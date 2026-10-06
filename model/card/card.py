@@ -1,4 +1,4 @@
-﻿"""Trainable DLSS-NR topology modules. Tensors inside the graph are BCHW.
+"""Trainable DLSS-NR topology modules. Tensors inside the graph are BCHW.
 
 This is a structural student baseline, not the recovered NVIDIA execution graph.
 It intentionally uses ordinary differentiable PyTorch arithmetic.
@@ -6,7 +6,7 @@ It intentionally uses ordinary differentiable PyTorch arithmetic.
 import torch
 from torch import nn
 from torch.nn import functional as F
-
+from .mamba import Mamba, MambaBlock, MambaStage, SSMStage
 
 class InputAdapter(nn.Module):
     def __init__(self, c1, c2):
@@ -15,7 +15,6 @@ class InputAdapter(nn.Module):
 
     def forward(self, x):
         return self.proj(x)
-
 
 class FeedForward(nn.Module):
     def __init__(self, dim, ratio=4):
@@ -172,4 +171,6 @@ class OutputHead(InputAdapter):
     """Raw RGB residual and temporal gate logit. No output sigmoid."""
 
 
-MODULES = {cls.__name__: cls for cls in (InputAdapter, SwinStage, ViTStage, Downsample, Upsample, Add, Concat, OutputHead)}
+MODULES = {cls.__name__: cls for cls in (InputAdapter, SwinStage, ViTStage, Downsample, Upsample, Add, Concat, OutputHead, MambaStage)}
+
+MODULES['SSMStage'] = SSMStage
