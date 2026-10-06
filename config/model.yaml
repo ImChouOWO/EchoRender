@@ -1,0 +1,37 @@
+﻿# Structural, trainable DLSS-NR student baseline; NOT NVIDIA numeric equivalence.
+# Each row: [from, repeats, module, args]. -1 means previous layer.
+# Stage args: [channels, depth, heads, window, ffn_ratio] (ViT omits window).
+# The recovered teacher owns special sampling, grouped FFN, gates and FP8 rounding.
+input_channels: 16
+output_channels: 4
+input_layout: BHWC
+backbone:
+  - [-1, 1, InputAdapter, [32]]       # 0
+  - [-1, 1, SwinStage, [32, 5, 1, 8, 4]] # 1: blocks 0-4
+  - [-1, 1, Downsample, [64]]         # 2
+  - [-1, 1, SwinStage, [64, 4, 2, 8, 4]] # 3: blocks 5-8
+  - [-1, 1, Downsample, [128]]        # 4
+  - [-1, 1, SwinStage, [128, 6, 4, 8, 4]] # 5: blocks 9-14
+  - [-1, 1, Downsample, [256]]        # 6
+  - [-1, 1, SwinStage, [256, 8, 8, 8, 4]] # 7: blocks 15-22
+  - [-1, 1, Downsample, [512]]        # 8
+  - [-1, 1, SwinStage, [512, 8, 16, 8, 4]] # 9: blocks 23-30
+  - [-1, 1, Downsample, [1024]]       # 10
+  - [-1, 1, ViTStage, [1024, 8, 32, 4]] # 11: blocks 31-38
+head:
+  - [[-1, 9], 1, Upsample, [512]]    # 12: block 39 topology
+  - [[-1, 9], 1, Add, []]            # 13
+  - [-1, 1, SwinStage, [512, 8, 16, 8, 4]] # 14: blocks 40-47
+  - [[-1, 7], 1, Upsample, [256]]    # 15
+  - [[-1, 7], 1, Add, []]            # 16
+  - [-1, 1, SwinStage, [256, 8, 8, 8, 4]] # 17: blocks 48-55
+  - [[-1, 5], 1, Upsample, [128]]    # 18
+  - [[-1, 5], 1, Add, []]            # 19
+  - [-1, 1, SwinStage, [128, 6, 4, 8, 4]] # 20: blocks 56-61
+  - [[-1, 3], 1, Upsample, [64]]     # 21
+  - [[-1, 3], 1, Add, []]            # 22
+  - [-1, 1, SwinStage, [64, 4, 2, 8, 4]] # 23: blocks 62-65
+  - [[-1, 1], 1, Upsample, [32]]     # 24
+  - [[-1, 1], 1, Add, []]            # 25
+  - [-1, 1, SwinStage, [32, 5, 1, 8, 4]] # 26: blocks 66-70 topology
+  - [-1, 1, OutputHead, [4]]         # 27
