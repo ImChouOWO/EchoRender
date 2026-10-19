@@ -6,8 +6,10 @@ __pycache__/
 # C extensions
 *.so
 *.safetensors
-# Locally generated inference images and reports
+# Local training/inference outputs and large Sintel downloads
 /outputs/
+/MPI-Sintel-complete/
+/MPI-Sintel-complete.zip
 # Distribution / packaging
 .Python
 build/

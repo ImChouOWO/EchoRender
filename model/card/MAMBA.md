@@ -33,7 +33,3 @@ claimed. Keep the original teacher inference backend for distillation.
 
 Reference for architecture:
 https://github.com/state-spaces/mamba/blob/main/mamba_ssm/modules/mamba_simple.py
-
-The existing mambatest.py still imports the external mamba_ssm package. To test
-this implementation use `from model.card.mamba import Mamba` from project root,
-or run `python -m unittest discover -s tests -v`.

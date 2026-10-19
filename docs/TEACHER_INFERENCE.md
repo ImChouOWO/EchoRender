@@ -17,9 +17,9 @@ reference. It does not reuse the randomly initialized structural student.
   current-image values in channels 7:10. The gate is still evaluated, but there
   is no cross-image state, sequence input, optical flow or temporal training.
 
-This fixes the particular recovered reference as the future distillation
-Teacher. Independent reverse-engineered implementations differ in graph and
-rounding. Successful image inference does not establish bit-exact agreement
+This fixes the recovered reference used as the distillation Teacher. Independent
+reverse-engineered implementations differ in graph and rounding. Successful
+image inference does not establish bit-exact agreement
 with NVIDIA, nor prove an improvement in image quality. Do not silently update
 the backend while keeping old Teacher feature caches.
 
@@ -53,32 +53,3 @@ selection use `--device cuda`, `--device cuda:0`, or `--device cpu`. CUDA uses
 the reference operations, not the vendor's CUDA kernels. Existing output files
 are protected unless `--overwrite` is supplied. Outputs are local artifacts
 ignored by Git; weights are not copied or committed.
-
-## Tests
-
-The ordinary test suite checks feature conditions, deterministic noise, padding
-and cropping, gate composition against the pinned reference, RGB IO, malformed
-inputs, packed/missing weights and CLI output protection:
-
-```powershell
-uv run python -m unittest discover -s tests -v
-```
-
-To additionally test a real external checkpoint:
-
-```powershell
-$env:ECHORENDER_TEACHER_WEIGHTS = "C:/path/to/dlssnr-logical.safetensors"
-uv run python -m unittest discover -s tests -v
-```
-
-The real-weight test runs three independent images (A, B, A), checks identical
-A results, finite non-identity RGB output and frozen/eval behavior, then verifies
-the detached raw head can supervise a small differentiable head with MSE.
-It does not train or update the Teacher and does not save model weights.
-Without that environment variable the real-checkpoint test is explicitly skipped.
-
-During implementation, the CLI also processed a full Sintel clean image
-`training/clean/ambush_2/frame_0001.png` (1024x436) on RTX 5060 Ti with the user's
-logical-v18 checkpoint (649 tensors). The padded field was 1024x448, output
-values were finite, and the RGB output differed from the input. This is an
-execution smoke test, not a fidelity benchmark or steady-state latency result.

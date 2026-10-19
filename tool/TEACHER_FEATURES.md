@@ -1,6 +1,8 @@
 ﻿# Teacher feature modes
 
 `teacher_features.py` receives your existing teacher; it does not define one.
+This is an optional feature-distillation utility; `train.py` currently uses
+raw-head MSE and does not extract or cache intermediate features.
 There are two training modes: `online` runs the teacher on each request; `cached`
 only reads precomputed features and fails on missing or changed inputs.
 Call `precompute()` explicitly before cached training.
@@ -58,5 +60,3 @@ collation. No automatic BCHW/BHWC conversion or student projection is performed;
 align feature layouts, spatial sizes and channels explicitly before loss.
 Large feature maps consume substantial disk space; select only needed layers.
 Cached mode can be constructed with extractor=None, so the teacher need not load.
-
-Tests: `python -m unittest discover -s tests -v` from the project root.

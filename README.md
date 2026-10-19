@@ -1,6 +1,8 @@
-﻿# EchoRender
+# EchoRender
 
-Trainable PyTorch student baseline for neural rendering, configured in `config/model.yaml`.
+Single-image knowledge distillation from a frozen recovered DLSS-NR Teacher to a
+trainable PyTorch student. Each image is processed independently; no video
+sequence, optical flow or cross-image state is used.
 
 ## Python environment
 
@@ -8,133 +10,122 @@ Run from the project root with [uv](https://docs.astral.sh/uv/):
 
 ```powershell
 uv sync --locked
-uv run python -m unittest discover -s tests -v
-uv run python -c "import torch; print(torch.__version__); print(torch.cuda.is_available())"
 ```
 
-uv installs Python 3.12 and creates a local `.venv`; manual activation is optional
-when using `uv run`. Commit `pyproject.toml`, `uv.lock`, and `.python-version` so
-collaborators can reproduce the environment. `.venv` is already ignored by Git.
-The environment selects PyTorch's official CUDA 12.8 wheels on Windows/Linux,
-and PyPI builds on macOS. Use a compatible NVIDIA driver for CUDA execution.
-NumPy supports tensor/feature-cache conversion, and Pillow supports image reading.
-The recovered Teacher backend is installed from a pinned MLX-DLSS Git revision.
-Teacher weights remain external, user-supplied files.
+uv installs Python 3.12 and creates `.venv`. `uv run` uses this environment without
+manual activation. `pyproject.toml`, `uv.lock` and `.python-version` define the
+shared environment. PyTorch uses CUDA 12.8 wheels on Windows/Linux and PyPI builds
+on macOS. The recovered Teacher backend is pinned to an MLX-DLSS Git revision.
+Teacher weights and large Sintel downloads remain local and are ignored by Git.
 
-## Single-image Teacher inference
+## Training
+
+Place the extracted Sintel dataset at `MPI-Sintel-complete/`, or change
+`dataset.root` in `config/data.yaml`. Supply the decoded **logical** Teacher
+checkpoint; packed safetensors are unsupported.
 
 ```powershell
-uv sync --locked
-uv run python infer.py --input input.png --weights "C:/path/to/dlssnr-logical.safetensors" --output outputs/teacher.png --device auto --report outputs/teacher.json
+uv run python train.py --teacher-weights "C:/path/to/dlssnr-logical.safetensors" --epochs 10 --output-dir outputs/run_01
 ```
 
-This runs the actual recovered Teacher, without a DataLoader or student. The
-default device is CUDA when available, otherwise CPU. Input images are converted
-to RGB, padded using the pinned backend's reflected geometry (at least 320 pixels
-per side, multiples of 64), and cropped back to their original dimensions. The
-result is a lossless RGB PNG. Existing outputs require `--overwrite`.
+`train.py` loads the full `config/model.yaml` student (172,122,446 parameters),
+initialized independently from the frozen Teacher. Both models receive the same
+16-channel input prepared from the same RGB image. Training uses a shared
+320x320 center crop, reflected padding where needed, and MSE between the raw
+four-channel heads on valid image pixels. Each batch averages per-image losses
+and makes one optimizer update. The Teacher runs under `no_grad` in eval mode.
 
-Every call independently builds the 16 input channels with deterministic noise
-(`--noise-index 0` by default), standard controls, and current-image values in
-the history slots. All four head channels are composed using the checkpoint's
-learned blend cap; no previous image is stored. `--intensity` accepts [0,1].
-Only the standard style is currently exposed. The model computes in float32
-while preserving the recovered backend's explicit FP16/E4M3 rounding points.
+The default optimizer is SGD with learning rate 0.001 and gradient-norm clipping
+at 1.0. After each epoch the complete validation split is evaluated without
+updates, then the student checkpoint is saved. The official test split is
+reserved for separate evaluation.
 
-`model/teacher.py` owns loading/frozen model execution;
-`tool/teacher_pipeline.py` owns image preparation/composition; `infer.py` is the CLI.
-See [Teacher implementation and testing](docs/TEACHER_INFERENCE.md) for the
-backend revision, validation limits and optional real-weight tests.
+Useful training options:
 
-## DataLoader and one-step distillation smoke test
+- `--epochs`: number of passes over the configured training split.
+- `--max-steps`: optional total optimizer-update budget; validation and checkpoint
+  saving still run when training reaches this budget.
+- `--lr`, `--grad-clip`: learning rate and gradient-norm cap; a cap of 0 disables clipping.
+- `--crop-size`: shared center-crop size; 0 uses original image dimensions.
+- `--student-config`, `--data-config`: model and dataset configuration paths.
+- `--student-weights`: initialize student weights from a state dict or `last.pt`.
+- `--device`: `auto`, `cuda`, `cuda:0` or `cpu`.
+
+Use a new `--output-dir` for each run. Training writes:
+
+- `metrics.jsonl`: per-step training metrics and epoch/validation losses.
+- `last.pt`: student weights/config, optimizer state and training progress.
+- `summary.json`: settings, losses, progress and frozen-Teacher information.
+
+`--student-weights` starts a new run with matching student weights; it does not
+restore optimizer state, data order or epoch progress. Teacher weights are never
+copied into training checkpoints. `outputs/` is ignored by Git.
+
+## Dataset and preprocessing
+
+`config/data.yaml` defines the Sintel root, render pass, scene splits, batch size,
+workers, shuffle and seed. Dataset paths are resolved relative to this YAML.
+
+- `train`: 19 selected scenes from the official `training` source.
+- `val`: held-out alley/temple scenes from the same source.
+- `test`: the official `test` source, used separately from training/validation.
+
+`clean` and `final` are rendering passes, independent of the split. Train/val
+scene overlap and use of official test data for training are rejected.
+`tool/dataloader.py` returns CPU float32 CHW RGB in [0,1], sample IDs, paths,
+scenes and sizes. Batches preserve original image sizes as lists. Training
+shuffle is seeded; validation/test order is fixed. Cropping and shared Teacher
+preparation happen in `tool/distillation.py`, after loading.
+
+## Teacher image inference
 
 ```powershell
-uv run python smoke_train.py --teacher-weights "C:/path/to/dlssnr-logical.safetensors" --report outputs/smoke_train.json
+uv run python infer.py --input input.png --weights "C:/path/to/dlssnr-logical.safetensors" --output outputs/teacher.png
 ```
 
-This consumes exactly one training batch: CPU RGB images -> shared 16-channel
-preparation -> real frozen Teacher and trainable EchoRenderStudent -> raw-head
-MSE -> backward -> one SGD update. Only valid image pixels contribute to loss;
-padding is context. All trainable student parameters must receive finite
-gradients, student weights must change, and Teacher parameters/buffers must stay
-unchanged. The script saves an optional JSON report and no model checkpoint.
+`infer.py` runs the Teacher and saves an RGB PNG at the original image dimensions.
+It converts input to RGB and pads to the backend's minimum 320/multiple-of-64
+geometry. Noise and controls are deterministic; channels 7:10 use the current
+image. All four head channels are composed using the checkpoint's learned blend
+cap. No previous image is retained. `--intensity` accepts [0,1]; only standard
+style is exposed. Existing outputs require `--overwrite`. `--report` optionally
+saves inference metadata. See [Teacher implementation](docs/TEACHER_INFERENCE.md).
 
-`config/data.yaml` separates the official source (`training`/`test`), rendering
-pass (`clean`/`final`), and explicit train/val scene lists. Paths are relative to
-that YAML. The default holds out alley/temple scenes for validation and reserves
-official test images for testing. Train/val overlap and test-as-training are
-rejected. The CLI updates only on the train split.
+## Model configuration
 
-`tool/dataloader.py` returns CPU CHW float RGB in [0,1], stable source/pass/scene/
-frame IDs and image sizes. Batches contain lists of images so differently sized
-images are preserved, with no resizing, augmentation, flow or feature caches.
-Validation/test order is fixed; train shuffle uses the configured seed. The
-smoke step accumulates mean per-image gradients and makes one batch update.
+Rows in `config/model.yaml` use `[from, repeats, module, args]`. `-1` selects the
+previous output (model input at layer zero); other negative indices are relative;
+non-negative indices select earlier graph outputs. Indices span backbone/head.
+Modules come from the explicit registry in `model/card/card.py`.
 
-The default `config/model_smoke.yaml` is a small 28-node instance of the existing
-student topology (408,636 parameters) for pipeline checks. It uses Swin stages;
-SSM replacement remains a separate experiment. The full `config/model.yaml` is
-unchanged; select a different student explicitly with `--student-config`.
-This one-step run does not measure learning quality or claim successful NR
-distillation. Teacher uses the real external logical checkpoint.
+Swin arguments are `[channels, depth, heads, window, ffn_ratio]`; ViT omits window.
+`repeats` repeats modules; stage depth counts internal blocks. Heads must divide
+channels. Upsample takes `[decoder, skip]` and matches skip dimensions. Add merges
+equal-shaped tensors; Concat merges channels. `input_layout` supports BHWC or BCHW.
+`model(x, return_features=True)` also returns BCHW intermediate features with gradients.
 
-## Usage
+The default student uses Swin/ViT stages. The registered Mamba/SSM stages are
+available for explicit model-config changes; see [Mamba stages](model/card/MAMBA.md).
+Intermediate-feature extraction/caching is an optional utility documented in
+[Teacher features](tool/TEACHER_FEATURES.md); the current training loop uses
+raw-head MSE directly. The loss is implemented in `tool/distillation.py:image_loss`.
 
-```python
-import torch
-from model.student import EchoRenderStudent
+## Current scope
 
-model = EchoRenderStudent()  # resolves config relative to the source, not cwd
-x = torch.randn(1, 64, 64, 16)  # BHWC by default
-head = model(x)  # [1, 64, 64, 4]: RGB residual and temporal gate logit
-head.square().mean().backward()
-```
+The implemented path covers image loading, shared preprocessing, Teacher/student
+forward passes, raw-head MSE, backward, optimizer updates, validation and student
+checkpoint saving. Student-only image inference and full-state training resume
+are not implemented. Image-quality metrics, alternative losses and the choice
+of SSM replacement are further research work.
 
-Use the uv environment above. `requirements.txt` remains a compatibility list for
-other installers; it does not lock exact versions or select the CUDA wheel index.
-
-## YAML contract
-
-Rows use YOLO's `[from, repeats, module, args]` convention. `-1` selects the
-previous output (or model input at layer zero); other negative indices are relative;
-non-negative indices select earlier graph outputs. Indices span backbone and head.
-Module names come from an explicit registry in `model/card/card.py`, without eval.
-`repeats` repeats complete modules; stage `depth` counts internal transformer blocks.
-Use `input_layout: BCHW` for channel-first inputs and outputs. Features returned by
-`model(x, return_features=True)` are always BCHW and remain attached to autograd.
-
-Stage arguments are `[channels, depth, heads, window, ffn_ratio]` for Swin and
-`[channels, depth, heads, ffn_ratio]` for ViT. Heads must divide channels.
-Upsample takes `[decoder, skip]` sources and matches the skip's spatial dimensions.
-Add merges equal-shaped tensors; Concat merges on the channel axis. To substitute
-a custom SSM stage, define its class, add it to MODULES, and retain the
-`(input_channels, output_channels, *args)` constructor and BCHW forward contract.
-
-## Equivalence boundary
-
-The baseline follows the shared conversation's five encoder/decoder widths,
-stage depths, global bottleneck, skip connections and 16-input/4-output interface.
-It is a **structural baseline**, not an exact reconstruction of DLSS-NR. LayerNorm,
-GELU dense FFN, ordinary residual additions, stride-2 convolutions, bilinear
-upsampling and standard PyTorch softmax deliberately replace vendor operations.
-The final five-block stage plus separate head is a configurable student choice;
-the recovered block 70 includes its head internally. No NVIDIA weight-key mapping
-is claimed. Original recovered weights cannot be loaded into this student.
-The full baseline is large; lower widths and depths in YAML for a smaller student.
-Global bottleneck attention has quadratic token memory cost.
-
-`model/teacher.py` uses the pinned recovered MLX-DLSS graph and validates decoded
-logical weights. Packed safetensors are opaque storage and are rejected. The
-Teacher remains frozen/eval and its forward runs under `torch.no_grad()` so
-its output can be used as an ordinary detached distillation target.
-
-Both model classes return raw four-channel heads. `TeacherPipeline` now supplies
-the single-image input preparation and RGB composition for the Teacher; the
-student's corresponding image pipeline and training loop remain future work.
-The recovered reference graph and rounding are not claimed to be bit-identical
-to NVIDIA's kernels, or to the independently updated Intel port. Teacher/student
-feature coordinates must still be aligned explicitly for feature distillation.
+The student is a structural baseline, not a numeric reconstruction of DLSS-NR.
+It uses standard PyTorch normalization, FFN, sampling and attention operations;
+original recovered weights cannot be loaded into it. The Teacher uses the pinned
+recovered MLX-DLSS graph and validates logical weights. Agreement with NVIDIA's
+kernels or the independently updated Intel port is not claimed. Feature
+coordinates must be aligned explicitly before intermediate-feature distillation.
 
 References:
+
 - https://chatgpt.com/share/6ac4fb26-91f0-83ee-9e3c-26fb50a0e746
 - https://github.com/Uzbekunknown/dlss-nr-on-intel/blob/master/docs/ARCHITECTURE.md
