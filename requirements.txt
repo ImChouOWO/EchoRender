@@ -1,3 +1,7 @@
-﻿torch>=2.1
+# Prefer `uv sync --locked` for the reproducible CUDA environment.
+mlxdlss @ git+https://github.com/iamwavecut/MLX-DLSS.git@7870371e8bf6c03967213f1a5d40db6c5a3bee38#subdirectory=python
+torch>=2.7
 PyYAML>=6.0
 safetensors>=0.4
+numpy>=1.26
+Pillow>=10.0
