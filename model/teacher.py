@@ -39,12 +39,12 @@ class EchoRenderTeacher(nn.Module):
                 "Use dlssnr-logical.safetensors, not dlssnr-packed.safetensors."
             )
         try:
-            from mlxdlss.model import NeuralRenderingModel
             from mlxdlss.pipeline import load_weights
+            from tool.teacher_features import FeatureRecordingBackend
         except ImportError as exc:
             raise ImportError("Teacher backend is missing; run 'uv sync --locked'") from exc
         # Validate the complete tensor names/shapes and checkpoint format.
-        self.model = NeuralRenderingModel(load_weights(self.weights_path))
+        self.model = FeatureRecordingBackend(load_weights(self.weights_path))
         self.model.to(device=target_device, dtype=torch.float32)
         self.model.requires_grad_(False)
         self.eval()
@@ -66,7 +66,7 @@ class EchoRenderTeacher(nn.Module):
         return self
 
     @torch.no_grad()
-    def forward(self, x):
+    def forward(self, x, return_features=False):
         if (not isinstance(x, torch.Tensor) or x.ndim != 4 or x.shape[-1] != 16
                 or x.shape[0] < 1 or min(x.shape[1:3]) < 320
                 or any(size % 64 for size in x.shape[1:3])):
@@ -75,10 +75,14 @@ class EchoRenderTeacher(nn.Module):
             raise ValueError("Teacher input must contain finite floating-point values")
         # The recovered graph owns its FP16/E4M3 rounding points.
         with torch.autocast(device_type=self.device.type, enabled=False):
-            head = self.model(x.to(device=self.device, dtype=torch.float32))
+            value = x.to(device=self.device, dtype=torch.float32)
+            if return_features:
+                head, features = self.model.forward_with_features(value)
+            else:
+                head = self.model(value)
         if head.shape != (*x.shape[:-1], 4) or not torch.isfinite(head).all().item():
             raise RuntimeError("Teacher returned an invalid or non-finite four-channel head")
-        return head
+        return (head, features) if return_features else head
 
 
 Teacher = EchoRenderTeacher

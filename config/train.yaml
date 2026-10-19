@@ -1,0 +1,73 @@
+# Paths resolve relative to this file, on Windows or Linux.
+model:
+  student_config: model.yaml
+  student_weights: null
+  teacher_weights: ../dlssnr-logical.safetensors
+runtime:
+  device: auto
+  cpu_threads: 4
+  output_dir: ../outputs/train
+training:
+  epochs: 10
+  max_steps: null
+  crop_size: 320  # shared center crop; 0 keeps original image dimensions
+  optimizer:
+    lr: 0.001
+    momentum: 0.0
+    weight_decay: 0.0
+  grad_clip: 1.0  # 0 disables clipping
+loss:
+  distillation: 3.0
+  reconstruction: 1.0
+  mid: 0.5
+  output: 0.5
+  e1: 1.0
+  e2: 1.0
+  e3: 1.0
+  vit: 1.0
+  vit_feature: 0.5
+  vit_affinity: 1.0
+  rgb_mse: 0.5
+  rgb_ssim: 0.2
+  rgb_ms_ssim: 0.3
+  projection: true  # identity-initialized 1x1 student feature adapters
+  norm_eps: 0.000001
+  affinity_chunk_size: 128  # exact off-diagonal cosine affinity; no token sampling
+  ssim_window: 11
+  ms_ssim_weights: [0.0448, 0.2856, 0.3001, 0.2363, 0.1333]
+validation:
+  # Both RGB loss and image-quality metrics use Teacher RGB as reference.
+  reference: teacher
+  lpips_net: alex  # official pretrained backbone; first run downloads weights
+benchmark:
+  enabled: true
+  warmup: 2
+  repeats: 5
+  # Once per epoch on the first validation image's prepared extent, batch=1.
+  # Times forward only, without feature capture, preprocessing or composition.
+logging:
+  progress: true
+  gpu_poll_seconds: 1.0
+schedule:
+  kind: constant  # extension point only; no training strategy enabled yet
+
+dataset:
+  root: ../MPI-Sintel-complete
+  render_pass: clean
+  splits:
+    train:
+      source: training
+      scenes: [ambush_2, ambush_4, ambush_5, ambush_6, ambush_7, bamboo_1, bamboo_2,
+               bandage_1, bandage_2, cave_2, cave_4, market_2, market_5, market_6,
+               mountain_1, shaman_2, shaman_3, sleeping_1, sleeping_2]
+    val:
+      source: training
+      scenes: [alley_1, alley_2, temple_2, temple_3]
+    test:
+      source: test
+      scenes: null
+loader:
+  batch_size: 1
+  num_workers: 0
+  seed: 42
+  train_shuffle: true

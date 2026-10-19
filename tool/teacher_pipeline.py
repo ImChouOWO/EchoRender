@@ -97,6 +97,25 @@ def save_rgb(rgb, path):
     Image.fromarray(np.rint(np.clip(rgb, 0, 1) * 255).astype(np.uint8)).save(path)
 
 
+def compose_rgb_tensor(head, prepared, *, blend_scale):
+    """Differentiable counterpart of compose_image, returning valid BCHW RGB.
+
+    Forward retains the backend's FP16 rounding; backward uses a straight-through
+    estimator for that rounding only. Clamp/sigmoid keep their actual gradients.
+    """
+    h, w = prepared.rgb.shape[:2]
+    raw = head[:, :h, :w].float()
+    def half_ste(value):
+        return value + (value.half().float() - value).detach()
+    colour = torch.as_tensor(prepared.rgb, device=head.device).unsqueeze(0)
+    history = prepared.features[:, :h, :w, 7:10].to(head.device) * 8 + 0.5
+    predicted = (colour + 0.25 * half_ste(raw[..., :3])).clamp(0, 1)
+    scale = torch.as_tensor(blend_scale, device=head.device).half().float()
+    alpha = torch.sigmoid(half_ste(raw[..., 3:])) * scale
+    output = (predicted + alpha * (history - predicted)).clamp(0, 1)
+    return output.permute(0, 3, 1, 2).contiguous()
+
+
 class TeacherPipeline:
     def __init__(self, teacher: EchoRenderTeacher):
         self.teacher = teacher

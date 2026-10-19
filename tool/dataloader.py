@@ -15,7 +15,7 @@ import yaml
 from .teacher_pipeline import load_rgb
 
 
-DEFAULT_DATA_CONFIG = Path(__file__).resolve().parents[1] / 'config' / 'data.yaml'
+DEFAULT_DATA_CONFIG = Path(__file__).resolve().parents[1] / 'config' / 'train.yaml'
 
 
 @dataclass(frozen=True)
@@ -56,9 +56,13 @@ def _scene_names(value, name):
 
 
 def load_data_config(path=DEFAULT_DATA_CONFIG):
-    path = Path(path).expanduser().resolve()
-    with path.open(encoding='utf-8-sig') as source:
-        config = yaml.safe_load(source)
+    if isinstance(path, dict):
+        config = path
+        path = Path(config['config_path'])
+    else:
+        path = Path(path).expanduser().resolve()
+        with path.open(encoding='utf-8-sig') as source:
+            config = yaml.safe_load(source)
     if not isinstance(config, dict):
         raise ValueError('Data config must be a mapping')
     dataset, loader = config.get('dataset'), config.get('loader')

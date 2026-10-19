@@ -5,12 +5,17 @@ description = "Trainable PyTorch student baseline for neural rendering"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "lpips>=0.1.4",
     "mlxdlss",
     "numpy>=1.26",
+    "nvidia-ml-py>=12",
     "pillow>=10.0",
+    "pytorch-msssim>=1.0",
     "pyyaml>=6.0",
     "safetensors>=0.4",
     "torch>=2.7",
+    "torchvision>=0.22",
+    "tqdm>=4.67",
 ]
 
 [tool.uv]
@@ -19,6 +24,9 @@ package = false
 [tool.uv.sources]
 mlxdlss = { git = "https://github.com/iamwavecut/MLX-DLSS.git", rev = "7870371e8bf6c03967213f1a5d40db6c5a3bee38", subdirectory = "python" }
 torch = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'win32' or sys_platform == 'linux'" },
+]
+torchvision = [
     { index = "pytorch-cu128", marker = "sys_platform == 'win32' or sys_platform == 'linux'" },
 ]
 

@@ -1,62 +1,34 @@
-﻿# Teacher feature modes
+# Online stage distillation
 
-`teacher_features.py` receives your existing teacher; it does not define one.
-This is an optional feature-distillation utility; `train.py` currently uses
-raw-head MSE and does not extract or cache intermediate features.
-There are two training modes: `online` runs the teacher on each request; `cached`
-only reads precomputed features and fails on missing or changed inputs.
-Call `precompute()` explicitly before cached training.
+Training captures Teacher E1/E2/E3 and the final global block in the same forward
+as the raw head. `FeatureRecordingBackend` subclasses the pinned MLX-DLSS backend
+and observes its functional `_window`/`_global` results; the backend graph and
+rounding are unchanged. Captures are detached BCHW, cleared even after failure.
+The old generic hook/cache interface has been removed.
 
-```python
-from tool.teacher_features import TorchFeatureExtractor, TeacherFeatures, file_sha256
+For the required HT checkpoint:
 
-# teacher is the actual nn.Module used by your existing inference pipeline.
-print(TorchFeatureExtractor.list_layers(teacher))
-layers = ['actual.module.name']  # replace with names printed above
-extractor = TorchFeatureExtractor(teacher, layers)
-provider = TeacherFeatures(
-    extractor, layers, mode='online', cache_dir='data/teacher_features',
-    teacher_id=file_sha256('weight/mlxw/dlssnr-logical.safetensors')
-        + ':reference:preprocess-v1',
-    output_device='cuda',
-)
+| Name | Teacher observation | Teacher stride | Student YAML layer | Student stride |
+| --- | --- | --- | --- | --- |
+| E1 | Block 8 window output, before pooling/projection | 4 | 3, SSMStage | 2 |
+| E2 | Block 14 window output, before pooling/projection | 8 | 5, SSMStage | 4 |
+| E3 | Block 22 window output, before pooling/projection | 16 | 7, SSMStage | 8 |
+| ViT | Block 38 global output | 64 | 11, ViTStage | 32 |
 
-# Option A: precompute, then train without teacher inference.
-# prepared_samples yields (stable_id, prepared input tensor).
-provider.precompute(prepared_samples)
-provider.set_mode('cached')
-features = provider.get(prepared_input, sample_id='frame-00001')
+The structural student and recovered Teacher do not have identical sampling
+boundaries. Student features are projected (optional, identity-initialized 1x1),
+resized onto the Teacher's physical spatial grid, and cropped to cells intersecting
+the real image. Teacher-only end padding in the split/global path is excluded;
+we do not stretch the student to the padded capture extent. This is approximate
+spatial correspondence, not proof of equivalent receptive fields. Raw-head and
+RGB losses exclude all reflected padding; MS-SSIM is never computed on synthetic
+padding to make a small real image pass.
 
-# Option B: generate features during training.
-provider.set_mode('online')
-features = provider.get(prepared_input)
-```
+E1/E2/E3 use per-location channel-L2 normalization and mean squared error. ViT uses
+`0.5 * feature_MSE + off_diagonal_cosine_affinity_MSE`. Affinity is computed exactly
+in row chunks, without sampling tokens. Output loss compares all four raw-head
+channels; RGB-head and gate MSE are also logged separately. Teacher targets never
+receive gradients. Feature projections belong to the optimizer and checkpoint.
 
-Move input tensors to the teacher's device yourself. Default runner calls
-`teacher(inputs)`; pass `runner=lambda inputs: ...` to TorchFeatureExtractor for
-keyword arguments or a custom pipeline entry point which executes the hooked
-teacher. Tuple/dict module outputs require `selectors={name: lambda output: ...}`.
-Hook captures are detached clones; no teacher gradients are produced. Train/eval
-states are restored and hooks removed after each call. This tool is sequential;
-do not use the same hooked teacher concurrently from multiple threads.
-
-For a NumPy/native backend, provide your own callable extractor returning
-`{selected_name: torch.from_numpy(array.copy())}`. The native/reference backend
-must expose those intermediate arrays first; a progress callback containing only
-step names cannot provide features. Passing a pipeline object instead of its
-actual nn.Module to TorchFeatureExtractor will be rejected.
-
-Cache identity includes teacher_id and ordered selected layers. Include checkpoint
-hash, precision, backend/code version and preprocessing policy in teacher_id.
-The input digest covers actual input tensors, including noise/history/control
-channels, so random augmentations cannot silently reuse mismatched features.
-Use deterministic inputs for precomputation, or online mode for random inputs.
-Recompute caches whenever teacher weights or preprocessing changes.
-
-A cache entry represents one sample or one fixed batch, exactly as provided.
-A different batch ordering/size requires separate entries. For flexible shuffled
-training, precompute one sample at a time and stack corresponding features during
-collation. No automatic BCHW/BHWC conversion or student projection is performed;
-align feature layouts, spatial sizes and channels explicitly before loss.
-Large feature maps consume substantial disk space; select only needed layers.
-Cached mode can be constructed with extractor=None, so the teacher need not load.
+All formulas and loss composition live in `model/card/loss.py`; all coefficients,
+SSIM scales and normalization epsilon live in `config/train.yaml`.

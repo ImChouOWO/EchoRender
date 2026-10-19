@@ -9,11 +9,11 @@ backbone:
   - [-1, 1, InputAdapter, [32]]       # 0
   - [-1, 1, SwinStage, [32, 5, 1, 8, 4]] # 1: blocks 0-4
   - [-1, 1, Downsample, [64]]         # 2
-  - [-1, 1, SwinStage, [64, 4, 2, 8, 4]] # 3: blocks 5-8
+  - [-1, 1, SSMStage, [64, 4, 16, 4, 2, cross]] # 3: E1
   - [-1, 1, Downsample, [128]]        # 4
-  - [-1, 1, SwinStage, [128, 6, 4, 8, 4]] # 5: blocks 9-14
+  - [-1, 1, SSMStage, [128, 6, 16, 4, 2, cross]] # 5: E2
   - [-1, 1, Downsample, [256]]        # 6
-  - [-1, 1, SwinStage, [256, 8, 8, 8, 4]] # 7: blocks 15-22
+  - [-1, 1, SSMStage, [256, 8, 16, 4, 2, cross]] # 7: E3
   - [-1, 1, Downsample, [512]]        # 8
   - [-1, 1, SwinStage, [512, 8, 16, 8, 4]] # 9: blocks 23-30
   - [-1, 1, Downsample, [1024]]       # 10
