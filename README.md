@@ -46,6 +46,38 @@ while preserving the recovered backend's explicit FP16/E4M3 rounding points.
 See [Teacher implementation and testing](docs/TEACHER_INFERENCE.md) for the
 backend revision, validation limits and optional real-weight tests.
 
+## DataLoader and one-step distillation smoke test
+
+```powershell
+uv run python smoke_train.py --teacher-weights "C:/path/to/dlssnr-logical.safetensors" --report outputs/smoke_train.json
+```
+
+This consumes exactly one training batch: CPU RGB images -> shared 16-channel
+preparation -> real frozen Teacher and trainable EchoRenderStudent -> raw-head
+MSE -> backward -> one SGD update. Only valid image pixels contribute to loss;
+padding is context. All trainable student parameters must receive finite
+gradients, student weights must change, and Teacher parameters/buffers must stay
+unchanged. The script saves an optional JSON report and no model checkpoint.
+
+`config/data.yaml` separates the official source (`training`/`test`), rendering
+pass (`clean`/`final`), and explicit train/val scene lists. Paths are relative to
+that YAML. The default holds out alley/temple scenes for validation and reserves
+official test images for testing. Train/val overlap and test-as-training are
+rejected. The CLI updates only on the train split.
+
+`tool/dataloader.py` returns CPU CHW float RGB in [0,1], stable source/pass/scene/
+frame IDs and image sizes. Batches contain lists of images so differently sized
+images are preserved, with no resizing, augmentation, flow or feature caches.
+Validation/test order is fixed; train shuffle uses the configured seed. The
+smoke step accumulates mean per-image gradients and makes one batch update.
+
+The default `config/model_smoke.yaml` is a small 28-node instance of the existing
+student topology (408,636 parameters) for pipeline checks. It uses Swin stages;
+SSM replacement remains a separate experiment. The full `config/model.yaml` is
+unchanged; select a different student explicitly with `--student-config`.
+This one-step run does not measure learning quality or claim successful NR
+distillation. Teacher uses the real external logical checkpoint.
+
 ## Usage
 
 ```python

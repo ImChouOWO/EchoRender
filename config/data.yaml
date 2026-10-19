@@ -1,0 +1,40 @@
+# Paths are relative to this YAML file, not the shell's working directory.
+dataset:
+  root: ../MPI-Sintel-complete
+  render_pass: clean  # clean or final; this is independent of the split
+  splits:
+    train:
+      source: training
+      scenes:
+        - ambush_2
+        - ambush_4
+        - ambush_5
+        - ambush_6
+        - ambush_7
+        - bamboo_1
+        - bamboo_2
+        - bandage_1
+        - bandage_2
+        - cave_2
+        - cave_4
+        - market_2
+        - market_5
+        - market_6
+        - mountain_1
+        - shaman_2
+        - shaman_3
+        - sleeping_1
+        - sleeping_2
+    val:
+      source: training
+      # Whole scene families are held out; no frame-level random split.
+      scenes: [alley_1, alley_2, temple_2, temple_3]
+    test:
+      source: test
+      scenes: null  # all official test scenes, discovered in sorted order
+
+loader:
+  batch_size: 1
+  num_workers: 0
+  seed: 42
+  train_shuffle: true  # val/test are always sequential
