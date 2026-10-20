@@ -1,4 +1,4 @@
-# Paths resolve relative to this file, on Windows or Linux.
+# teacher_weights resolves from the project root; other paths resolve from this file.
 model:
   student_config: model.yaml
   student_weights: null

@@ -27,7 +27,9 @@ Edit **`config/train.yaml`**, then run:
 uv run --locked python train.py --config config/train.yaml
 ```
 
-All paths resolve relative to the YAML file, not the shell directory. Set:
+Teacher weights resolve from the project root and must stay inside its `weights/`
+directory, regardless of YAML location or shell directory. Other paths resolve
+relative to the YAML file. Set:
 
 - `model.teacher_weights`: actual decoded logical safetensors with
   `fully_logical=true`, using the **71-block HT topology**. Packed/small checkpoints

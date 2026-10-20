@@ -5,7 +5,8 @@ import math
 
 import yaml
 
-DEFAULT_TRAIN_CONFIG = Path(__file__).resolve().parents[1] / 'config/train.yaml'
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_TRAIN_CONFIG = PROJECT_ROOT / 'config/train.yaml'
 LOSS_WEIGHTS = {'distillation', 'reconstruction', 'mid', 'output', 'e1', 'e2', 'e3',
                 'vit', 'vit_feature', 'vit_affinity', 'rgb_mse', 'rgb_ssim', 'rgb_ms_ssim'}
 
@@ -52,7 +53,11 @@ def load_training_config(path=DEFAULT_TRAIN_CONFIG):
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f'{section}.{key} must be a nonempty path')
         value = Path(value).expanduser()
-        c[section][key] = str((path.parent / value).resolve())
+        base = PROJECT_ROOT if key == 'teacher_weights' else path.parent
+        resolved = (base / value).resolve()
+        if key == 'teacher_weights' and not resolved.is_relative_to((PROJECT_ROOT / 'weights').resolve()):
+            raise ValueError('model.teacher_weights must be inside the project weights directory')
+        c[section][key] = str(resolved)
     for section, key, zero in (('runtime', 'cpu_threads', False), ('training', 'epochs', False),
                                ('training', 'crop_size', True), ('benchmark', 'warmup', True),
                                ('benchmark', 'repeats', False), ('loss', 'affinity_chunk_size', False),
