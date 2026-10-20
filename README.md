@@ -117,15 +117,54 @@ checkpoint. `model.student_weights` initializes only the student from a v2 check
 it starts a new run with fresh optimizer/adapters. Full-state resume and legacy
 checkpoint compatibility are intentionally not provided.
 
-## Reserved scheduling interface
+## Learning-rate scheduling
 
 `tool/training_config.py:TrainingSchedule.values(epoch=..., step=...)` is called
-before every optimizer update. It currently returns fixed `lr`, `grad_clip` and
-all loss coefficients from YAML. The trainer applies these values and logs them.
+before every optimizer update. It returns the scheduled `lr`, fixed `grad_clip`
+and fixed loss coefficients from YAML. The trainer applies and logs these values.
 `step` is the number of updates already completed; `epoch` starts at 1.
 
-Only `schedule.kind: constant` is supported. Add future strategies and their
-configuration validation at that entry point; no automatic ramp/decay is enabled.
+The optimizer remains **SGD**, with momentum and weight decay configured under
+`training.optimizer` (both default to zero). The default schedule is:
+
+```yaml
+schedule:
+  kind: cosine
+  eta_min: 0.000001
+```
+
+Cosine annealing runs once across the planned optimizer updates, with no warmup
+or restarts. The horizon is `min(epochs * len(train_loader), max_steps)` when a
+step cap is present. With T >= 2, the LR used by the first update is the configured
+initial LR (default 0.001); the last update uses `eta_min`. A one-update run uses
+the initial LR. Values remain at the minimum after the horizon. Validation and
+latency measurement do not advance the schedule.
+
+Use `kind: constant` to keep LR fixed (`eta_min` is then unused). Loss-weight
+ramps and other training strategies remain extension points; none are enabled.
+
+## Student-only augmentation
+
+Training uses a per-image augmentation probability: 10% in epoch 1, rising
+linearly to 25% at 50% of the configured epochs, then held until augmentation
+is disabled from 75% onward (rounded up to the next integer epoch). For the
+default 10 epochs: epoch 1 = 10%, epoch 5 = 25%, epochs 5–7 = 25%, epochs 8–10 = 0%.
+Short runs may reach the cutoff before a full ramp is possible. `max_steps`
+does not rescale this epoch schedule. The 25% cap is a sampling probability;
+actual sample counts fluctuate, and `augmented_samples` records the count.
+
+Every selected image receives Gaussian noise followed by exactly one uniformly
+selected adjustment: brightness, contrast, or sharpness. In `augmentation`,
+`noise_std: 0.02` sets the maximum sigma (uniformly sampled from 0 to 0.02 on
+RGB in [0,1]); brightness/contrast factors range from 0.8 to 1.2, and sharpness
+from 0.5 to 1.5. These are configurable strengths, separate from probability.
+
+Teacher inputs, raw-head/feature/RGB targets remain clean. The same center crop
+is used by both branches; student features and RGB composition use the corrupted
+image. Validation, benchmarks, and inference remain clean. Loss weights, SGD,
+and cosine LR settings are unchanged. Augmentation has its own RNG seeded by
+`loader.seed`; training logs include `augmentation_probability` and
+`augmented_samples`. Set `augmentation.enabled: false` to disable it.
 
 ## Teacher-only inference
 

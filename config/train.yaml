@@ -2,11 +2,11 @@
 model:
   student_config: model.yaml
   student_weights: null
-  teacher_weights: ../dlssnr-logical.safetensors
+  teacher_weights: weights/dlssnr-logical.safetensors
 runtime:
   device: auto
   cpu_threads: 4
-  output_dir: ../outputs/train
+  output_dir: output/train
 training:
   epochs: 10
   max_steps: null
@@ -49,7 +49,19 @@ logging:
   progress: true
   gpu_poll_seconds: 1.0
 schedule:
-  kind: constant  # extension point only; no training strategy enabled yet
+  kind: cosine  # per optimizer update; no warmup or restarts
+  eta_min: 0.000001  # lowest LR; initial LR comes from training.optimizer.lr
+
+augmentation:
+  enabled: true
+  start_probability: 0.10
+  max_probability: 0.25
+  peak_fraction: 0.50
+  stop_fraction: 0.75
+  noise_std: 0.02  # maximum Gaussian sigma for RGB in [0,1]
+  brightness: 0.20  # factor sampled from 1 +/- this value
+  contrast: 0.20
+  sharpness: 0.50
 
 dataset:
   root: ../MPI-Sintel-complete

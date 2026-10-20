@@ -6,7 +6,7 @@ from time import perf_counter
 import torch
 from tqdm.auto import tqdm
 
-from .distillation import train_batch, evaluate, module_digest
+from .distillation import train_batch, evaluate, module_digest, StudentAugmentation
 from .training_config import TrainingSchedule
 from .monitoring import GPUMonitor
 
@@ -64,7 +64,11 @@ def fit(teacher, student, criterion, train_loader, val_loader, optimizer, metric
     teacher_before = module_digest(teacher)
     student_before = module_digest(student, parameters_only=True)
     monitor = GPUMonitor(teacher.device, config['logging']['gpu_poll_seconds'])
-    schedule = schedule or TrainingSchedule(config)
+    total_steps = len(train_loader) * config['training']['epochs']
+    if config['training']['max_steps'] is not None:
+        total_steps = min(total_steps, config['training']['max_steps'])
+    schedule = schedule or TrainingSchedule(config, total_steps=total_steps)
+    augmentation = StudentAugmentation(config)
     global_step, images_seen, history = 0, 0, []
     started = perf_counter()
     if teacher.device.type == 'cuda':
@@ -76,17 +80,20 @@ def fit(teacher, student, criterion, train_loader, val_loader, optimizer, metric
                 stream.flush()
             for epoch in range(1, config['training']['epochs'] + 1):
                 epoch_loss, epoch_images, batches = 0.0, 0, 0
+                augmentation_probability = augmentation.probability(epoch)
                 gpu_values = []
                 bar = tqdm(train_loader, desc=f'Epoch {epoch}/{config["training"]["epochs"]} [Train]',
                            unit='it', dynamic_ncols=True, disable=not config['logging']['progress'])
                 try:
                     for batch in bar:
-                        # Reserved training-policy call site, currently constant.
+                        # Apply current LR and reserved future training controls.
                         controls = schedule.values(epoch=epoch, step=global_step)
                         for group in optimizer.param_groups:
                             group['lr'] = controls['lr']
                         result = train_batch(teacher, student, criterion, batch, optimizer,
-                                             crop_size=config['training']['crop_size'], controls=controls)
+                                             crop_size=config['training']['crop_size'], controls=controls,
+                                             augmentation=augmentation,
+                                             augmentation_probability=augmentation_probability)
                         global_step += 1
                         batches += 1
                         epoch_images += result['batch_size']
@@ -97,9 +104,11 @@ def fit(teacher, student, criterion, train_loader, val_loader, optimizer, metric
                             gpu_values.append(gpu)
                         record({'event': 'train', 'epoch': epoch, 'step': global_step, **result,
                                 'lr': controls['lr'], 'grad_clip': controls['grad_clip'],
-                                'loss_weights': controls['loss_weights'], 'gpu_utilization_percent': gpu})
+                                'loss_weights': controls['loss_weights'],
+                                'augmentation_probability': augmentation_probability,
+                                'gpu_utilization_percent': gpu})
                         bar.set_postfix(loss=f'{result["loss"]:.5f}', avg_loss=f'{epoch_loss / epoch_images:.5f}',
-                                        gpu=monitor.display())
+                                        lr=f'{controls["lr"]:.2e}', gpu=monitor.display())
                         maximum = config['training']['max_steps']
                         if maximum is not None and global_step >= maximum:
                             break

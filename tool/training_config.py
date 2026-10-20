@@ -1,4 +1,4 @@
-"""Validated training configuration and the reserved schedule entry point."""
+"""Validated training configuration and optimizer-update scheduling."""
 from copy import deepcopy
 from pathlib import Path
 import math
@@ -24,7 +24,7 @@ def load_training_config(path=DEFAULT_TRAIN_CONFIG):
     with path.open(encoding='utf-8-sig') as source:
         c = yaml.safe_load(source)
     required = {'model', 'runtime', 'training', 'loss', 'validation', 'benchmark',
-                'logging', 'schedule', 'dataset', 'loader'}
+                'logging', 'schedule', 'augmentation', 'dataset', 'loader'}
     if not isinstance(c, dict) or set(c) != required or any(not isinstance(c[k], dict) for k in required):
         raise ValueError(f'train.yaml must contain exactly these mappings: {sorted(required)}')
     expected = {
@@ -33,7 +33,9 @@ def load_training_config(path=DEFAULT_TRAIN_CONFIG):
         'training': {'epochs', 'max_steps', 'crop_size', 'optimizer', 'grad_clip'},
         'loss': LOSS_WEIGHTS | {'projection', 'norm_eps', 'affinity_chunk_size', 'ssim_window', 'ms_ssim_weights'},
         'validation': {'reference', 'lpips_net'}, 'benchmark': {'enabled', 'warmup', 'repeats'},
-        'logging': {'progress', 'gpu_poll_seconds'}, 'schedule': {'kind'},
+        'logging': {'progress', 'gpu_poll_seconds'}, 'schedule': {'kind', 'eta_min'},
+        'augmentation': {'enabled', 'start_probability', 'max_probability', 'peak_fraction',
+                         'stop_fraction', 'noise_std', 'brightness', 'contrast', 'sharpness'},
         'dataset': {'root', 'render_pass', 'splits'},
         'loader': {'batch_size', 'num_workers', 'seed', 'train_shuffle'},
     }
@@ -83,25 +85,52 @@ def load_training_config(path=DEFAULT_TRAIN_CONFIG):
         raise ValueError('Only the agreed Teacher RGB reference is implemented')
     if c['validation']['lpips_net'] not in ('alex', 'vgg', 'squeeze'):
         raise ValueError('lpips_net must be alex, vgg or squeeze')
-    if c['schedule']['kind'] != 'constant':
-        raise ValueError('Only constant schedule is implemented; extend TrainingSchedule for future strategies')
+    if c['schedule']['kind'] not in ('constant', 'cosine'):
+        raise ValueError('schedule.kind must be constant or cosine')
+    _positive(c['schedule']['eta_min'], 'schedule.eta_min', zero=True)
+    if c['schedule']['eta_min'] > c['training']['optimizer']['lr']:
+        raise ValueError('schedule.eta_min cannot exceed the initial optimizer.lr')
+    augmentation = c['augmentation']
+    if type(augmentation['enabled']) is not bool:
+        raise ValueError('augmentation.enabled must be boolean')
+    for key in set(augmentation) - {'enabled'}:
+        _positive(augmentation[key], f'augmentation.{key}', zero=True)
+    if not 0 <= augmentation['start_probability'] <= augmentation['max_probability'] <= 0.25:
+        raise ValueError('augmentation probabilities must satisfy 0 <= start <= max <= 0.25')
+    if not 0 < augmentation['peak_fraction'] < augmentation['stop_fraction'] <= 1:
+        raise ValueError('augmentation fractions must satisfy 0 < peak < stop <= 1')
+    if any(augmentation[key] > 1 for key in ('noise_std', 'brightness', 'contrast', 'sharpness')):
+        raise ValueError('augmentation strengths must be within [0,1]')
     c['config_path'] = str(path)
     return c
 
 
 class TrainingSchedule:
-    """Reserved call site for future epoch/step-dependent training policies.
+    """Stateless per-update LR schedule; other controls remain fixed.
 
     Called before each optimizer update. Return absolute current values, never
-    mutate the base config. Add future strategy definitions here and validate
-    their YAML in load_training_config; the default intentionally stays constant.
+    mutate the base config. For T >= 2 updates, cosine starts at base LR on step
+    zero and reaches eta_min on step T-1. One update uses the base LR. Values
+    beyond the horizon stay at eta_min; no warmup/restarts. This interface also
+    reserves future epoch/step-dependent loss-weight and training policies.
     """
-    def __init__(self, config):
+    def __init__(self, config, *, total_steps=None):
         self.config = deepcopy(config)
+        self.total_steps = total_steps
+        if config['schedule']['kind'] == 'cosine':
+            if type(total_steps) is not int or total_steps < 1:
+                raise ValueError('Cosine scheduling requires positive total_steps')
 
     def values(self, *, epoch, step):
+        if type(step) is not int or step < 0:
+            raise ValueError('step must be a nonnegative integer')
+        lr = self.config['training']['optimizer']['lr']
+        if self.config['schedule']['kind'] == 'cosine':
+            minimum = self.config['schedule']['eta_min']
+            progress = min(step / max(self.total_steps - 1, 1), 1.0)
+            lr = minimum + 0.5 * (lr - minimum) * (1 + math.cos(math.pi * progress))
         return {
-            'lr': self.config['training']['optimizer']['lr'],
+            'lr': lr,
             'grad_clip': self.config['training']['grad_clip'],
             'loss_weights': {key: self.config['loss'][key] for key in LOSS_WEIGHTS},
         }
