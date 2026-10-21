@@ -59,9 +59,13 @@ using smaller images. Validation LPIPS requires real images at least 64x64.
 
 ## Student and losses
 
-E1/E2/E3 use the project's custom pure-PyTorch **SSMStage**, with unchanged widths
-64/128/256 and depths 4/6/8. The configured `cross` scan runs shared bidirectional
-row/column mixers, resetting state per line. E0/E4 remain Swin, the bottleneck
+E1/E2/E3 use the project's custom pure-PyTorch **SSMStage**, with widths
+32/64/128 and depths 2/4/6. Top-level `ssm.rotation: clockwise` and
+`ssm.directions: 2` in `config/model.yaml` configure all three stages. This uses two shared axial
+mixers per block: right+down, down+left, left+up, up+right, repeating every four
+blocks and restarting at each stage. State resets per row/column. SSM checkpointing is controlled by `training.gradient_checkpointing`:
+`true` enables non-reentrant recomputation during training; the current default
+`false` retains activations and avoids recomputation. E0/E4 remain Swin, the bottleneck
 remains ViT, and decoder stages remain Swin. See [SSM modules](model/card/MAMBA.md).
 The sequential selective scan is a research implementation; benchmark actual
 latency/memory rather than assuming it is faster than attention.
@@ -79,7 +83,10 @@ Ltotal     = 3 * Ld + Lrgb
 ```
 
 The Teacher is frozen/eval and runs under `no_grad`. Optional identity-initialized
-1x1 student projections accommodate differing feature bases. They are optimized
+1x1 student projections accommodate differing feature bases and channel widths.
+Their input widths are read from the Student; output widths match Teacher
+64/128/256/1024. Unequal widths require `loss.projection: true`; rectangular
+projections initialize the shared channels to identity and the rest to zero. They are optimized
 and saved with the training checkpoint. Spatial grids differ between the recovered
 Teacher and structural student; [feature alignment](tool/TEACHER_FEATURES.md)
 documents observation points and padding handling.
@@ -145,6 +152,37 @@ latency measurement do not advance the schedule.
 Use `kind: constant` to keep LR fixed (`eta_min` is then unused). Loss-weight
 ramps and other training strategies remain extension points; none are enabled.
 
+`loader.batch_size: 16` 為每次 optimizer 更新的有效批次；
+`training.micro_batch_size: 4` 為 Student 同時前向的張數。每 4 張計算一次
+loss／backward，累積 4 組後裁剪梯度並更新一次，LR 也只前進一次。
+不足 16 張的最後一批以實際張數平均；不同網路尺寸會分組，保留原圖幾何。
+每張影像依 sample ID 讀取乾淨 Teacher 目標，增強只套用 Student。
+改動 Student 方向或 micro-batch 不需要重建 Teacher 快取。
+
+## Teacher feature cache
+
+`training.releas: true` (default) enables this mode. Training first runs the frozen Teacher once on clean train and validation images,
+writing E1/E2/E3/ViT features, raw head and RGB targets to project `output/feats/`.
+Models initialize on CPU. During target generation only Teacher is on the selected
+GPU; after caching Teacher is completely unloaded from GPU and CPU, and cached targets
+are loaded one image at a time. LPIPS moves to GPU only for validation. Teacher latency is measured once during cache creation; student latency is
+measured each epoch, using the same input extent. SGD, cosine LR, augmentation and loss definitions remain unchanged.
+
+All epochs reuse the same cache, loading targets by sample ID for each shuffled
+batch. Complete caches are also reused across runs when Teacher weights, image
+paths/sizes/modification times, crop, preprocessing and backend code match.
+Incomplete or mismatched caches are rebuilt; old caches without a manifest are
+rebuilt once. Augmentation, loss weights and optimizer settings do not invalidate
+clean Teacher targets. Benchmark settings and device also participate in validity.
+
+After successful training the terminal asks `[Done]: Delete cached features? [Y/N]:`: Y clears
+`output/feats/`; N retains it for the next run. EOF or Ctrl+C retains the cache.
+Failed/interrupted training also retains it, with complete caches reusable.
+A process lock protects the directory, including while waiting for the answer.
+`training.releas: true` keeps cache distillation enabled and saves the fixed `blend_scale` in the cache manifest/checkpoint/summary and unloads Teacher;
+`false` keeps the frozen Teacher and Student together on the selected GPU,
+using online distillation without cache reads, writes or cleanup prompt.
+
 ## Student-only augmentation
 
 Training uses a per-image augmentation probability: 10% in epoch 1, rising
@@ -188,3 +226,33 @@ Tests cover loss formulas/gradients, spatial padding alignment, Teacher capture,
 RGB composition parity and a small synthetic training/validation/checkpoint loop.
 Synthetic fixtures do not validate real Teacher checkpoint quality or dataset
 training. Actual runs require local Teacher weights and Sintel files.
+
+Training reserves a fresh `runtime.output_dir` automatically: `output/test`,
+then `output/test_2`, `output/test_3`, etc. Existing directories are preserved,
+including empty ones. The selected absolute path is printed and recorded in
+`resolved_train.yaml` and checkpoints.
+
+Teacher cache creation overlaps CPU image loading/preparation, single-Teacher GPU
+inference, and background atomic writes. Worker counts are automatically estimated
+from the first real sample's preparation/inference/write times and capped by CPU
+affinity/cgroup limits and available RAM. Reader/writer queues have bounded capacity.
+The selected counts are printed and recorded in the cache manifest; this setting
+is separate from `loader.num_workers`, which still controls the training loader.
+
+Cache extraction checkpoints its index after each atomic target write. If a run is
+interrupted after train extraction, the next compatible run reuses completed train
+targets and extracts only missing validation targets. Missing/truncated target files
+are rebuilt individually. The progress log reports reused and newly extracted counts.
+Pipeline/display changes no longer invalidate targets; Teacher capture code, weights,
+images and preprocessing still participate in the fingerprint. Unindexed old files
+cannot be safely resumed and require one complete extraction.
+
+CUDA Teacher cache extraction automatically uses a single-shape CUDA Graph for
+batch-1 inference. Fixed attention biases are reordered once before capture;
+the graph preserves the pinned reference arithmetic and checks head plus all
+captured features for exact equality on its first input. GPU warmup/capture adds
+one-time startup work. CPU execution uses the reference path, and unsupported
+captures report the reason and fall back. Moving Teacher to CPU resets the graph
+and releases its device buffers; normal Teacher inference outside cache creation
+continues to use the reference path. Latency benchmarks of head-only inference
+therefore describe that reference path, not graph-accelerated cache throughput.
