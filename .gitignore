@@ -5,9 +5,21 @@ __pycache__/
 
 # C extensions
 *.so
+
+# Model weights and checkpoints
+/weights/
 *.safetensors
-# Local training/inference outputs and large Sintel downloads
+*.pt
+*.pth
+*.ckpt
+
+# Training/inference outputs, including Teacher feature caches and locks
+/output/
 /outputs/
+/config/output/
+/config/outputs/
+
+# Large Sintel downloads
 /MPI-Sintel-complete/
 /MPI-Sintel-complete.zip
 # Distribution / packaging
