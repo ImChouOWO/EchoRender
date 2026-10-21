@@ -1,80 +1,190 @@
 # EchoRender
 
-Single-image distillation from a frozen recovered DLSS-NR Teacher into a trainable
-SSM/Swin/ViT student. Images are independent: no sequence state or optical flow.
+[繁體中文](CHT-README.md)
 
-## Environment
+![Python](https://img.shields.io/badge/Python-3.12-blue) ![Framework](https://img.shields.io/badge/Framework-PyTorch-orange) ![Architecture](https://img.shields.io/badge/Student-SSM%20%2F%20Swin%20%2F%20ViT-purple) ![License](https://img.shields.io/badge/License-MIT-green)
 
-From the project root, on Windows or Linux:
+Single-image knowledge distillation from a frozen recovered DLSS-NR Teacher into a trainable PyTorch Student. Images are independent, with no optical flow or cross-frame state.
 
-```shell
+```text
+Clean image -> frozen Teacher -> cached head / features / RGB targets
+Same crop -> optional augmentation -> Student -> distillation + RGB losses
+```
+
+<details>
+<summary><em>Current limitations</em></summary>
+
+The Student is a structural research model, not a numerically equivalent NVIDIA implementation. Its custom SSM uses a sequential PyTorch scan rather than an official fused Mamba/VMamba kernel. Metrics measure agreement with Teacher RGB, not quality against independent ground truth. Full-state training resume and a Student image-inference CLI are not implemented.
+
+</details>
+
+---
+
+## Overview
+
+The Teacher uses decoded logical safetensors with `fully_logical=true` and the 71-block HT topology, executed through the pinned MLX-DLSS PyTorch backend. Packed and small-topology checkpoints are unsupported by this training workflow.
+
+### Student architecture
+
+Defined in [config/model.yaml](config/model.yaml). Channels and depths below describe the current configuration, not Teacher block indices.
+
+| Stage | Module | Channels | Blocks |
+|---|---|---:|---:|
+| E0 | Swin | 32 | 2 |
+| E1 | SSM | 32 | 2 |
+| E2 | SSM | 64 | 4 |
+| E3 | SSM | 128 | 6 |
+| E4 | Swin | 512 | 8 |
+| Bottleneck | ViT | 1024 | 8 |
+| Decoder E4 / E3 / E2 / E1 / E0 | Swin | 256 / 128 / 64 / 32 / 32 | 8 / 8 / 6 / 4 / 5 |
+
+E4 projects 256 input channels to 512. Its first decoder upsample also outputs 512 channels for skip addition; the next Swin stage projects to 256. All `Add` inputs must have equal shapes.
+
+E1/E2/E3 and the bottleneck supply distillation features. Trainable 1x1 projections map Student widths to Teacher widths 64/128/256/1024. Shared channels initialize as identity; extra output channels initialize to zero. Unequal widths require `loss.projection: true`.
+
+---
+
+## Project structure
+
+```text
+EchoRender/
+├── README.md / CHT-README.md
+├── config/model.yaml             # Student architecture
+├── config/train.yaml             # Training strategy and dataset
+├── model/card/                   # SSM, attention modules and losses
+├── model/student.py / teacher.py
+├── tool/                        # Data, cache, training and monitoring
+├── docs/TEACHER_INFERENCE.md
+├── weights/                     # Local Teacher weights; ignored by Git
+├── output/feats/                 # Persistent Teacher targets; ignored by Git
+├── train.py / infer.py
+└── pyproject.toml / uv.lock
+```
+
+---
+
+## Installation
+
+### 1. Create the environment
+
+From the project root:
+
+```bash
 uv sync --locked
 ```
 
-Python 3.12 is pinned. Linux/Windows use matching CUDA 12.8 PyTorch and torchvision
-wheels; CPU execution is supported. The MLX-DLSS backend revision is pinned in
-`pyproject.toml` and `uv.lock`. Do not update it without rechecking feature capture.
-LPIPS uses official pretrained AlexNet by default and bundled LPIPS calibration
-weights. The first validation initialization downloads the backbone through
-PyTorch, with checksum verification. Set `TORCH_HOME` to a writable persistent
-cache if needed; otherwise training uses the ignored `.cache/torch` path.
+Python 3.12 is pinned. Linux and Windows use matching CUDA 12.8 PyTorch/torchvision wheels; CPU execution is also supported. The MLX-DLSS revision is pinned in `pyproject.toml` and `uv.lock`; backend changes require feature-capture verification.
 
-## Training configuration
+### 2. Prepare local assets
 
-Edit **`config/train.yaml`**, then run:
+Place decoded Teacher weights at `weights/dlssnr-logical.safetensors` and extract MPI-Sintel-complete. Set `dataset.root` in the existing training YAML to your dataset path. LPIPS defaults to official pretrained AlexNet and downloads its backbone on first initialization. Training defaults `TORCH_HOME` to `.cache/torch` unless already set.
 
-```shell
-uv run --locked python train.py --config config/train.yaml
+---
+
+## Dataset format
+
+```text
+MPI-Sintel-complete/
+├── training/clean/<scene>/frame_0001.png
+├── training/final/<scene>/frame_0001.png
+└── test/clean/<scene>/frame_0001.png
 ```
 
-Teacher weights resolve from the project root and must stay inside its `weights/`
-directory, regardless of YAML location or shell directory. Other paths resolve
-relative to the YAML file. Set:
+The current configuration uses the `clean` pass: 19 training scenes and four validation scenes (`alley_1`, `alley_2`, `temple_2`, `temple_3`), with 864/200 images in the current local dataset. Training and validation scenes cannot overlap; official test data remains separate. `clean` and `final` are render passes, not an automatic input/ground-truth pair.
 
-- `model.teacher_weights`: actual decoded logical safetensors with
-  `fully_logical=true`, using the **71-block HT topology**. Packed/small checkpoints
-  are unsupported for this student.
-- `dataset.root`: extracted MPI-Sintel-complete directory. Defaults to
-  `../MPI-Sintel-complete`, relative to `config/`.
-- `runtime.output_dir`: a fresh directory for each run.
-- `runtime.device`: `auto`, `cpu`, `cuda`, or `cuda:0`.
+The shared center crop is **192x192**. Teacher-compatible preprocessing pads to a minimum extent of 320 and multiples of 64, giving a **320x320 network input** for this crop. Head/RGB losses exclude padding. The configured five-scale MS-SSIM requires real dimensions above 160; LPIPS requires at least 64x64.
 
-The old per-parameter training CLI and separate `config/data.yaml` have been
-removed. Dataset splits, loader settings, seed, optimizer, crop, losses, metrics,
-latency benchmark, logging and schedule all live in `train.yaml`. Model structure
-remains in `config/model.yaml`.
+---
 
-The Sintel default is the `clean` pass, with 19 training scenes and four held-out
-alley/temple validation scenes. Train/validation scenes cannot overlap; the official
-test split is separate. `clean` and `final` are render passes, not an automatic
-input/GT pair. **Both RGB reconstruction and evaluation use the Teacher's composed
-RGB as reference**, per the current training design. These metrics measure
-Teacher fidelity; they do not establish improvement against independent ground truth.
+## Teacher feature cache
 
-The default crop is a shared 320x320 center crop. Teacher preprocessing reflects
-small images to minimum-320/multiple-of-64 geometry, but RGB/head losses exclude
-padding. Five-scale MS-SSIM with window 11 requires real crop height/width >160;
-small images fail explicitly. Change the configured scales/window if intentionally
-using smaller images. Validation LPIPS requires real images at least 64x64.
+| `training.releas` | Behavior |
+|---|---|
+| `true` | Build or reuse targets, save fixed `blend_scale`, fully unload Teacher, then train Student from cache. |
+| `false` | Keep a frozen/eval Teacher and Student on the selected GPU for online distillation; no cache access or deletion prompt. |
 
-## Student and losses
+The existing `releas` key spelling is intentional. Cached targets live at project-root `output/feats/`: clean E1/E2/E3/ViT features, raw four-channel head and composed RGB. Targets are matched by split and sample ID; they are loss targets, not Student inputs.
 
-E1/E2/E3 use the project's custom pure-PyTorch **SSMStage**, with widths
-32/64/128 and depths 2/4/6. Top-level `ssm.rotation: clockwise` and
-`ssm.directions: 2` in `config/model.yaml` configure all three stages. This uses two shared axial
-mixers per block: right+down, down+left, left+up, up+right, repeating every four
-blocks and restarting at each stage. State resets per row/column. SSM checkpointing is controlled by `training.gradient_checkpointing`:
-`true` enables non-reentrant recomputation during training; the current default
-`false` retains activations and avoids recomputation. E0/E4 remain Swin, the bottleneck
-remains ViT, and decoder stages remain Swin. See [SSM modules](model/card/MAMBA.md).
-The sequential selective scan is a research implementation; benchmark actual
-latency/memory rather than assuming it is faster than attention.
+Complete caches are reused across epochs and runs. Compatible partial caches resume per file; missing or truncated targets are rebuilt. Atomic writes update the index after each completed file, and a process lock protects the cache, including the cleanup prompt. Teacher weights, dataset identity, crop, preprocessing, capture/backend code, device and benchmark settings participate in validity. Student architecture, batch sizes, augmentation and optimizer changes do not invalidate clean targets.
 
-All losses are defined in **`model/card/loss.py`**:
+Cache generation uses `torch.inference_mode()`, overlapping CPU reading/preparation, a single Teacher GPU forward and background writes. Reader/writer counts are estimated from the first sample and bounded by CPU/cgroup/RAM limits and queue capacity; they are separate from `loader.num_workers`.
+
+Supported CUDA cache extraction uses a batch-1 CUDA Graph with precomputed attention biases. The first capture checks the head and all captured features for exact equality to the reference path. Unsupported captures report the reason and fall back; OOM is not silently ignored. Graph resources are cleared when Teacher is unloaded. Head-only latency benchmarks describe reference inference, not graph cache throughput.
+
+After successful training:
+
+```text
+[Done]: Delete cached features? [Y/N]:
+```
+
+`Y` clears the cache; `N`, EOF or interruption retains it. Failed training preserves extraction progress.
+
+---
+
+## Model and training configuration
+
+Edit the existing [config/train.yaml](config/train.yaml). Selected settings:
+
+```yaml
+model:
+  student_config: model.yaml
+  student_weights: null
+  teacher_weights: weights/dlssnr-logical.safetensors
+runtime:
+  device: cuda:1
+  cpu_threads: 4
+  output_dir: output/test
+training:
+  epochs: 10
+  gradient_checkpointing: false
+  micro_batch_size: 4
+  releas: true
+  max_steps: null
+  crop_size: 192
+  optimizer:
+    lr: 0.001
+    momentum: 0.0
+    weight_decay: 0.0
+  grad_clip: 1.0
+loader:
+  batch_size: 16
+  num_workers: 0
+  seed: 42
+  train_shuffle: true
+schedule:
+  kind: cosine
+  eta_min: 0.000001
+```
+
+Teacher weights resolve from the project root and must remain inside its `weights/` directory. Other paths resolve relative to the training YAML: `output/test` therefore becomes `config/output/test`. Existing run directories are preserved; new runs use `_2`, `_3`, etc. The selected absolute output path is printed and recorded.
+
+`runtime.device` accepts `auto`, `cpu`, `cuda` and `cuda:N`. CUDA indices refer to visible devices, so `CUDA_VISIBLE_DEVICES` can remap them.
+
+### Training strategy
+
+`loader.batch_size` is the effective number of images per optimizer update. `training.micro_batch_size` is the maximum number forwarded together. The default runs **four groups of four images**, averages gradients over all 16 images, clips gradients and updates once. Short final batches use their actual image count. Different network extents are processed in separate groups without changing image geometry.
+
+`training.gradient_checkpointing: true` recomputes each SSM block during backward to reduce saved activations. `false` retains activations and avoids that recomputation. Validation/inference do not use checkpointing.
+
+In [config/model.yaml](config/model.yaml), `ssm.rotation` accepts `clockwise` or `counterclockwise`; `ssm.directions` accepts 1-4. Current two-direction clockwise blocks rotate **right+down → down+left → left+up → up+right**. Each stage restarts the cycle and each row/column resets its state. See [SSM details](model/card/MAMBA.md).
+
+SGD uses no momentum or weight decay by default. Cosine LR is applied before each optimizer update over `epochs * len(train_loader)`, capped by `max_steps` when set. The first update uses 0.001 and the last uses 0.000001; a one-update run uses the initial LR. There is no warmup or restart. Loss weights remain fixed; cache generation and validation do not advance the schedule. `kind: constant` disables annealing.
+
+### Student-only augmentation
+
+Each selected image receives Gaussian noise plus one uniformly selected adjustment: brightness, contrast or sharpness. Probability starts at 10%, reaches 25% at 50% of configured epochs and switches off from 75% onward. For 10 epochs: epoch 1 is 10%, epochs 5-7 are 25%, and epochs 8-10 are 0%. The cap is a sampling probability, not a guaranteed per-batch count. Short runs may not complete the ramp; `max_steps` does not rescale it.
+
+Noise sigma is sampled from 0-0.02; brightness/contrast factors from 0.8-1.2, sharpness from 0.5-1.5. Teacher targets stay clean. Student preparation and RGB composition use the augmented image. Validation, benchmarks and inference are clean. Augmentation uses its own RNG seeded by `loader.seed`; set `augmentation.enabled: false` to disable it.
+
+---
+
+## Losses
+
+Defined in [model/card/loss.py](model/card/loss.py):
 
 ```text
 E1, E2, E3 = channel-L2-normalized feature MSE
-ViT        = 0.5 * feature MSE + cosine token-affinity MSE (diagonal excluded)
+ViT        = 0.5 * feature MSE + off-diagonal cosine token-affinity MSE
 Lmid       = (E1 + E2 + E3 + ViT) / 4
 Lout       = raw four-channel head MSE
 Ld         = 0.5 * Lmid + 0.5 * Lout
@@ -82,177 +192,48 @@ Lrgb       = 0.5 * RGB MSE + 0.2 * (1 - SSIM) + 0.3 * (1 - MS-SSIM)
 Ltotal     = 3 * Ld + Lrgb
 ```
 
-The Teacher is frozen/eval and runs under `no_grad`. Optional identity-initialized
-1x1 student projections accommodate differing feature bases and channel widths.
-Their input widths are read from the Student; output widths match Teacher
-64/128/256/1024. Unequal widths require `loss.projection: true`; rectangular
-projections initialize the shared channels to identity and the rest to zero. They are optimized
-and saved with the training checkpoint. Spatial grids differ between the recovered
-Teacher and structural student; [feature alignment](tool/TEACHER_FEATURES.md)
-documents observation points and padding handling.
+Feature alignment excludes padding-only cells and preserves physical grid correspondence; see [feature capture and alignment](tool/TEACHER_FEATURES.md). Token affinity uses exact row chunks without token sampling. Teacher targets are detached; only Student and feature adapters enter the optimizer.
 
-RGB composition uses the Teacher's learned blend cap for both outputs. Its
-forward retains FP16 rounding; backward uses a straight-through estimator for
-that rounding, so RGB losses can train the student. Clipping/sigmoid retain their
-actual gradients. This is an explicit training surrogate, not NVIDIA numeric equivalence.
+Both RGB branches use the Teacher's fixed learned blend cap. RGB composition preserves FP16 rounding in forward and uses a straight-through gradient for rounding only; clamp/sigmoid retain their actual gradients. This is a training surrogate, not NVIDIA numerical equivalence. Reconstruction and PSNR/SSIM/LPIPS all reference Teacher RGB.
 
-## Progress, evaluation and outputs
+---
 
-`tqdm` displays epoch/total, current loss, running image-weighted epoch loss,
-iteration rate and **GPU utilization (%)**, not VRAM usage. NVML is polled no more
-than once per configured interval and uses the CUDA device UUID. CPU or unavailable
-NVML displays `N/A`, never a fabricated 0%. Utilization reflects the whole device.
+## Run, monitor and verify
 
-Each epoch evaluates the full validation split with PSNR, SSIM and pretrained
-LPIPS. Both image means and equal-weight scene means are saved. PSNR for identical
-images is infinite, serialized as the string `"Infinity"` in strict JSON.
-
-The optional latency benchmark separately measures Teacher and student float32
-batch-1 forward passes on the first validation sample's prepared dimensions.
-It uses warm-up, CUDA synchronization, eval mode and no feature capture. Timings
-exclude loading, preprocessing, composition and backward. They are measured once
-per epoch, not inferred from training iteration rate.
-
-Outputs:
-
-- `metrics.jsonl`: every step's raw/weighted loss components, current controls,
-  GPU utilization, and epoch validation/benchmark results.
-- `last.pt`: v2 student, feature adapters, optimizer, progress and configurations.
-- `summary.json`: epoch results, parameter counts and peak CUDA allocation.
-- `resolved_train.yaml`: resolved paths and settings used for the run.
-
-`max_steps` limits optimizer updates, but still runs full validation and saves a
-checkpoint. `model.student_weights` initializes only the student from a v2 checkpoint;
-it starts a new run with fresh optimizer/adapters. Full-state resume and legacy
-checkpoint compatibility are intentionally not provided.
-
-## Learning-rate scheduling
-
-`tool/training_config.py:TrainingSchedule.values(epoch=..., step=...)` is called
-before every optimizer update. It returns the scheduled `lr`, fixed `grad_clip`
-and fixed loss coefficients from YAML. The trainer applies and logs these values.
-`step` is the number of updates already completed; `epoch` starts at 1.
-
-The optimizer remains **SGD**, with momentum and weight decay configured under
-`training.optimizer` (both default to zero). The default schedule is:
-
-```yaml
-schedule:
-  kind: cosine
-  eta_min: 0.000001
-```
-
-Cosine annealing runs once across the planned optimizer updates, with no warmup
-or restarts. The horizon is `min(epochs * len(train_loader), max_steps)` when a
-step cap is present. With T >= 2, the LR used by the first update is the configured
-initial LR (default 0.001); the last update uses `eta_min`. A one-update run uses
-the initial LR. Values remain at the minimum after the horizon. Validation and
-latency measurement do not advance the schedule.
-
-Use `kind: constant` to keep LR fixed (`eta_min` is then unused). Loss-weight
-ramps and other training strategies remain extension points; none are enabled.
-
-`loader.batch_size: 16` 為每次 optimizer 更新的有效批次；
-`training.micro_batch_size: 4` 為 Student 同時前向的張數。每 4 張計算一次
-loss／backward，累積 4 組後裁剪梯度並更新一次，LR 也只前進一次。
-不足 16 張的最後一批以實際張數平均；不同網路尺寸會分組，保留原圖幾何。
-每張影像依 sample ID 讀取乾淨 Teacher 目標，增強只套用 Student。
-改動 Student 方向或 micro-batch 不需要重建 Teacher 快取。
-
-## Teacher feature cache
-
-`training.releas: true` (default) enables this mode. Training first runs the frozen Teacher once on clean train and validation images,
-writing E1/E2/E3/ViT features, raw head and RGB targets to project `output/feats/`.
-Models initialize on CPU. During target generation only Teacher is on the selected
-GPU; after caching Teacher is completely unloaded from GPU and CPU, and cached targets
-are loaded one image at a time. LPIPS moves to GPU only for validation. Teacher latency is measured once during cache creation; student latency is
-measured each epoch, using the same input extent. SGD, cosine LR, augmentation and loss definitions remain unchanged.
-
-All epochs reuse the same cache, loading targets by sample ID for each shuffled
-batch. Complete caches are also reused across runs when Teacher weights, image
-paths/sizes/modification times, crop, preprocessing and backend code match.
-Incomplete or mismatched caches are rebuilt; old caches without a manifest are
-rebuilt once. Augmentation, loss weights and optimizer settings do not invalidate
-clean Teacher targets. Benchmark settings and device also participate in validity.
-
-After successful training the terminal asks `[Done]: Delete cached features? [Y/N]:`: Y clears
-`output/feats/`; N retains it for the next run. EOF or Ctrl+C retains the cache.
-Failed/interrupted training also retains it, with complete caches reusable.
-A process lock protects the directory, including while waiting for the answer.
-`training.releas: true` keeps cache distillation enabled and saves the fixed `blend_scale` in the cache manifest/checkpoint/summary and unloads Teacher;
-`false` keeps the frozen Teacher and Student together on the selected GPU,
-using online distillation without cache reads, writes or cleanup prompt.
-
-## Student-only augmentation
-
-Training uses a per-image augmentation probability: 10% in epoch 1, rising
-linearly to 25% at 50% of the configured epochs, then held until augmentation
-is disabled from 75% onward (rounded up to the next integer epoch). For the
-default 10 epochs: epoch 1 = 10%, epoch 5 = 25%, epochs 5–7 = 25%, epochs 8–10 = 0%.
-Short runs may reach the cutoff before a full ramp is possible. `max_steps`
-does not rescale this epoch schedule. The 25% cap is a sampling probability;
-actual sample counts fluctuate, and `augmented_samples` records the count.
-
-Every selected image receives Gaussian noise followed by exactly one uniformly
-selected adjustment: brightness, contrast, or sharpness. In `augmentation`,
-`noise_std: 0.02` sets the maximum sigma (uniformly sampled from 0 to 0.02 on
-RGB in [0,1]); brightness/contrast factors range from 0.8 to 1.2, and sharpness
-from 0.5 to 1.5. These are configurable strengths, separate from probability.
-
-Teacher inputs, raw-head/feature/RGB targets remain clean. The same center crop
-is used by both branches; student features and RGB composition use the corrupted
-image. Validation, benchmarks, and inference remain clean. Loss weights, SGD,
-and cosine LR settings are unchanged. Augmentation has its own RNG seeded by
-`loader.seed`; training logs include `augmentation_probability` and
-`augmented_samples`. Set `augmentation.enabled: false` to disable it.
-
-## Teacher-only inference
-
-```shell
-uv run --locked python infer.py --input input.png --weights /path/to/dlssnr-logical.safetensors --output outputs/teacher.png
-```
-
-Inference saves RGB at original image dimensions. Existing outputs require
-`--overwrite`; `--report` saves metadata. See [Teacher](docs/TEACHER_INFERENCE.md).
-Student-only image CLI inference remains outside the implemented training workflow.
-
-## Verification
-
-```shell
+```bash
+uv run --locked python train.py --config config/train.yaml
 uv run --locked python -m unittest tool.test_training -v
 ```
 
-Tests cover loss formulas/gradients, spatial padding alignment, Teacher capture,
-RGB composition parity and a small synthetic training/validation/checkpoint loop.
-Synthetic fixtures do not validate real Teacher checkpoint quality or dataset
-training. Actual runs require local Teacher weights and Sintel files.
+Progress shows epoch, loss, running image-weighted loss, iteration rate and GPU utilization. NVML matches the configured CUDA device by UUID. Utilization covers the whole device; unavailable readings display `N/A`.
 
-Training reserves a fresh `runtime.output_dir` automatically: `output/test`,
-then `output/test_2`, `output/test_3`, etc. Existing directories are preserved,
-including empty ones. The selected absolute path is printed and recorded in
-`resolved_train.yaml` and checkpoints.
+Every epoch evaluates the full validation split, recording image means and equal-weight scene means for PSNR/SSIM/LPIPS. Infinite PSNR is serialized as `"Infinity"`. The optional batch-1 FP32 latency benchmark uses warmup, synchronization and eval mode, excluding preprocessing, feature capture, composition and backward. Teacher reference timing is retained from cache creation in cached mode; Student timing is measured each epoch.
 
-Teacher cache creation overlaps CPU image loading/preparation, single-Teacher GPU
-inference, and background atomic writes. Worker counts are automatically estimated
-from the first real sample's preparation/inference/write times and capped by CPU
-affinity/cgroup limits and available RAM. Reader/writer queues have bounded capacity.
-The selected counts are printed and recorded in the cache manifest; this setting
-is separate from `loader.num_workers`, which still controls the training loader.
+| Output | Contents |
+|---|---|
+| `metrics.jsonl` | Per-update losses, controls, augmentation counts, GPU utilization and epoch evaluation. |
+| `last.pt` | v2 Student, feature adapters, optimizer, progress, model/train configurations and blend scale. |
+| `summary.json` | Epoch results, parameter counts and peak CUDA allocation. |
+| `resolved_train.yaml` | Resolved paths and run settings. |
 
-Cache extraction checkpoints its index after each atomic target write. If a run is
-interrupted after train extraction, the next compatible run reuses completed train
-targets and extracts only missing validation targets. Missing/truncated target files
-are rebuilt individually. The progress log reports reused and newly extracted counts.
-Pipeline/display changes no longer invalidate targets; Teacher capture code, weights,
-images and preprocessing still participate in the fingerprint. Unindexed old files
-cannot be safely resumed and require one complete extraction.
+`max_steps` caps optimizer updates while still running validation and checkpoint saving. `model.student_weights` loads only Student weights into a new run with fresh optimizer/adapters. Tests cover gradients, projection widths, scan directions, batching, cache lifecycle and scheduling; synthetic fixtures do not establish real-data model quality.
 
-CUDA Teacher cache extraction automatically uses a single-shape CUDA Graph for
-batch-1 inference. Fixed attention biases are reordered once before capture;
-the graph preserves the pinned reference arithmetic and checks head plus all
-captured features for exact equality on its first input. GPU warmup/capture adds
-one-time startup work. CPU execution uses the reference path, and unsupported
-captures report the reason and fall back. Moving Teacher to CPU resets the graph
-and releases its device buffers; normal Teacher inference outside cache creation
-continues to use the reference path. Latency benchmarks of head-only inference
-therefore describe that reference path, not graph-accelerated cache throughput.
+With the current E4-512 model, crop 192, micro-batch 4, effective batch 16 and checkpointing off, two short updates on GPU 1 (RTX 5000 Ada) reached about **29.14 GiB allocated / 29.81 GiB reserved** and took **8-9 seconds per update**. These observations are not a full-epoch benchmark or a memory guarantee.
+
+Weights, checkpoints, Teacher caches and output directories are excluded by `.gitignore`. Keep `uv.lock` versioned for reproducibility.
+
+---
+
+## Teacher inference
+
+```bash
+uv run --locked python infer.py --input input.png --weights weights/dlssnr-logical.safetensors --output outputs/teacher.png --device cuda:1
+```
+
+Output PNGs keep the original image dimensions. Use `--overwrite` to replace an existing output and `--report path.json` for timings/metadata. See [Teacher inference](docs/TEACHER_INFERENCE.md).
+
+---
+
+## License
+
+Project code is licensed under [MIT](LICENSE). External dependencies, datasets and Teacher weights retain their own terms.
