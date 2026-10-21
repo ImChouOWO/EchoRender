@@ -4,13 +4,16 @@ model:
   student_weights: null
   teacher_weights: weights/dlssnr-logical.safetensors
 runtime:
-  device: auto
+  device: cuda:1
   cpu_threads: 4
-  output_dir: output/train
+  output_dir: output/test  # existing directories get _2, _3, ...
 training:
   epochs: 10
+  gradient_checkpointing: false  # SSM 反向重算：true 節省顯存，false 減少重算
+  micro_batch_size: 4  # simultaneous Student images; gradients accumulate to loader.batch_size
+  releas: true  # true: cache once and unload Teacher; false: frozen online Teacher, no cache
   max_steps: null
-  crop_size: 320  # shared center crop; 0 keeps original image dimensions
+  crop_size: 192  # shared center crop; 0 keeps original image dimensions
   optimizer:
     lr: 0.001
     momentum: 0.0
@@ -64,7 +67,7 @@ augmentation:
   sharpness: 0.50
 
 dataset:
-  root: ../MPI-Sintel-complete
+  root: /home/soic/Desktop/MPI-Sintel-complete
   render_pass: clean
   splits:
     train:
@@ -79,7 +82,7 @@ dataset:
       source: test
       scenes: null
 loader:
-  batch_size: 1
+  batch_size: 16  # effective images per optimizer update6
   num_workers: 0
   seed: 42
   train_shuffle: true
