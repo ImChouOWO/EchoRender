@@ -8,6 +8,7 @@ import math
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 
 __all__ = ['Mamba', 'MambaBlock', 'MambaStage', 'SSMStage', 'selective_scan']
 
@@ -76,47 +77,58 @@ class Mamba(nn.Module):
 
 
 class MambaBlock(nn.Module):
-    """BCHW residual mixer. raster: flattened image; cross: four axial scans.
-
-cross shares mixer weights between directions and resets state per row/column.
-It is a custom image wrapper, not VMamba's exact SS2D implementation.
-"""
-    def __init__(self, channels, state_dim=16, d_conv=4, expand=2, scan='raster'):
+    """Shared axial mixer, rotating the selected directions between blocks."""
+    def __init__(self, channels, state_dim=16, d_conv=4, expand=2, *,
+                 rotation='clockwise', directions=2, index=0):
         super().__init__()
-        if scan not in ('raster', 'cross'):
-            raise ValueError('scan must be raster or cross')
-        self.scan = scan
+        if rotation not in ('clockwise', 'counterclockwise'):
+            raise ValueError('rotation must be clockwise or counterclockwise')
+        if type(directions) is not int or not 1 <= directions <= 4:
+            raise ValueError('directions must be an integer from 1 to 4')
+        # 0=right, 1=down, 2=left, 3=up; every stage starts at right.
+        cycle = (0, 1, 2, 3) if rotation == 'clockwise' else (0, 3, 2, 1)
+        self.scan_directions = tuple(cycle[(index + offset) % 4] for offset in range(directions))
         self.norm = nn.LayerNorm(channels)
         self.mixer = Mamba(channels, state_dim, d_conv, expand)
-
-    def _bidirectional(self, sequence):
-        return (self.mixer(sequence) + self.mixer(sequence.flip(1)).flip(1)) * 0.5
 
     def forward(self, x):
         if x.ndim != 4 or min(x.shape[-2:]) < 1:
             raise ValueError('Expected nonempty BCHW image')
         b, c, h, w = x.shape
         z = self.norm(x.permute(0, 2, 3, 1))
-        if self.scan == 'raster':
-            y = self.mixer(z.reshape(b, h * w, c)).reshape(b, h, w, c)
-        else:
-            rows = self._bidirectional(z.reshape(b * h, w, c)).reshape(b, h, w, c)
-            cols = self._bidirectional(z.permute(0, 2, 1, 3).reshape(b * w, h, c))
-            cols = cols.reshape(b, w, h, c).permute(0, 2, 1, 3)
-            y = (rows + cols) * 0.5
+        outputs = []
+        for direction in self.scan_directions:
+            horizontal = direction in (0, 2)
+            sequence = z.reshape(b * h, w, c) if horizontal else z.permute(0, 2, 1, 3).reshape(b * w, h, c)
+            reverse = direction in (2, 3)
+            value = self.mixer(sequence.flip(1)).flip(1) if reverse else self.mixer(sequence)
+            value = value.reshape(b, h, w, c) if horizontal else value.reshape(b, w, h, c).permute(0, 2, 1, 3)
+            outputs.append(value)
+        y = torch.stack(outputs).mean(0)
         return x + y.permute(0, 3, 1, 2).contiguous()
 
 
 class MambaStage(nn.Module):
-    def __init__(self, c1, c2, depth=2, state_dim=16, d_conv=4, expand=2, scan='raster'):
+    def __init__(self, c1, c2, depth=2, state_dim=16, d_conv=4, expand=2, *,
+                 rotation='clockwise', directions=2):
         super().__init__()
         if type(depth) is not int or depth < 1 or c1 < 1 or c2 < 1:
             raise ValueError('Channels and depth must be positive')
+        self.gradient_checkpointing = True
         self.adapter = nn.Conv2d(c1, c2, 1) if c1 != c2 else nn.Identity()
-        self.blocks = nn.Sequential(*(MambaBlock(c2, state_dim, d_conv, expand, scan) for _ in range(depth)))
+        self.blocks = nn.Sequential(*(MambaBlock(c2, state_dim, d_conv, expand,
+                                               rotation=rotation, directions=directions, index=i)
+                                      for i in range(depth)))
 
     def forward(self, x):
-        return self.blocks(self.adapter(x))
+        x = self.adapter(x)
+        for block in self.blocks:
+            # Recompute one scan block during backward instead of retaining every state.
+            if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
+                x = checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
+        return x
 
 
 SSMStage = MambaStage

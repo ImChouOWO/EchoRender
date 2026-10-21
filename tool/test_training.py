@@ -18,13 +18,14 @@ from mlxdlss.topology import HT
 from model.card.loss import (DistillationLoss, normalized_feature_mse,
                              token_affinity_loss, align_features)
 from model.student import EchoRenderStudent
-from tool.training_config import load_training_config, TrainingSchedule
+from tool.training_config import load_training_config, TrainingSchedule, reserve_output_dir
 from tool.teacher_pipeline import PreparedImage, prepare_image, compose_image, compose_rgb_tensor
 from tool.teacher_features import FeatureRecordingBackend
 from tool.distillation import train_batch, sample_objective, StudentAugmentation
 from tool.trainer import fit
 from tool.dataloader import SintelImageDataset, build_dataloader, load_data_config
 from tool.monitoring import GPUMonitor
+from tool.teacher_features import TeacherFeatureCache, ask_delete_cache
 from torchvision.transforms import functional as TF
 
 
@@ -32,9 +33,9 @@ from torchvision.transforms import functional as TF
 def tiny_model():
     rows = [
         [-1, 1, 'InputAdapter', [4]], [-1, 1, 'SwinStage', [4, 1, 1, 2, 1]],
-        [-1, 1, 'Downsample', [4]], [-1, 1, 'SSMStage', [4, 1, 2, 2, 1, 'cross']],
-        [-1, 1, 'Downsample', [4]], [-1, 1, 'SSMStage', [4, 1, 2, 2, 1, 'cross']],
-        [-1, 1, 'Downsample', [4]], [-1, 1, 'SSMStage', [4, 1, 2, 2, 1, 'cross']],
+        [-1, 1, 'Downsample', [4]], [-1, 1, 'SSMStage', [4, 1, 2, 2, 1]],
+        [-1, 1, 'Downsample', [4]], [-1, 1, 'SSMStage', [4, 1, 2, 2, 1]],
+        [-1, 1, 'Downsample', [4]], [-1, 1, 'SSMStage', [4, 1, 2, 2, 1]],
         [-1, 1, 'Downsample', [4]], [-1, 1, 'SwinStage', [4, 1, 1, 2, 1]],
         [-1, 1, 'Downsample', [4]], [-1, 1, 'ViTStage', [4, 1, 1, 1]],
     ]
@@ -87,6 +88,11 @@ class TrainingTests(unittest.TestCase):
         torch.manual_seed(7)
 
     def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        cache_patch = patch('tool.trainer.FEATURE_CACHE_DIR', Path(directory.name) / 'feats')
+        cache_patch.start()
+        self.addCleanup(cache_patch.stop)
         self.config = load_training_config()
 
     def criterion(self):
@@ -94,11 +100,147 @@ class TrainingTests(unittest.TestCase):
         config.update(ssim_window=3, ms_ssim_weights=[0.3, 0.3, 0.4])
         return DistillationLoss(config, channels=dict.fromkeys(('e1', 'e2', 'e3', 'vit'), 4))
 
+    def test_ssm_checkpoint_matches_outputs_and_gradients(self):
+        from model.card.mamba import MambaStage
+        stage = MambaStage(4, 4, depth=2, state_dim=2, rotation='clockwise', directions=2).double()
+        reference = deepcopy(stage)
+        for requires_grad in (False, True):
+            stage.zero_grad(set_to_none=True)
+            reference.zero_grad(set_to_none=True)
+            x = torch.randn(1, 4, 3, 5, dtype=torch.float64, requires_grad=requires_grad)
+            other = x.detach().clone().requires_grad_(requires_grad)
+            actual = stage(x)
+            expected = reference.blocks(reference.adapter(other))
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            actual.square().mean().backward()
+            expected.square().mean().backward()
+            for a, b in zip(stage.parameters(), reference.parameters()):
+                self.assertIsNotNone(a.grad)
+                torch.testing.assert_close(a.grad, b.grad, rtol=1e-10, atol=1e-12)
+            if requires_grad:
+                torch.testing.assert_close(x.grad, other.grad, rtol=1e-10, atol=1e-12)
+        with patch('model.card.mamba.checkpoint', side_effect=AssertionError('unexpected checkpoint')):
+            with torch.no_grad():
+                stage(x)
+            stage.eval()(x)
+            stage.train().gradient_checkpointing = False
+            output = stage(x)
+            torch.testing.assert_close(output, reference.blocks(reference.adapter(x)), rtol=0, atol=0)
+            output.sum().backward()
+
+    def test_clockwise_scans_rotate_and_reset_each_stage(self):
+        from model.card.mamba import MambaStage, MambaBlock
+        class PrefixSum(nn.Module):
+            def forward(self, x):
+                return x.cumsum(1)
+        x = torch.arange(30, dtype=torch.float64).reshape(1, 2, 3, 5)
+        for rotation in range(4):
+            block = MambaBlock(2, rotation='clockwise', directions=2, index=rotation).double()
+            block.norm = nn.Identity()
+            block.mixer = PrefixSum()
+            horizontal = x.flip(3).cumsum(3).flip(3) if rotation in (1, 2) else x.cumsum(3)
+            vertical = x.flip(2).cumsum(2).flip(2) if rotation in (2, 3) else x.cumsum(2)
+            torch.testing.assert_close(block(x), x + (horizontal + vertical) * 0.5, rtol=0, atol=0)
+        for depth in (4, 6, 8):
+            stage = MambaStage(4, 4, depth=depth, rotation='clockwise', directions=2)
+            self.assertEqual([b.scan_directions for b in stage.blocks],
+                             [((i % 4), (i + 1) % 4) for i in range(depth)])
+
+    def test_ssm_scan_config_counts_rotation_and_validation(self):
+        from model.card.mamba import MambaBlock
+        class PrefixSum(nn.Module):
+            def forward(self, x):
+                return x.cumsum(1)
+        x = torch.arange(30, dtype=torch.float64).reshape(1, 2, 3, 5)
+        directional = (x.cumsum(3), x.cumsum(2),
+                       x.flip(3).cumsum(3).flip(3), x.flip(2).cumsum(2).flip(2))
+        config = tiny_model().config
+        for rotation, cycle in (('clockwise', (0, 1, 2, 3)), ('counterclockwise', (0, 3, 2, 1))):
+            for count in range(1, 5):
+                for index in range(4):
+                    block = MambaBlock(2, rotation=rotation, directions=count, index=index).double()
+                    block.norm, block.mixer = nn.Identity(), PrefixSum()
+                    expected_directions = tuple(cycle[(index + n) % 4] for n in range(count))
+                    self.assertEqual(block.scan_directions, expected_directions)
+                    expected = x + torch.stack([directional[d] for d in expected_directions]).mean(0)
+                    torch.testing.assert_close(block(x), expected, rtol=0, atol=0)
+                config['ssm'] = {'rotation': rotation, 'directions': count}
+                model = EchoRenderStudent(config)
+                for layer in (3, 5, 7):
+                    self.assertEqual(model.layers[layer].blocks[0].scan_directions, cycle[:count])
+        for invalid in ({'rotation': 'invalid', 'directions': 2},
+                        {'rotation': 'clockwise', 'directions': 0},
+                        {'rotation': 'clockwise', 'directions': 5},
+                        {'rotation': 'clockwise', 'directions': True},
+                        {'rotation': 'clockwise', 'directions': 1.5},
+                        {'directions': 2}):
+            config['ssm'] = invalid
+            with self.assertRaises(ValueError):
+                EchoRenderStudent(config)
+
+    def test_microbatch_matches_individual_gradients_and_sample_targets(self):
+        for ragged in (False, True):
+            with self.subTest(ragged=ragged), patch('tool.distillation.prepare_image', identity_prepare):
+                student = tiny_model()
+                reference = deepcopy(student)
+                criterion = self.criterion()
+                reference_criterion = deepcopy(criterion)
+                teacher = FixtureTeacher()
+                sizes = (32, 32, 40, 32, 32) if ragged else (32,) * 5
+                images = [torch.rand(3, size, 32) for size in sizes]
+                ids = [f'fixture/{i}' for i in (4, 1, 3, 0, 2)]
+                batch = {'images': images, 'sample_ids': ids}
+                target_by_id = {}
+                for image, sample_id in zip(images, ids):
+                    prepared = identity_prepare(image.permute(1, 2, 0).numpy())
+                    head, features = teacher(prepared.features, return_features=True)
+                    target_by_id[sample_id] = (head, features, compose_rgb_tensor(head, prepared, blend_scale=.5))
+                class Cache:
+                    def __init__(self):
+                        self.loaded = []
+                    def load(self, split, sample_id, device):
+                        self.loaded.append((split, sample_id))
+                        return target_by_id[sample_id]
+                cache = Cache()
+                controls = TrainingSchedule(self.config, total_steps=2).values(epoch=1, step=0)
+                params = [*student.parameters(), *criterion.parameters()]
+                ref_params = [*reference.parameters(), *reference_criterion.parameters()]
+                optimizer = torch.optim.SGD(params, lr=.001)
+                ref_optimizer = torch.optim.SGD(ref_params, lr=.001)
+                ref_augmentation = StudentAugmentation(self.config)
+                losses = []
+                for image in images:
+                    loss, _, _, _ = sample_objective(teacher, reference, reference_criterion, image,
+                        crop_size=0, loss_weights=controls['loss_weights'], augmentation=ref_augmentation,
+                        augmentation_probability=1.0)
+                    losses.append(loss.item())
+                    (loss / len(images)).backward()
+                torch.nn.utils.clip_grad_norm_(ref_params, controls['grad_clip'])
+                ref_optimizer.step()
+                calls = []
+                handle = student.register_forward_pre_hook(lambda mod, args: calls.append(args[0].shape[0]))
+                try:
+                    result = train_batch(None, student, criterion, batch, optimizer, crop_size=0,
+                        controls=controls, target_cache=cache, blend_scale=.5, micro_batch_size=2,
+                        augmentation=StudentAugmentation(self.config), augmentation_probability=1.0)
+                finally:
+                    handle.remove()
+                self.assertEqual(calls, [2, 1, 2] if ragged else [2, 2, 1])
+                self.assertEqual(result['micro_batch_sizes'], calls)
+                self.assertEqual(result['batch_size'], 5)
+                self.assertEqual(result['augmented_samples'], 5)
+                self.assertEqual(cache.loaded, [('train', sample_id) for sample_id in ids])
+                self.assertAlmostEqual(result['loss'], sum(losses) / 5, places=5)
+                for p, expected in zip(params, ref_params):
+                    torch.testing.assert_close(p.grad, expected.grad, rtol=2e-4, atol=2e-6)
+                    torch.testing.assert_close(p, expected, rtol=2e-5, atol=2e-6)
+
     def test_config_and_default_architecture(self):
         import yaml
         c = yaml.safe_load(Path(self.config['model']['student_config']).read_text(encoding='utf-8-sig'))
         self.assertEqual([c['backbone'][i][2] for i in (3, 5, 7)], ['SSMStage'] * 3)
-        self.assertEqual([c['backbone'][i][3][1] for i in (1, 3, 5, 7, 9, 11)], [5, 4, 6, 8, 8, 8])
+        self.assertEqual(c['ssm'], {'rotation': 'clockwise', 'directions': 2})
+        self.assertEqual([c['backbone'][i][3][1] for i in (1, 3, 5, 7, 9, 11)], [2, 2, 4, 6, 8, 8])
         controls = TrainingSchedule(self.config, total_steps=1001)
         self.assertEqual(controls.values(epoch=1, step=0)['lr'], self.config['training']['optimizer']['lr'])
         self.assertEqual(controls.values(epoch=100, step=1000)['lr'], self.config['schedule']['eta_min'])
@@ -108,7 +250,8 @@ class TrainingTests(unittest.TestCase):
 
     def test_config_rejects_invalid_values(self):
         import yaml
-        for section, key, value in [('training', 'epochs', 0), ('loss', 'output', -1),
+        for section, key, value in [('training', 'epochs', 0), ('training', 'gradient_checkpointing', 'false'), ('training', 'micro_batch_size', 0),
+                                     ('training', 'micro_batch_size', True), ('training', 'releas', 'yes'), ('loss', 'output', -1),
                                      ('schedule', 'kind', 'unknown'), ('schedule', 'eta_min', -1),
                                      ('schedule', 'eta_min', 1), ('logging', 'progress', 'yes'),
                                      ('augmentation', 'enabled', 'yes'),
@@ -217,6 +360,39 @@ class TrainingTests(unittest.TestCase):
         self.assertIsNone(th.grad)
         self.assertIsNone(tr.grad)
         self.assertGreater(sr.grad.abs().sum().item(), 0)
+
+    def test_narrow_student_projects_features_to_teacher_widths(self):
+        source = dict(e1=2, e2=3, e3=4, vit=4)
+        target = dict(e1=4, e2=5, e3=6, vit=4)
+        config = dict(self.criterion().config)
+        criterion = DistillationLoss(config, channels=target, student_channels=source)
+        for name in source:
+            torch.testing.assert_close(criterion.projections[name].weight[:, :, 0, 0],
+                                       torch.eye(target[name], source[name]))
+        features = {name: torch.randn(1, source[name], 4, 4, requires_grad=True) for name in source}
+        teacher = {name: torch.randn(1, target[name], max(1, 32 // stride), max(1, 32 // stride),
+                                    requires_grad=True)
+                   for name, stride in {'e1': 4, 'e2': 8, 'e3': 16, 'vit': 64}.items()}
+        head = torch.rand(1, 32, 32, 4, requires_grad=True)
+        rgb = torch.rand(1, 3, 32, 32, requires_grad=True)
+        loss, _ = criterion(head, torch.rand_like(head), features, teacher, rgb, torch.rand_like(rgb),
+                            image_hw=(32, 32), network_hw=(32, 32))
+        loss.backward()
+        self.assertTrue(all(p.grad is not None and torch.isfinite(p.grad).all() for p in criterion.parameters()))
+        self.assertTrue(all(v.grad is not None and torch.isfinite(v.grad).all() for v in features.values()))
+        self.assertTrue(all(v.grad is None for v in teacher.values()))
+        with self.assertRaisesRegex(ValueError, 'projection must be true'):
+            DistillationLoss({**config, 'projection': False}, channels=target, student_channels=source)
+
+    def test_current_student_merge_widths_and_feature_projections(self):
+        student = EchoRenderStudent(self.config['model']['student_config'])
+        source = {name: student.channels[index] for name, index in student.FEATURE_LAYERS.items()}
+        criterion = DistillationLoss(self.config['loss'], student_channels=source)
+        for name, width in source.items():
+            self.assertEqual(criterion.projections[name].in_channels, width)
+        for add_index in (13, 16, 19, 22, 25):
+            skip_index = student.sources[add_index][1]
+            self.assertEqual(student.channels[add_index - 1], student.channels[skip_index])
 
     def test_ms_ssim_identical_and_small_image_error(self):
         c = DistillationLoss(self.config['loss'])
@@ -343,6 +519,8 @@ class TrainingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch('tool.distillation.prepare_image', identity_prepare):
             c['runtime']['output_dir'] = directory
             summary = fit(teacher, student, criterion, [batch], [batch], optimizer, MetricFixture(), c, schedule=schedule)
+            for index in (3, 5, 7):
+                self.assertEqual(student.layers[index].gradient_checkpointing, c['training']['gradient_checkpointing'])
             self.assertEqual(summary['global_step'], 1)
             self.assertEqual(summary['epochs_run'], 1)
             self.assertTrue(summary['teacher_unchanged'])
@@ -363,7 +541,7 @@ class TrainingTests(unittest.TestCase):
         optimizer = torch.optim.SGD(list(student.parameters()) + list(criterion.parameters()), lr=0.001)
         batch = {'images': [torch.rand(3, 32, 32)], 'sample_ids': ['fixture/1'], 'scenes': ['fixture']}
         c = deepcopy(self.config)
-        c['training'].update(epochs=3, max_steps=3, crop_size=32)
+        c['training'].update(epochs=3, max_steps=3, crop_size=32, gradient_checkpointing=True)
         c['benchmark']['enabled'] = False
         c['logging']['progress'] = False
         class MetricFixture(nn.Module):
@@ -372,6 +550,7 @@ class TrainingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch('tool.distillation.prepare_image', identity_prepare):
             c['runtime']['output_dir'] = directory
             summary = fit(teacher, student, criterion, [batch, batch], [batch], optimizer, MetricFixture(), c)
+            self.assertTrue(all(student.layers[i].gradient_checkpointing for i in (3, 5, 7)))
             records = [json.loads(line) for line in (Path(directory) / 'metrics.jsonl').read_text().splitlines()]
             updates = [row for row in records if row['event'] == 'train']
             self.assertEqual([row['epoch'] for row in updates], [1, 1, 2])
@@ -505,6 +684,475 @@ class TrainingTests(unittest.TestCase):
             self.assertEqual(updates[0]['lr'], .001)
             self.assertEqual(updates[-1]['lr'], .000001)
             self.assertTrue(summary['teacher_unchanged'])
+
+    def test_feature_cache_matches_online_loss_and_gradients(self):
+        c = deepcopy(self.config)
+        c['training']['crop_size'] = 32
+        c['benchmark']['enabled'] = False
+        c['logging']['progress'] = False
+        student, teacher, criterion = tiny_model(), FixtureTeacher(), self.criterion()
+        image = torch.rand(3, 32, 32)
+        batch = {'images': [image], 'sample_ids': ['../../fixture/1'], 'scenes': ['fixture']}
+        with tempfile.TemporaryDirectory() as directory, patch('tool.distillation.prepare_image', identity_prepare):
+            cache = TeacherFeatureCache(Path(directory) / 'feats')
+            cache.open()
+            try:
+                cache.build(teacher, [batch], [batch], c)
+                self.assertEqual(len(list(cache.directory.glob('*.pt'))), 2)
+                targets = cache.load('train', batch['sample_ids'][0], 'cpu')
+                self.assertEqual(set(targets[1]), {'e1', 'e2', 'e3', 'vit'})
+                self.assertTrue(all(not value.requires_grad for value in targets[1].values()))
+                online, _, _, rgb = sample_objective(teacher, student, criterion, image,
+                                                     crop_size=32, loss_weights=c['loss'])
+                online.backward()
+                gradients = [p.grad.clone() for p in student.parameters()]
+                student.zero_grad(set_to_none=True)
+                criterion.zero_grad(set_to_none=True)
+                with patch.object(teacher, 'forward', side_effect=AssertionError('Teacher executed during student phase')):
+                    cached, _, _, cached_rgb = sample_objective(teacher, student, criterion, image,
+                        crop_size=32, loss_weights=c['loss'], targets=targets)
+                    cached.backward()
+                torch.testing.assert_close(online, cached, rtol=0, atol=0)
+                torch.testing.assert_close(rgb, cached_rgb, rtol=0, atol=0)
+                for expected, parameter in zip(gradients, student.parameters()):
+                    torch.testing.assert_close(expected, parameter.grad, rtol=0, atol=0)
+                changed = {**batch, 'sample_ids': ['fixture/2']}
+                cache.build(teacher, [changed], [changed], c)
+                self.assertFalse(cache.path('train', batch['sample_ids'][0]).exists())
+                self.assertEqual(len(list(cache.directory.glob('*.pt'))), 2)
+            finally:
+                cache.close()
+            self.assertEqual(list(cache.directory.iterdir()), [])
+
+    def test_feature_cache_lock_and_unrelated_file_protection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first = TeacherFeatureCache(Path(directory) / 'feats')
+            second = TeacherFeatureCache(first.directory)
+            first.open()
+            with self.assertRaisesRegex(RuntimeError, 'in use'):
+                second.open()
+            first.close()
+            foreign = first.directory / 'keep.txt'
+            foreign.write_text('preserve')
+            with self.assertRaisesRegex(ValueError, 'Unexpected files'):
+                first.open()
+            self.assertEqual(foreign.read_text(), 'preserve')
+            foreign.unlink()
+            first.open()
+            first.close()
+
+    def test_feature_cache_fit_cleanup_and_online_switch(self):
+        for cached in (True, False):
+            with self.subTest(releas=cached), tempfile.TemporaryDirectory() as directory:
+                student, teacher, criterion = tiny_model(), FixtureTeacher(), self.criterion()
+                optimizer = torch.optim.SGD(list(student.parameters()) + list(criterion.parameters()), lr=.001)
+                c = deepcopy(self.config)
+                c['training'].update(epochs=2, max_steps=None, crop_size=32, releas=cached)
+                c['benchmark']['enabled'] = False
+                c['logging']['progress'] = False
+                c['runtime']['output_dir'] = str(Path(directory) / 'run')
+                batch = {'images': [torch.rand(3, 32, 32)], 'sample_ids': ['fixture/1'], 'scenes': ['fixture']}
+                class Metrics(nn.Module):
+                    def forward(self, pred, target):
+                        return {'psnr': 20., 'ssim': .8, 'lpips': .1}
+                events = []
+                original_forward = teacher.forward
+                original_student = student.forward
+                def teacher_forward(*args, **kwargs):
+                    events.append('teacher')
+                    return original_forward(*args, **kwargs)
+                def student_forward(*args, **kwargs):
+                    events.append('student')
+                    return original_student(*args, **kwargs)
+                cache_dir = Path(directory) / 'feats'
+                with patch('tool.trainer.FEATURE_CACHE_DIR', cache_dir), \
+                     patch('tool.distillation.prepare_image', identity_prepare), \
+                     patch.object(teacher, 'forward', teacher_forward), \
+                     patch.object(student, 'forward', student_forward), \
+                     patch.object(TeacherFeatureCache, 'build', autospec=True, wraps=None,
+                                  side_effect=TeacherFeatureCache.build) as build:
+                    summary = fit(teacher, student, criterion, [batch], [batch], optimizer, Metrics(), c)
+                expected = ['teacher', 'teacher'] + ['student'] * 4 if cached else ['teacher', 'student', 'teacher', 'student'] * 2
+                self.assertEqual(events, expected)
+                self.assertEqual(build.call_count, 1 if cached else 0)
+                self.assertEqual(summary['global_step'], 2)
+                self.assertTrue(summary['teacher_unchanged'])
+                self.assertEqual(list(cache_dir.iterdir()) if cache_dir.exists() else [], [])
+                self.assertEqual(next(student.parameters()).device.type, 'cpu')
+
+    def test_feature_cache_cleanup_on_failure_and_interrupt(self):
+        for error in (RuntimeError('fixture failure'), KeyboardInterrupt()):
+            with self.subTest(error=type(error).__name__), tempfile.TemporaryDirectory() as directory:
+                student, teacher, criterion = tiny_model(), FixtureTeacher(), self.criterion()
+                optimizer = torch.optim.SGD(list(student.parameters()) + list(criterion.parameters()), lr=.001)
+                c = deepcopy(self.config)
+                c['training'].update(epochs=1, max_steps=1, crop_size=32, releas=True)
+                c['benchmark']['enabled'] = False
+                c['logging']['progress'] = False
+                c['runtime']['output_dir'] = str(Path(directory) / 'run')
+                cache_dir = Path(directory) / 'feats'
+                batch = {'images': [torch.rand(3, 32, 32)], 'sample_ids': ['fixture/1'], 'scenes': ['fixture']}
+                def fail(*args, **kwargs):
+                    self.assertEqual(len(list(cache_dir.glob('*.pt'))), 2)
+                    raise error
+                with patch('tool.trainer.FEATURE_CACHE_DIR', cache_dir), \
+                     patch('tool.distillation.prepare_image', identity_prepare), \
+                     patch('tool.trainer.train_batch', fail), self.assertRaises(type(error)):
+                    fit(teacher, student, criterion, [batch], [batch], optimizer, nn.Identity(), c)
+                self.assertEqual(list(cache_dir.iterdir()), [])
+                self.assertEqual(teacher.device.type, 'cpu')
+
+    def test_cache_prompt_answers_and_noninteractive_keep(self):
+        with patch('builtins.input', side_effect=['invalid', 'n']):
+            self.assertFalse(ask_delete_cache(Path('/tmp/feats')))
+        with patch('builtins.input', return_value=' y ') as ask:
+            self.assertTrue(ask_delete_cache(Path('/tmp/feats')))
+            ask.assert_called_once_with('[Done]: Delete cached features? [Y/N]: ')
+        for error in (EOFError(), KeyboardInterrupt()):
+            with patch('builtins.input', side_effect=error):
+                self.assertFalse(ask_delete_cache(Path('/tmp/feats')))
+
+    def test_cache_reused_across_runs_and_deleted_on_request(self):
+        c = deepcopy(self.config)
+        c['training'].update(epochs=1, max_steps=1, crop_size=32, releas=True)
+        c['benchmark']['enabled'] = False
+        c['logging']['progress'] = False
+        teacher = FixtureTeacher()
+        batch = {'images': [torch.rand(3, 32, 32)], 'sample_ids': ['fixture/1'], 'scenes': ['fixture']}
+        class Metrics(nn.Module):
+            def forward(self, pred, target):
+                return {'psnr': 20., 'ssim': .8, 'lpips': .1}
+        with tempfile.TemporaryDirectory() as directory, \
+             patch('tool.trainer.FEATURE_CACHE_DIR', Path(directory) / 'feats'), \
+             patch('tool.distillation.prepare_image', identity_prepare):
+            cache_dir = Path(directory) / 'feats'
+            original_forward = teacher.forward
+            for run, delete in enumerate((False, False, True)):
+                c['runtime']['output_dir'] = str(Path(directory) / f'run-{run}')
+                student, criterion = tiny_model(), self.criterion()
+                optimizer = torch.optim.SGD(list(student.parameters()) + list(criterion.parameters()), lr=.001)
+                side_effect = original_forward if run == 0 else AssertionError('Teacher must not execute for valid cache')
+                with patch.object(teacher, 'forward', side_effect=side_effect) as forward:
+                    fit(teacher, student, criterion, [batch], [batch], optimizer, Metrics(), c,
+                        cache_cleanup=lambda path: delete)
+                    self.assertEqual(forward.call_count, 2 if run == 0 else 0)
+                rows = [json.loads(line) for line in (Path(c['runtime']['output_dir']) / 'metrics.jsonl').read_text().splitlines()]
+                self.assertEqual(next(row for row in rows if row['event'] == 'teacher_cache')['reused'], run > 0)
+                self.assertEqual((cache_dir / 'manifest.json').exists(), not delete)
+            self.assertEqual(list(cache_dir.iterdir()), [])
+
+    def test_cache_manifest_invalidation(self):
+        c = deepcopy(self.config)
+        c['training']['crop_size'] = 32
+        c['benchmark']['enabled'] = False
+        c['logging']['progress'] = False
+        teacher = FixtureTeacher()
+        batch = {'images': [torch.rand(3, 32, 32)], 'sample_ids': ['fixture/1'], 'scenes': ['fixture']}
+        with tempfile.TemporaryDirectory() as directory, patch('tool.distillation.prepare_image', identity_prepare):
+            cache = TeacherFeatureCache(Path(directory) / 'feats')
+            cache.open()
+            fingerprint = cache.fingerprint('teacher-a', [batch], [batch], c, torch.device('cpu'))
+            cache.build(teacher, [batch], [batch], c)
+            cache.seal(fingerprint)
+            cache.close(delete=False)
+            cache.open()
+            self.assertTrue(cache.reuse(fingerprint))
+            self.assertFalse(cache.reuse(cache.fingerprint('teacher-b', [batch], [batch], c, torch.device('cpu'))))
+            changed = deepcopy(c)
+            changed['training']['crop_size'] = 64
+            self.assertFalse(cache.reuse(cache.fingerprint('teacher-a', [batch], [batch], changed, torch.device('cpu'))))
+            changed = deepcopy(c)
+            changed['augmentation']['enabled'] = not changed['augmentation']['enabled']
+            changed['training']['epochs'] += 1
+            self.assertEqual(fingerprint, cache.fingerprint('teacher-a', [batch], [batch], changed, torch.device('cpu')))
+            cache.path('train', 'fixture/1').unlink()
+            self.assertFalse(cache.reuse(fingerprint))
+            (cache.directory / 'manifest.json').write_text(json.dumps({'fingerprint': fingerprint, 'files': []}))
+            self.assertFalse(cache.reuse(fingerprint))
+            cache.close()
+
+    def test_teacher_factory_releases_object_and_weights_only_in_cache_mode(self):
+        import weakref
+        for cached in (True, False):
+            with self.subTest(releas=cached), tempfile.TemporaryDirectory() as directory:
+                refs = []
+                def create_teacher():
+                    teacher = FixtureTeacher()
+                    refs.extend([weakref.ref(teacher), weakref.ref(teacher.anchor)])
+                    return teacher
+                c = deepcopy(self.config)
+                c['training'].update(epochs=1, max_steps=1, crop_size=32, releas=cached)
+                c['benchmark']['enabled'] = False
+                c['logging']['progress'] = False
+                c['runtime']['output_dir'] = str(Path(directory) / 'run')
+                student, criterion = tiny_model(), self.criterion()
+                optimizer = torch.optim.SGD(list(student.parameters()) + list(criterion.parameters()), lr=.001)
+                def check_lifetime(module, args):
+                    if cached:
+                        self.assertIsNone(refs[0]())
+                        self.assertIsNone(refs[1]())
+                    else:
+                        teacher = refs[0]()
+                        self.assertIsNotNone(teacher)
+                        self.assertFalse(teacher.training)
+                        self.assertTrue(all(not value.requires_grad for value in teacher.buffers()))
+                student.register_forward_pre_hook(check_lifetime)
+                class Metrics(nn.Module):
+                    def forward(self, pred, target):
+                        return {'psnr': 20., 'ssim': .8, 'lpips': .1}
+                batch = {'images': [torch.rand(3, 32, 32)], 'sample_ids': ['fixture/1'], 'scenes': ['fixture']}
+                cache_dir = Path(directory) / 'feats'
+                with patch('tool.trainer.FEATURE_CACHE_DIR', cache_dir), \
+                     patch('tool.distillation.prepare_image', identity_prepare):
+                    result = fit(create_teacher, student, criterion, [batch], [batch], optimizer, Metrics(), c,
+                                 cache_cleanup=lambda path: False)
+                self.assertEqual(result['teacher_released'], cached)
+                self.assertEqual(result['teacher_blend_scale'], .5)
+                checkpoint = torch.load(Path(c['runtime']['output_dir']) / 'last.pt', weights_only=True)
+                self.assertEqual(checkpoint['teacher_blend_scale'], .5)
+                if cached:
+                    manifest = json.loads((cache_dir / 'manifest.json').read_text())
+                    self.assertEqual(manifest['blend_scale'], .5)
+                else:
+                    self.assertFalse(cache_dir.exists())
+
+    def test_output_directory_numbering_preserves_existing_results(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory) / 'output' / 'test'
+            self.assertEqual(reserve_output_dir(base), base)
+            old_result = base / 'metrics.jsonl'
+            old_result.write_text('preserve')
+            self.assertEqual(reserve_output_dir(base), base.with_name('test_2'))
+            self.assertEqual(reserve_output_dir(base), base.with_name('test_3'))
+            self.assertEqual(old_result.read_text(), 'preserve')
+            base.with_name('test_4').write_text('existing file')
+            self.assertEqual(reserve_output_dir(base), base.with_name('test_5'))
+
+    def test_output_directory_reservations_are_unique(self):
+        from concurrent.futures import ThreadPoolExecutor
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory) / 'test'
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                paths = list(pool.map(lambda _: reserve_output_dir(base), range(8)))
+            self.assertEqual(len(set(paths)), 8)
+            self.assertTrue(all(path.is_dir() for path in paths))
+
+    def test_parallel_cache_dataset_loading_writes_and_exact_targets(self):
+        import threading
+        from tool.teacher_features import cache_worker_plan
+        c = deepcopy(self.config)
+        c['training']['crop_size'] = 32
+        c['benchmark']['enabled'] = False
+        c['logging']['progress'] = False
+        teacher = FixtureTeacher()
+        images = [torch.full((3, 32, 32), value) for value in (.2, .4, .6, .8)]
+        read_threads, write_threads = [], []
+        class Dataset:
+            def __len__(self):
+                return len(images)
+            def __getitem__(self, index):
+                read_threads.append(threading.current_thread().name)
+                return {'sample_id': f'fixture/{index}', 'image': images[index]}
+        def assert_teacher_thread(module, args):
+            self.assertEqual(threading.current_thread().name, 'MainThread')
+        teacher.register_forward_pre_hook(assert_teacher_thread)
+        original_save = torch.save
+        def record_save(*args, **kwargs):
+            write_threads.append(threading.current_thread().name)
+            return original_save(*args, **kwargs)
+        plan = {'readers': 2, 'writers': 2, 'prefetch': 2, 'pending_writes': 2}
+        with tempfile.TemporaryDirectory() as directory, \
+             patch('tool.distillation.prepare_image', identity_prepare), \
+             patch('tool.teacher_features.cache_worker_plan', return_value=plan), \
+             patch.object(torch, 'save', record_save):
+            cache = TeacherFeatureCache(Path(directory) / 'feats')
+            cache.open()
+            try:
+                cache.build(teacher, SimpleNamespace(dataset=Dataset()), SimpleNamespace(dataset=Dataset()), c)
+                self.assertEqual(len(list(cache.directory.glob('*.pt'))), 8)
+                for index, image in enumerate(images):
+                    prepared = identity_prepare(image.permute(1, 2, 0).numpy())
+                    head, features = teacher(prepared.features, return_features=True)
+                    rgb = compose_rgb_tensor(head, prepared, blend_scale=teacher.blend_scale)
+                    for split in ('train', 'val'):
+                        actual_head, actual_features, actual_rgb = cache.load(split, f'fixture/{index}', 'cpu')
+                        torch.testing.assert_close(actual_head, head, rtol=0, atol=0)
+                        torch.testing.assert_close(actual_rgb, rgb, rtol=0, atol=0)
+                        for key in features:
+                            torch.testing.assert_close(actual_features[key], features[key], rtol=0, atol=0)
+                self.assertTrue(any(name.startswith('cache-read') for name in read_threads))
+                self.assertTrue(any(name.startswith('cache-write') for name in write_threads))
+            finally:
+                cache.close()
+
+    def test_parallel_cache_writer_errors_propagate(self):
+        import threading
+        c = deepcopy(self.config)
+        c['training']['crop_size'] = 32
+        c['benchmark']['enabled'] = False
+        c['logging']['progress'] = False
+        batch = {'images': [torch.rand(3, 32, 32), torch.rand(3, 32, 32)],
+                 'sample_ids': ['fixture/1', 'fixture/2'], 'scenes': ['fixture', 'fixture']}
+        original_save = torch.save
+        def fail_in_background(*args, **kwargs):
+            if threading.current_thread().name.startswith('cache-write'):
+                raise OSError('fixture disk failure')
+            return original_save(*args, **kwargs)
+        with tempfile.TemporaryDirectory() as directory, \
+             patch('tool.distillation.prepare_image', identity_prepare), \
+             patch.object(torch, 'save', fail_in_background):
+            cache = TeacherFeatureCache(Path(directory) / 'feats')
+            cache.open()
+            try:
+                with self.assertRaisesRegex(OSError, 'fixture disk failure'):
+                    cache.build(FixtureTeacher(), [batch], [batch], c)
+                self.assertFalse((cache.directory / 'manifest.json').exists())
+            finally:
+                cache.close()
+            self.assertEqual(list(cache.directory.iterdir()), [])
+
+    def test_cache_worker_limits_and_bounded_prefetch(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from tool.teacher_features import cache_worker_plan, bounded_cache_prepare
+        with patch('os.sched_getaffinity', return_value={0, 1}):
+            plan = cache_worker_plan(1, .001, 1, 1024, 1024, 100)
+            self.assertEqual(plan['readers'], 1)
+            self.assertEqual(plan['writers'], 1)
+        plan = cache_worker_plan(1, .001, 1, 10**12, 10**12, 100)
+        self.assertEqual(plan['prefetch'], 1)
+        self.assertEqual(plan['pending_writes'], 1)
+        submitted = []
+        def source():
+            for i in range(20):
+                submitted.append(i)
+                yield i
+        with ThreadPoolExecutor(max_workers=2) as pool, \
+             patch('tool.teacher_features.prepare_cache_item', side_effect=lambda item, crop: item):
+            items = bounded_cache_prepare(pool, source(), 32, 2)
+            self.assertEqual(next(items), 0)
+            self.assertEqual(submitted, [0, 1])
+            items.close()
+            self.assertEqual(submitted, [0, 1])
+
+    def test_partial_cache_resumes_validation_without_reextracting_train(self):
+        from tool.teacher_features import prepare_cache_item
+        c = deepcopy(self.config)
+        c['training']['crop_size'] = 32
+        c['benchmark']['enabled'] = False
+        c['logging']['progress'] = False
+        teacher = FixtureTeacher()
+        train = [{'images': [torch.rand(3, 32, 32), torch.rand(3, 32, 32)],
+                  'sample_ids': ['train/1', 'train/2'], 'scenes': ['fixture', 'fixture']}]
+        val = [{'images': [torch.rand(3, 32, 32)], 'sample_ids': ['val/1'], 'scenes': ['fixture']}]
+        def stop_before_validation(item, crop):
+            if item[0] == 'val/1':
+                raise KeyboardInterrupt()
+            return prepare_cache_item(item, crop)
+        with tempfile.TemporaryDirectory() as directory, patch('tool.distillation.prepare_image', identity_prepare):
+            cache_dir = Path(directory) / 'feats'
+            cache = TeacherFeatureCache(cache_dir)
+            cache.open()
+            fingerprint = cache.fingerprint('teacher', train, val, c, torch.device('cpu'))
+            cache.prepare(fingerprint, .5)
+            with patch('tool.teacher_features.prepare_cache_item', side_effect=stop_before_validation):
+                with self.assertRaises(KeyboardInterrupt):
+                    cache.build(teacher, train, val, c)
+            saved_train = {path.name: (path.stat().st_mtime_ns, path.read_bytes()) for path in cache_dir.glob('train-*.pt')}
+            self.assertEqual(len(saved_train), 2)
+            cache.close(delete=False)
+            cache = TeacherFeatureCache(cache_dir)
+            cache.open()
+            try:
+                self.assertFalse(cache.reuse(fingerprint))
+                cache.prepare(fingerprint, .5)
+                with patch.object(teacher, 'forward', wraps=teacher.forward) as forward:
+                    cache.build(teacher, train, val, c)
+                    self.assertEqual(forward.call_count, 1)
+                for name, expected in saved_train.items():
+                    path = cache_dir / name
+                    self.assertEqual((path.stat().st_mtime_ns, path.read_bytes()), expected)
+                cache.seal(fingerprint, blend_scale=.5)
+                self.assertTrue(cache.reuse(fingerprint))
+                cache.path('train', 'train/1').write_bytes(b'truncated')
+                self.assertFalse(cache.reuse(fingerprint))
+                cache.prepare(fingerprint, .5)
+                with patch.object(teacher, 'forward', wraps=teacher.forward) as forward:
+                    cache.build(teacher, train, val, c)
+                    self.assertEqual(forward.call_count, 1)
+                cache.seal(fingerprint, blend_scale=.5)
+                self.assertTrue(cache.reuse(fingerprint))
+            finally:
+                cache.close()
+
+    def test_completed_legacy_cache_is_reused_after_pipeline_update(self):
+        c = deepcopy(self.config)
+        c['training']['crop_size'] = 32
+        c['benchmark']['enabled'] = False
+        c['logging']['progress'] = False
+        batch = {'images': [torch.rand(3, 32, 32)], 'sample_ids': ['fixture/1'], 'scenes': ['fixture']}
+        with tempfile.TemporaryDirectory() as directory, patch('tool.distillation.prepare_image', identity_prepare):
+            cache = TeacherFeatureCache(Path(directory) / 'feats')
+            cache.open()
+            try:
+                fingerprint = cache.fingerprint('teacher', [batch], [batch], c, torch.device('cpu'))
+                cache.build(FixtureTeacher(), [batch], [batch], c)
+                cache.seal(cache._legacy_fingerprint, blend_scale=.5)
+                manifest = cache.read_manifest()
+                manifest.pop('complete')
+                (cache.directory / 'manifest.json').write_text(json.dumps(manifest))
+                self.assertTrue(cache.reuse(fingerprint))
+            finally:
+                cache.close()
+
+    def test_teacher_graph_cpu_path_and_explicit_cleanup(self):
+        from unittest.mock import Mock
+        model = FeatureRecordingBackend.__new__(FeatureRecordingBackend)
+        nn.Module.__init__(model)
+        model._graph_enabled = True
+        model._eager_with_features = Mock(return_value=('head', 'features'))
+        value = torch.zeros(1, 2, 2, 16)
+        self.assertEqual(model.forward_with_features(value), ('head', 'features'))
+        model._eager_with_features.assert_called_once_with(value)
+        graph = Mock()
+        model._graph = graph
+        model._graph_input = value
+        model._graph_output = (value, {})
+        model._graph_biases = {'bias': value}
+        model._clear_graph()
+        graph.reset.assert_called_once()
+        self.assertIsNone(model._graph)
+        self.assertIsNone(model._graph_input)
+        self.assertIsNone(model._graph_output)
+        self.assertIsNone(model._graph_biases)
+
+    @unittest.skipUnless(torch.cuda.is_available(), 'CUDA required')
+    def test_teacher_cuda_graph_replays_new_inputs_and_releases_on_cpu_move(self):
+        class GraphFixture(FeatureRecordingBackend):
+            def __init__(self, device):
+                nn.Module.__init__(self)
+                self.register_buffer('anchor', torch.tensor(.125, device=device))
+                self._graph_enabled = True
+                self._graph = None
+                self._graph_biases = None
+                self._weight_attributes = {}
+            def _eager_with_features(self, value):
+                head = value[..., :4] * self.anchor
+                features = head.permute(0, 3, 1, 2).contiguous()
+                return head, {'e1': features, 'e2': features + 1, 'e3': features + 2, 'vit': features + 3}
+        device = torch.device('cuda:1' if torch.cuda.device_count() > 1 else 'cuda:0')
+        model = GraphFixture(device)
+        with torch.inference_mode():
+            for value in (torch.zeros(1, 8, 8, 16, device=device), torch.ones(1, 8, 8, 16, device=device)):
+                expected_head, expected_features = model._eager_with_features(value)
+                head, features = model.forward_with_features(value)
+                torch.testing.assert_close(head, expected_head, rtol=0, atol=0)
+                for name in expected_features:
+                    torch.testing.assert_close(features[name], expected_features[name], rtol=0, atol=0)
+            self.assertIsNotNone(model._graph)
+            model.cpu()
+            self.assertIsNone(model._graph)
+            self.assertIsNone(model._graph_biases)
+            self.assertEqual(model.anchor.device.type, 'cpu')
 
 
 if __name__ == '__main__':

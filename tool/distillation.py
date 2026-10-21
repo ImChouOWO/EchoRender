@@ -7,7 +7,7 @@ from tqdm.auto import tqdm
 from torchvision.transforms import functional as TF
 
 from .teacher_pipeline import prepare_image, compose_rgb_tensor
-from .monitoring import benchmark_forward
+from .monitoring import benchmark_forward, measure_forward
 
 
 class StudentAugmentation:
@@ -63,14 +63,18 @@ def prepare_sample(image, crop_size):
 
 
 def sample_objective(teacher, student, criterion, image, *, crop_size, loss_weights,
-                     augmentation=None, augmentation_probability=0.0):
+                     augmentation=None, augmentation_probability=0.0, targets=None, blend_scale=None):
+    blend_scale = teacher.blend_scale if blend_scale is None else blend_scale
     prepared = prepare_sample(image, crop_size)
-    inputs = prepared.features.to(teacher.device)
-    with torch.no_grad():
-        target_head, target_features = teacher(inputs, return_features=True)
-        target_rgb = compose_rgb_tensor(target_head, prepared, blend_scale=teacher.blend_scale)
+    device = next(student.parameters()).device
+    if targets is None:
+        with torch.no_grad():
+            target_head, target_features = teacher(prepared.features.to(device), return_features=True)
+            target_rgb = compose_rgb_tensor(target_head, prepared, blend_scale=blend_scale)
+    else:
+        target_head, target_features, target_rgb = targets
     student_prepared = augmentation.apply(prepared, augmentation_probability) if augmentation else prepared
-    student_inputs = student_prepared.features.to(teacher.device)
+    student_inputs = student_prepared.features.to(device)
     if student.layout != 'BHWC':
         student_inputs = student_inputs.permute(0, 3, 1, 2).contiguous()
     head, features = student(student_inputs, return_features=True)
@@ -78,31 +82,95 @@ def sample_objective(teacher, student, criterion, image, *, crop_size, loss_weig
         head = head.permute(0, 2, 3, 1).contiguous()
     if head.shape != target_head.shape:
         raise RuntimeError('Student and Teacher raw head shapes differ')
-    prediction_rgb = compose_rgb_tensor(head, student_prepared, blend_scale=teacher.blend_scale)
+    prediction_rgb = compose_rgb_tensor(head, student_prepared, blend_scale=blend_scale)
     loss, components = criterion(
         head, target_head, features, target_features, prediction_rgb, target_rgb,
-        image_hw=prepared.rgb.shape[:2], network_hw=inputs.shape[1:3], weights=loss_weights,
+        image_hw=prepared.rgb.shape[:2], network_hw=prepared.features.shape[1:3], weights=loss_weights,
     )
     return loss, components, prediction_rgb, target_rgb
 
 
+def training_microbatches(images, *, crop_size, micro_batch_size, augmentation, probability):
+    """Batch only matching network extents; preserve order and per-image geometry."""
+    group = []
+    for index, image in enumerate(images):
+        prepared = prepare_sample(image, crop_size)
+        augmented = augmentation.apply(prepared, probability) if augmentation else prepared
+        if group and (len(group) == micro_batch_size or
+                      augmented.features.shape != group[0][2].features.shape):
+            yield group
+            group = []
+        group.append((index, prepared, augmented))
+    if group:
+        yield group
+
+
+def microbatch_objective(teacher, student, criterion, group, sample_ids, *,
+                         loss_weights, target_cache, blend_scale):
+    device = next(student.parameters()).device
+    online_targets = []
+    if target_cache is None:
+        # Keep Teacher inference single-image, before Student's training forward.
+        with torch.no_grad():
+            for _, prepared, _ in group:
+                target_head, target_features = teacher(prepared.features.to(device), return_features=True)
+                online_targets.append((target_head, target_features,
+                                       compose_rgb_tensor(target_head, prepared, blend_scale=blend_scale)))
+    inputs = torch.cat([augmented.features for _, _, augmented in group]).to(device)
+    if student.layout != 'BHWC':
+        inputs = inputs.permute(0, 3, 1, 2).contiguous()
+    head, features = student(inputs, return_features=True)
+    if student.layout == 'BCHW':
+        head = head.permute(0, 2, 3, 1).contiguous()
+    loss_sum, totals = None, defaultdict(float)
+    for position, (index, prepared, augmented) in enumerate(group):
+        if target_cache is not None:
+            target_head, target_features, target_rgb = target_cache.load('train', sample_ids[index], device)
+        else:
+            target_head, target_features, target_rgb = online_targets[position]
+        sample_head = head[position:position + 1]
+        if sample_head.shape != target_head.shape:
+            raise RuntimeError('Student and Teacher raw head shapes differ')
+        prediction_rgb = compose_rgb_tensor(sample_head, augmented, blend_scale=blend_scale)
+        loss, components = criterion(
+            sample_head, target_head, {k: v[position:position + 1] for k, v in features.items()},
+            target_features, prediction_rgb, target_rgb, image_hw=prepared.rgb.shape[:2],
+            network_hw=prepared.features.shape[1:3], weights=loss_weights)
+        loss_sum = loss if loss_sum is None else loss_sum + loss
+        for name, value in components.items():
+            totals[name] += value
+    return loss_sum, totals
+
+
 def train_batch(teacher, student, criterion, batch, optimizer, *, crop_size, controls,
-                augmentation=None, augmentation_probability=0.0):
+                augmentation=None, augmentation_probability=0.0, target_cache=None, blend_scale=None,
+                micro_batch_size=1):
+    if type(micro_batch_size) is not int or micro_batch_size < 1:
+        raise ValueError('micro_batch_size must be a positive integer')
     student.train()
     criterion.train()
-    teacher.eval()
+    if teacher is not None:
+        teacher.eval()
     optimizer.zero_grad(set_to_none=True)
     count = len(batch['images'])
     if count == 0:
         raise ValueError('Empty training batch')
     totals = defaultdict(float)
     augmented_before = augmentation.applied_count if augmentation else 0
-    for image in batch['images']:
-        loss, components, _, _ = sample_objective(
-            teacher, student, criterion, image, crop_size=crop_size,
-            loss_weights=controls['loss_weights'], augmentation=augmentation,
-            augmentation_probability=augmentation_probability)
+    if len(batch['sample_ids']) != count:
+        raise ValueError('Each training image needs one sample ID')
+    blend_scale = teacher.blend_scale if blend_scale is None else blend_scale
+    sizes = []
+    for group in training_microbatches(batch['images'], crop_size=crop_size,
+                                      micro_batch_size=micro_batch_size, augmentation=augmentation,
+                                      probability=augmentation_probability):
+        loss, components = microbatch_objective(
+            teacher, student, criterion, group, batch['sample_ids'],
+            loss_weights=controls['loss_weights'], target_cache=target_cache, blend_scale=blend_scale)
+        # Normalize by the actual effective batch, including a short final group.
         (loss / count).backward()
+        del loss
+        sizes.append(len(group))
         for name, value in components.items():
             totals[name] += value / count
     parameters = [p for group in optimizer.param_groups for p in group['params'] if p.requires_grad]
@@ -115,12 +183,12 @@ def train_batch(teacher, student, criterion, batch, optimizer, *, crop_size, con
     if any(not torch.isfinite(p).all().item() for p in parameters):
         raise RuntimeError('Parameters became non-finite after optimizer update')
     return {'loss': totals['total'], 'components': dict(totals), 'gradient_norm': norm,
-            'batch_size': count, 'sample_ids': list(batch['sample_ids']),
+            'batch_size': count, 'micro_batch_sizes': sizes, 'sample_ids': list(batch['sample_ids']),
             'augmented_samples': augmentation.applied_count - augmented_before if augmentation else 0}
 
 
 @torch.no_grad()
-def evaluate(teacher, student, criterion, loader, metrics, monitor, *, config, epoch, controls):
+def evaluate(teacher, student, criterion, loader, metrics, monitor, *, config, epoch, controls, target_cache=None, blend_scale=None):
     states = student.training, criterion.training
     student.eval()
     criterion.eval()
@@ -131,11 +199,13 @@ def evaluate(teacher, student, criterion, loader, metrics, monitor, *, config, e
                unit='it', dynamic_ncols=True, disable=not config['logging']['progress'])
     try:
         for batch in bar:
-            for image, scene in zip(batch['images'], batch['scenes']):
+            for image, scene, sample_id in zip(batch['images'], batch['scenes'], batch['sample_ids']):
+                targets = target_cache.load('val', sample_id, next(student.parameters()).device) if target_cache else None
                 _, parts, prediction, target = sample_objective(
                     teacher, student, criterion, image, crop_size=config['training']['crop_size'],
-                    loss_weights=controls['loss_weights'])
+                    loss_weights=controls['loss_weights'], targets=targets, blend_scale=blend_scale)
                 quality = metrics(prediction, target)
+                del targets, prediction, target
                 values = {**parts, **quality}
                 for key, value in values.items():
                     totals[key] += value
@@ -146,15 +216,22 @@ def evaluate(teacher, student, criterion, loader, metrics, monitor, *, config, e
                 images += 1
                 # Isolated forward benchmark, once per epoch, with eval modes and sync.
                 if benchmark is None and config['benchmark']['enabled']:
-                    inputs = prepare_sample(image, config['training']['crop_size']).features.to(teacher.device)
-                    benchmark = benchmark_forward(teacher, student, inputs,
-                                                  warmup=config['benchmark']['warmup'],
-                                                  repeats=config['benchmark']['repeats'])
+                    inputs = prepare_sample(image, config['training']['crop_size']).features.to(next(student.parameters()).device)
+                    timing = config['benchmark']
+                    if target_cache is None:
+                        benchmark = benchmark_forward(teacher, student, inputs,
+                                                      warmup=timing['warmup'], repeats=timing['repeats'])
+                    else:
+                        student_inputs = inputs if student.layout == 'BHWC' else inputs.permute(0, 3, 1, 2).contiguous()
+                        benchmark = {**target_cache.benchmark, **{f'student_{key}': value for key, value in
+                            measure_forward(student, student_inputs, warmup=timing['warmup'], repeats=timing['repeats']).items()}}
+                        del student_inputs
+                    del inputs
             gpu = monitor.sample()
             if gpu is not None:
                 gpu_values.append(gpu)
-            bar.set_postfix(loss=f'{totals["total"] / images:.5f}',
-                            psnr=f'{totals["psnr"] / images:.2f}', gpu=monitor.display())
+            bar.set_postfix({'GPU': monitor.display(), 'loss': f'{totals["total"] / images:.5f}',
+                             'psnr': f'{totals["psnr"] / images:.2f}'})
         if not images:
             raise ValueError('Validation loader has no images')
         scenes = {name: {key: value / scene_counts[name] for key, value in values.items()}

@@ -1,13 +1,18 @@
 """Epoch loop, checkpoints and metric persistence for train.py."""
 import json
+import gc
 from pathlib import Path
 from time import perf_counter
 
 import torch
 from tqdm.auto import tqdm
+from model.card.mamba import MambaStage
 
 from .distillation import train_batch, evaluate, module_digest, StudentAugmentation
-from .training_config import TrainingSchedule
+from .training_config import TrainingSchedule, PROJECT_ROOT
+from .teacher_features import TeacherFeatureCache
+
+FEATURE_CACHE_DIR = PROJECT_ROOT / "output/feats"
 from .monitoring import GPUMonitor
 
 
@@ -30,12 +35,13 @@ def load_student_state(student, path):
     student.load_state_dict(payload['student'], strict=True)
 
 
-def save_checkpoint(path, student, criterion, optimizer, *, epoch, step, config, controls):
+def save_checkpoint(path, student, criterion, optimizer, *, epoch, step, config, controls, blend_scale):
     payload = {
         'format': 'echorender-ssm-v2', 'student': student.state_dict(),
         'distillation': criterion.state_dict(), 'optimizer': optimizer.state_dict(),
         'student_config': student.config, 'train_config': config,
         'epoch': epoch, 'global_step': step, 'schedule_controls': controls,
+        'teacher_blend_scale': blend_scale,
     }
     temporary = path.with_suffix('.pt.tmp')
     try:
@@ -45,7 +51,29 @@ def save_checkpoint(path, student, criterion, optimizer, *, epoch, step, config,
         temporary.unlink(missing_ok=True)
 
 
-def fit(teacher, student, criterion, train_loader, val_loader, optimizer, metrics, config, *, schedule=None):
+def move_student(student, criterion, optimizer, device):
+    optimizer.zero_grad(set_to_none=True)
+    student.to(device)
+    criterion.to(device)
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if isinstance(value, torch.Tensor):
+                state[key] = value.to(device)
+
+
+def release_cuda(device):
+    if device.type == 'cuda':
+        with torch.cuda.device(device):
+            torch.cuda.empty_cache()
+
+
+def fit(teacher, student, criterion, train_loader, val_loader, optimizer, metrics, config, *, schedule=None, device=None, cache_cleanup=None):
+    for module in student.modules():
+        if isinstance(module, MambaStage):
+            module.gradient_checkpointing = config['training']['gradient_checkpointing']
+    if not isinstance(teacher, torch.nn.Module):
+        teacher = teacher()
+    blend_scale = float(torch.as_tensor(teacher.blend_scale).detach().cpu().item())
     if any(value.requires_grad for value in list(teacher.parameters()) + list(teacher.buffers())):
         raise ValueError('Teacher must be frozen')
     expected = {id(p) for module in (student, criterion) for p in module.parameters() if p.requires_grad}
@@ -63,7 +91,8 @@ def fit(teacher, student, criterion, train_loader, val_loader, optimizer, metric
     (output / 'resolved_train.yaml').write_text(yaml.safe_dump(config, sort_keys=False), encoding='utf-8')
     teacher_before = module_digest(teacher)
     student_before = module_digest(student, parameters_only=True)
-    monitor = GPUMonitor(teacher.device, config['logging']['gpu_poll_seconds'])
+    device = torch.device(device) if device is not None else next(student.parameters()).device
+    monitor = GPUMonitor(device, config['logging']['gpu_poll_seconds'])
     total_steps = len(train_loader) * config['training']['epochs']
     if config['training']['max_steps'] is not None:
         total_steps = min(total_steps, config['training']['max_steps'])
@@ -71,13 +100,49 @@ def fit(teacher, student, criterion, train_loader, val_loader, optimizer, metric
     augmentation = StudentAugmentation(config)
     global_step, images_seen, history = 0, 0, []
     started = perf_counter()
-    if teacher.device.type == 'cuda':
-        torch.cuda.reset_peak_memory_stats(teacher.device)
+    completed = False
+    cache = TeacherFeatureCache(FEATURE_CACHE_DIR) if config['training']['releas'] else None
+    if device.type == 'cuda':
+        torch.cuda.reset_peak_memory_stats(device)
     try:
+        if cache is not None:
+            cache.open()
+        else:
+            teacher.to(device)
+            move_student(student, criterion, optimizer, device)
         with (output / 'metrics.jsonl').open('x', encoding='utf-8') as stream:
             def record(row):
                 stream.write(json.dumps(json_safe(row), allow_nan=False) + '\n')
                 stream.flush()
+            if cache is not None:
+                move_student(student, criterion, optimizer, 'cpu')
+                metrics.cpu()
+                release_cuda(device)
+                fingerprint = cache.fingerprint(teacher_before, train_loader, val_loader, config, device)
+                reused = cache.reuse(fingerprint)
+                if reused:
+                    tqdm.write(f'Reusing Teacher feature cache: {cache.directory}')
+                else:
+                    tqdm.write(f'[Cache]: {cache.reason}; resuming extraction.')
+                    cache.prepare(fingerprint, blend_scale)
+                    try:
+                        teacher.to(device)
+                        cache.build(teacher, train_loader, val_loader, config, monitor=monitor)
+                        cache.seal(fingerprint, blend_scale=blend_scale)
+                    finally:
+                        teacher.cpu()
+                        release_cuda(device)
+                if teacher is not None and module_digest(teacher) != teacher_before:
+                    raise RuntimeError('Teacher parameters/buffers changed during cache generation')
+                teacher.cpu()
+                teacher = None
+                gc.collect()
+                release_cuda(device)
+                record({'event': 'teacher_cache', 'reused': reused, 'teacher_device': 'released',
+                        'teacher_blend_scale': blend_scale,
+                        'cache_dir': str(cache.directory),
+                        'gpu_allocated_mib': torch.cuda.memory_allocated(device) / 2**20 if device.type == 'cuda' else None})
+                move_student(student, criterion, optimizer, device)
             for epoch in range(1, config['training']['epochs'] + 1):
                 epoch_loss, epoch_images, batches = 0.0, 0, 0
                 augmentation_probability = augmentation.probability(epoch)
@@ -93,7 +158,8 @@ def fit(teacher, student, criterion, train_loader, val_loader, optimizer, metric
                         result = train_batch(teacher, student, criterion, batch, optimizer,
                                              crop_size=config['training']['crop_size'], controls=controls,
                                              augmentation=augmentation,
-                                             augmentation_probability=augmentation_probability)
+                                             augmentation_probability=augmentation_probability, target_cache=cache,
+                                             blend_scale=blend_scale, micro_batch_size=config['training']['micro_batch_size'])
                         global_step += 1
                         batches += 1
                         epoch_images += result['batch_size']
@@ -107,16 +173,20 @@ def fit(teacher, student, criterion, train_loader, val_loader, optimizer, metric
                                 'loss_weights': controls['loss_weights'],
                                 'augmentation_probability': augmentation_probability,
                                 'gpu_utilization_percent': gpu})
-                        bar.set_postfix(loss=f'{result["loss"]:.5f}', avg_loss=f'{epoch_loss / epoch_images:.5f}',
-                                        lr=f'{controls["lr"]:.2e}', gpu=monitor.display())
+                        bar.set_postfix({'GPU': monitor.display(), 'loss': f'{result["loss"]:.5f}',
+                                         'avg_loss': f'{epoch_loss / epoch_images:.5f}', 'lr': f'{controls["lr"]:.2e}'})
                         maximum = config['training']['max_steps']
                         if maximum is not None and global_step >= maximum:
                             break
                 finally:
                     bar.close()
+                optimizer.zero_grad(set_to_none=True)
+                metrics.to(device)
                 validation = evaluate(teacher, student, criterion, val_loader, metrics, monitor,
-                                      config=config, epoch=epoch, controls=controls)
-                if module_digest(teacher) != teacher_before:
+                                      config=config, epoch=epoch, controls=controls, target_cache=cache,
+                                      blend_scale=blend_scale)
+                metrics.cpu()
+                if teacher is not None and module_digest(teacher) != teacher_before:
                     raise RuntimeError('Teacher parameters/buffers changed')
                 row = {'event': 'epoch', 'epoch': epoch, 'step': global_step,
                        'train_loss': epoch_loss / epoch_images, 'train_images': epoch_images,
@@ -132,7 +202,7 @@ def fit(teacher, student, criterion, train_loader, val_loader, optimizer, metric
                     tqdm.write(f'Forward latency: Teacher={timing["teacher_latency_ms"]:.2f} ms/image, '
                                f'Student={timing["student_latency_ms"]:.2f} ms/image')
                 save_checkpoint(output / 'last.pt', student, criterion, optimizer, epoch=epoch,
-                                step=global_step, config=config, controls=controls)
+                                step=global_step, config=config, controls=controls, blend_scale=blend_scale)
                 maximum = config['training']['max_steps']
                 if maximum is not None and global_step >= maximum:
                     break
@@ -140,14 +210,30 @@ def fit(teacher, student, criterion, train_loader, val_loader, optimizer, metric
                 'status': 'completed', 'reference': 'teacher_rgb', 'global_step': global_step,
                 'epochs_run': len(history), 'train_images_seen': images_seen,
                 'student_parameters_updated': module_digest(student, parameters_only=True) != student_before,
-                'teacher_unchanged': True, 'student_parameter_count': sum(p.numel() for p in student.parameters()),
+                'teacher_unchanged': True, 'teacher_released': cache is not None,
+                'teacher_blend_scale': blend_scale, 'student_parameter_count': sum(p.numel() for p in student.parameters()),
                 'adapter_parameter_count': sum(p.numel() for p in criterion.parameters()),
                 'seconds': perf_counter() - started, 'history': history,
-                'peak_cuda_allocated_mib': (torch.cuda.max_memory_allocated(teacher.device) / 2**20
-                                            if teacher.device.type == 'cuda' else None),
+                'peak_cuda_allocated_mib': (torch.cuda.max_memory_allocated(device) / 2**20
+                                            if device.type == 'cuda' else None),
             }
             # The validation metric can be infinite only for identical RGB pairs.
             (output / 'summary.json').write_text(json.dumps(json_safe(summary), indent=2, allow_nan=False) + '\n', encoding='utf-8')
+            completed = True
             return summary
     finally:
-        monitor.close()
+        try:
+            if teacher is not None:
+                teacher.cpu()
+            metrics.cpu()
+            move_student(student, criterion, optimizer, 'cpu')
+            release_cuda(device)
+            monitor.close()
+        finally:
+            if cache is not None and cache.lock is not None:
+                delete = cache_cleanup is None
+                try:
+                    if completed and cache_cleanup is not None:
+                        delete = cache_cleanup(cache.directory)
+                finally:
+                    cache.close(delete=delete)

@@ -51,35 +51,40 @@ class GPUMonitor:
 
 
 @torch.no_grad()
-def benchmark_forward(teacher, student, features, *, warmup, repeats):
-    """Batch-1 float32 forward only, features disabled, eval mode, CUDA synced."""
-    device = features.device
+def measure_forward(model, inputs, *, warmup, repeats):
+    device = inputs.device
     def sync():
         if device.type == 'cuda':
             torch.cuda.synchronize(device)
+    was_training = model.training
+    model.eval()
+    try:
+        for _ in range(warmup):
+            model(inputs)
+        sync()
+        durations = []
+        for _ in range(repeats):
+            sync()
+            started = perf_counter()
+            model(inputs)
+            sync()
+            durations.append((perf_counter() - started) * 1000)
+        return {'latency_ms': statistics.mean(durations),
+                'latency_median_ms': statistics.median(durations)}
+    finally:
+        model.train(was_training)
 
-    result = {'device': str(device), 'precision': 'float32', 'batch_size': 1,
+
+@torch.no_grad()
+def benchmark_forward(teacher, student, features, *, warmup, repeats):
+    """Batch-1 float32 forward only, features disabled, eval mode, CUDA synced."""
+    result = {'device': str(features.device), 'precision': 'float32', 'batch_size': 1,
               'network_bhwc': list(features.shape), 'warmup': warmup, 'repeats': repeats,
               'scope': 'forward_only_without_feature_capture'}
     for name, model, inputs in (
         ('teacher', teacher, features),
         ('student', student, features if student.layout == 'BHWC' else features.permute(0, 3, 1, 2).contiguous()),
     ):
-        was_training = model.training
-        model.eval()
-        try:
-            for _ in range(warmup):
-                model(inputs)
-            sync()
-            durations = []
-            for _ in range(repeats):
-                sync()
-                started = perf_counter()
-                model(inputs)
-                sync()
-                durations.append((perf_counter() - started) * 1000)
-            result[f'{name}_latency_ms'] = statistics.mean(durations)
-            result[f'{name}_latency_median_ms'] = statistics.median(durations)
-        finally:
-            model.train(was_training)
+        result.update({f'{name}_{key}': value for key, value in measure_forward(
+            model, inputs, warmup=warmup, repeats=repeats).items()})
     return result

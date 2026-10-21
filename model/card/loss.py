@@ -57,16 +57,24 @@ def token_affinity_loss(student, teacher, *, eps=1e-6, chunk_size=128):
 
 
 class DistillationLoss(nn.Module):
-    def __init__(self, config, channels=None):
+    def __init__(self, config, channels=None, *, student_channels=None):
         super().__init__()
         self.config = dict(config)
         channels = channels or STAGE_CHANNELS
+        student_channels = channels if student_channels is None else student_channels
+        if set(student_channels) != set(channels):
+            raise ValueError('Student and Teacher feature stage names must match')
         self.projections = nn.ModuleDict()
         for name, width in channels.items():
+            source_width = student_channels[name]
+            if type(source_width) is not int or source_width < 1:
+                raise ValueError(f'{name} student feature width must be a positive integer')
+            if not config['projection'] and source_width != width:
+                raise ValueError(f'{name}: loss.projection must be true for different Student/Teacher widths')
             if config['projection']:
-                projection = nn.Conv2d(width, width, 1, bias=False)
+                projection = nn.Conv2d(source_width, width, 1, bias=False)
                 with torch.no_grad():
-                    projection.weight.copy_(torch.eye(width).reshape(width, width, 1, 1))
+                    projection.weight.copy_(torch.eye(width, source_width).reshape(width, source_width, 1, 1))
                 self.projections[name] = projection
             else:
                 self.projections[name] = nn.Identity()

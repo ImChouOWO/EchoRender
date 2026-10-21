@@ -11,6 +11,19 @@ LOSS_WEIGHTS = {'distillation', 'reconstruction', 'mid', 'output', 'e1', 'e2', '
                 'vit', 'vit_feature', 'vit_affinity', 'rgb_mse', 'rgb_ssim', 'rgb_ms_ssim'}
 
 
+def reserve_output_dir(path):
+    """Atomically reserve an unused run directory; suffix numbering starts at 2."""
+    base = Path(path)
+    number = 1
+    while True:
+        candidate = base if number == 1 else base.with_name(f'{base.name}_{number}')
+        try:
+            candidate.mkdir(parents=True, exist_ok=False)
+            return candidate
+        except FileExistsError:
+            number += 1
+
+
 def _positive(value, name, *, integer=False, zero=False):
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         raise ValueError(f'{name} must be a finite number')
@@ -31,7 +44,7 @@ def load_training_config(path=DEFAULT_TRAIN_CONFIG):
     expected = {
         'model': {'student_config', 'student_weights', 'teacher_weights'},
         'runtime': {'device', 'cpu_threads', 'output_dir'},
-        'training': {'epochs', 'max_steps', 'crop_size', 'optimizer', 'grad_clip'},
+        'training': {'epochs', 'releas', 'max_steps', 'crop_size', 'optimizer', 'grad_clip', 'micro_batch_size', 'gradient_checkpointing'},
         'loss': LOSS_WEIGHTS | {'projection', 'norm_eps', 'affinity_chunk_size', 'ssim_window', 'ms_ssim_weights'},
         'validation': {'reference', 'lpips_net'}, 'benchmark': {'enabled', 'warmup', 'repeats'},
         'logging': {'progress', 'gpu_poll_seconds'}, 'schedule': {'kind', 'eta_min'},
@@ -59,6 +72,7 @@ def load_training_config(path=DEFAULT_TRAIN_CONFIG):
             raise ValueError('model.teacher_weights must be inside the project weights directory')
         c[section][key] = str(resolved)
     for section, key, zero in (('runtime', 'cpu_threads', False), ('training', 'epochs', False),
+                               ('training', 'micro_batch_size', False),
                                ('training', 'crop_size', True), ('benchmark', 'warmup', True),
                                ('benchmark', 'repeats', False), ('loss', 'affinity_chunk_size', False),
                                ('loss', 'ssim_window', False)):
@@ -72,7 +86,7 @@ def load_training_config(path=DEFAULT_TRAIN_CONFIG):
         _positive(c['loss'][key], f'loss.{key}', zero=True)
     _positive(c['loss']['norm_eps'], 'norm_eps')
     _positive(c['logging']['gpu_poll_seconds'], 'gpu_poll_seconds')
-    for section, key in (('loss', 'projection'), ('logging', 'progress'), ('benchmark', 'enabled')):
+    for section, key in (('training', 'gradient_checkpointing'), ('training', 'releas'), ('loss', 'projection'), ('logging', 'progress'), ('benchmark', 'enabled')):
         if type(c[section][key]) is not bool:
             raise ValueError(f'{section}.{key} must be boolean')
     weights = c['loss']['ms_ssim_weights']

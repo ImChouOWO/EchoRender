@@ -23,6 +23,13 @@ class Model(nn.Module):
         self.layout = cfg.get('input_layout', 'BHWC')
         if self.input_channels < 1 or self.layout not in ('BHWC', 'BCHW'):
             raise ValueError('Invalid input channels or layout')
+        ssm = cfg.get('ssm', {'rotation': 'clockwise', 'directions': 2})
+        if not isinstance(ssm, dict) or set(ssm) != {'rotation', 'directions'}:
+            raise ValueError('ssm requires rotation and directions')
+        if ssm['rotation'] not in ('clockwise', 'counterclockwise'):
+            raise ValueError('ssm.rotation must be clockwise or counterclockwise')
+        if type(ssm['directions']) is not int or not 1 <= ssm['directions'] <= 4:
+            raise ValueError('ssm.directions must be an integer from 1 to 4')
         self.layers, self.sources, self.channels = nn.ModuleList(), [], []
         rows = cfg.get('backbone', []) + cfg.get('head', [])
         if not rows:
@@ -58,7 +65,8 @@ class Model(nn.Module):
                 c2 = int(args[0])
                 if c2 < 1:
                     raise ValueError('Channels must be positive')
-                layers = [MODULES[name](cs[0] if n == 0 else c2, c2, *args[1:]) for n in range(repeats)]
+                options = ssm if name in ('SSMStage', 'MambaStage') else {}
+                layers = [MODULES[name](cs[0] if n == 0 else c2, c2, *args[1:], **options) for n in range(repeats)]
                 layer = layers[0] if repeats == 1 else nn.Sequential(*layers)
             self.layers.append(layer)
             self.sources.append(source)
