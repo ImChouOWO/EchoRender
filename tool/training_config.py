@@ -38,7 +38,7 @@ def load_training_config(path=DEFAULT_TRAIN_CONFIG):
     with path.open(encoding='utf-8-sig') as source:
         c = yaml.safe_load(source)
     required = {'model', 'runtime', 'training', 'loss', 'validation', 'benchmark',
-                'logging', 'schedule', 'augmentation', 'dataset', 'loader'}
+                'logging', 'schedule', 'augmentation', 'dataset', 'loader', 'reporting'}
     if not isinstance(c, dict) or set(c) != required or any(not isinstance(c[k], dict) for k in required):
         raise ValueError(f'train.yaml must contain exactly these mappings: {sorted(required)}')
     expected = {
@@ -48,8 +48,9 @@ def load_training_config(path=DEFAULT_TRAIN_CONFIG):
         'loss': LOSS_WEIGHTS | {'projection', 'norm_eps', 'affinity_chunk_size', 'ssim_window', 'ms_ssim_weights'},
         'validation': {'reference', 'lpips_net'}, 'benchmark': {'enabled', 'warmup', 'repeats'},
         'logging': {'progress', 'gpu_poll_seconds'}, 'schedule': {'kind', 'eta_min'},
-        'augmentation': {'enabled', 'start_probability', 'max_probability', 'peak_fraction',
-                         'stop_fraction', 'noise_std', 'brightness', 'contrast', 'sharpness'},
+        'augmentation': {'enabled', 'start_ratio', 'max_ratio', 'peak_fraction',
+                         'stop_fraction', 'noise_std'},
+        'reporting': {'enabled', 'project_name', 'best_metric', 'crop_size', 'inference_size', 'samples_per_mode', 'strengths'},
         'dataset': {'root', 'render_pass', 'splits'},
         'loader': {'batch_size', 'num_workers', 'seed', 'train_shuffle'},
     }
@@ -66,7 +67,7 @@ def load_training_config(path=DEFAULT_TRAIN_CONFIG):
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f'{section}.{key} must be a nonempty path')
         value = Path(value).expanduser()
-        base = PROJECT_ROOT if key == 'teacher_weights' else path.parent
+        base = PROJECT_ROOT if key in ('teacher_weights', 'output_dir') else path.parent
         resolved = (base / value).resolve()
         if key == 'teacher_weights' and not resolved.is_relative_to((PROJECT_ROOT / 'weights').resolve()):
             raise ValueError('model.teacher_weights must be inside the project weights directory')
@@ -114,12 +115,33 @@ def load_training_config(path=DEFAULT_TRAIN_CONFIG):
         raise ValueError('augmentation.enabled must be boolean')
     for key in set(augmentation) - {'enabled'}:
         _positive(augmentation[key], f'augmentation.{key}', zero=True)
-    if not 0 <= augmentation['start_probability'] <= augmentation['max_probability'] <= 0.25:
-        raise ValueError('augmentation probabilities must satisfy 0 <= start <= max <= 0.25')
+    if not 0 <= augmentation['start_ratio'] <= augmentation['max_ratio'] <= 0.25:
+        raise ValueError('augmentation ratios must satisfy 0 <= start <= max <= 0.25')
     if not 0 < augmentation['peak_fraction'] < augmentation['stop_fraction'] <= 1:
         raise ValueError('augmentation fractions must satisfy 0 < peak < stop <= 1')
-    if any(augmentation[key] > 1 for key in ('noise_std', 'brightness', 'contrast', 'sharpness')):
-        raise ValueError('augmentation strengths must be within [0,1]')
+    if augmentation['noise_std'] > 1:
+        raise ValueError('augmentation.noise_std must be within [0,1]')
+    reporting = c['reporting']
+    if type(reporting['enabled']) is not bool:
+        raise ValueError('reporting.enabled must be boolean')
+    name = reporting['project_name']
+    if name is not None and (not isinstance(name, str) or not name or name.startswith('.')
+                             or any(char not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-' for char in name)):
+        raise ValueError('reporting.project_name must be null or a directory name using letters, digits, _ and -')
+    if reporting['best_metric'] not in ('loss', 'psnr', 'ssim', 'lpips'):
+        raise ValueError('reporting.best_metric must be loss, psnr, ssim or lpips')
+    _positive(reporting['crop_size'], 'reporting.crop_size', integer=True, zero=True)
+    _positive(reporting['inference_size'], 'reporting.inference_size', integer=True, zero=True)
+    _positive(reporting['samples_per_mode'], 'reporting.samples_per_mode', integer=True)
+    strengths = reporting['strengths']
+    if not isinstance(strengths, list) or not strengths:
+        raise ValueError('reporting.strengths must be a nonempty list')
+    for strength in strengths:
+        _positive(strength, 'reporting.strengths entry')
+        if strength > 1:
+            raise ValueError('reporting.strengths must be within (0,1]')
+    if strengths != sorted(set(strengths)):
+        raise ValueError('reporting.strengths must be sorted and unique')
     c['config_path'] = str(path)
     return c
 

@@ -11,6 +11,9 @@ from model.card.mamba import MambaStage
 from .distillation import train_batch, evaluate, module_digest, StudentAugmentation
 from .training_config import TrainingSchedule, PROJECT_ROOT
 from .teacher_features import TeacherFeatureCache
+from .progress import progress_bar, progress_row, network_size
+from .reporting import (validation_values, is_better, best_message, metric_statistics,
+                        print_statistics, write_training_report)
 
 FEATURE_CACHE_DIR = PROJECT_ROOT / "output/feats"
 from .monitoring import GPUMonitor
@@ -67,7 +70,7 @@ def release_cuda(device):
             torch.cuda.empty_cache()
 
 
-def fit(teacher, student, criterion, train_loader, val_loader, optimizer, metrics, config, *, schedule=None, device=None, cache_cleanup=None):
+def fit(teacher, student, criterion, train_loader, val_loader, optimizer, metrics, config, *, schedule=None, device=None, cache_cleanup=None, report_dir=None, on_complete=None):
     for module in student.modules():
         if isinstance(module, MambaStage):
             module.gradient_checkpointing = config['training']['gradient_checkpointing']
@@ -84,7 +87,7 @@ def fit(teacher, student, criterion, train_loader, val_loader, optimizer, metric
         raise ValueError('Train and validation loaders must be nonempty')
     output = Path(config['runtime']['output_dir'])
     output.mkdir(parents=True, exist_ok=True)
-    for name in ('metrics.jsonl', 'last.pt', 'summary.json', 'resolved_train.yaml'):
+    for name in ('metrics.jsonl', 'best.pt', 'last.pt', 'summary.json', 'resolved_train.yaml'):
         if (output / name).exists():
             raise FileExistsError(f'{output / name} exists; choose a fresh output_dir')
     import yaml
@@ -101,6 +104,8 @@ def fit(teacher, student, criterion, train_loader, val_loader, optimizer, metric
     global_step, images_seen, history = 0, 0, []
     started = perf_counter()
     completed = False
+    best, best_epoch = None, None
+    best_metric = config['reporting']['best_metric']
     cache = TeacherFeatureCache(FEATURE_CACHE_DIR) if config['training']['releas'] else None
     if device.type == 'cuda':
         torch.cuda.reset_peak_memory_stats(device)
@@ -145,10 +150,9 @@ def fit(teacher, student, criterion, train_loader, val_loader, optimizer, metric
                 move_student(student, criterion, optimizer, device)
             for epoch in range(1, config['training']['epochs'] + 1):
                 epoch_loss, epoch_images, batches = 0.0, 0, 0
-                augmentation_probability = augmentation.probability(epoch)
+                augmentation_ratio = augmentation.ratio(epoch)
                 gpu_values = []
-                bar = tqdm(train_loader, desc=f'Epoch {epoch}/{config["training"]["epochs"]} [Train]',
-                           unit='it', dynamic_ncols=True, disable=not config['logging']['progress'])
+                bar = progress_bar(train_loader, enabled=config['logging']['progress'])
                 try:
                     for batch in bar:
                         # Apply current LR and reserved future training controls.
@@ -158,7 +162,7 @@ def fit(teacher, student, criterion, train_loader, val_loader, optimizer, metric
                         result = train_batch(teacher, student, criterion, batch, optimizer,
                                              crop_size=config['training']['crop_size'], controls=controls,
                                              augmentation=augmentation,
-                                             augmentation_probability=augmentation_probability, target_cache=cache,
+                                             augmentation_ratio=augmentation_ratio, target_cache=cache,
                                              blend_scale=blend_scale, micro_batch_size=config['training']['micro_batch_size'])
                         global_step += 1
                         batches += 1
@@ -171,10 +175,11 @@ def fit(teacher, student, criterion, train_loader, val_loader, optimizer, metric
                         record({'event': 'train', 'epoch': epoch, 'step': global_step, **result,
                                 'lr': controls['lr'], 'grad_clip': controls['grad_clip'],
                                 'loss_weights': controls['loss_weights'],
-                                'augmentation_probability': augmentation_probability,
+                                'augmentation_ratio': augmentation_ratio,
                                 'gpu_utilization_percent': gpu})
-                        bar.set_postfix({'GPU': monitor.display(), 'loss': f'{result["loss"]:.5f}',
-                                         'avg_loss': f'{epoch_loss / epoch_images:.5f}', 'lr': f'{controls["lr"]:.2e}'})
+                        bar.set_description_str(progress_row(epoch, config['training']['epochs'], device, monitor, [
+                            f'{result["loss"]:.5f}', f'{epoch_loss / epoch_images:.5f}', f'{controls["lr"]:.2e}',
+                            epoch_images, network_size(batch['images'][0], config['training']['crop_size'])]), refresh=False)
                         maximum = config['training']['max_steps']
                         if maximum is not None and global_step >= maximum:
                             break
@@ -201,6 +206,14 @@ def fit(teacher, student, criterion, train_loader, val_loader, optimizer, metric
                     timing = validation['benchmark']
                     tqdm.write(f'Forward latency: Teacher={timing["teacher_latency_ms"]:.2f} ms/image, '
                                f'Student={timing["student_latency_ms"]:.2f} ms/image')
+                current = validation_values(validation)
+                if is_better(current, best, best_metric):
+                    save_checkpoint(output / 'best.pt', student, criterion, optimizer, epoch=epoch,
+                                    step=global_step, config=config, controls=controls, blend_scale=blend_scale)
+                    message = best_message(epoch, current, best)
+                    best, best_epoch = dict(current), epoch
+                    record({'event': 'best', 'epoch': epoch, 'metric': best_metric, 'values': best})
+                    tqdm.write(message)
                 save_checkpoint(output / 'last.pt', student, criterion, optimizer, epoch=epoch,
                                 step=global_step, config=config, controls=controls, blend_scale=blend_scale)
                 maximum = config['training']['max_steps']
@@ -214,11 +227,28 @@ def fit(teacher, student, criterion, train_loader, val_loader, optimizer, metric
                 'teacher_blend_scale': blend_scale, 'student_parameter_count': sum(p.numel() for p in student.parameters()),
                 'adapter_parameter_count': sum(p.numel() for p in criterion.parameters()),
                 'seconds': perf_counter() - started, 'history': history,
+                'best_epoch': best_epoch, 'best_metric': best_metric, 'best_values': best,
+                'best_checkpoint': str(output / 'best.pt'), 'last_checkpoint': str(output / 'last.pt'),
+                'statistics': metric_statistics(history, best_epoch),
+                'report_dir': str(report_dir) if report_dir is not None else None,
                 'peak_cuda_allocated_mib': (torch.cuda.max_memory_allocated(device) / 2**20
                                             if device.type == 'cuda' else None),
             }
             # The validation metric can be infinite only for identical RGB pairs.
             (output / 'summary.json').write_text(json.dumps(json_safe(summary), indent=2, allow_nan=False) + '\n', encoding='utf-8')
+            print_statistics(summary['statistics'])
+            if report_dir is not None:
+                write_training_report(summary, report_dir)
+            if on_complete is not None:
+                # Export models sequentially after all training CUDA resources are released.
+                if teacher is not None:
+                    teacher.cpu()
+                    teacher = None
+                metrics.cpu()
+                move_student(student, criterion, optimizer, 'cpu')
+                gc.collect()
+                release_cuda(device)
+                on_complete(summary)
             completed = True
             return summary
     finally:

@@ -212,7 +212,7 @@ class TrainingTests(unittest.TestCase):
                 for image in images:
                     loss, _, _, _ = sample_objective(teacher, reference, reference_criterion, image,
                         crop_size=0, loss_weights=controls['loss_weights'], augmentation=ref_augmentation,
-                        augmentation_probability=1.0)
+                        augmentation_ratio=1.0)
                     losses.append(loss.item())
                     (loss / len(images)).backward()
                 torch.nn.utils.clip_grad_norm_(ref_params, controls['grad_clip'])
@@ -222,7 +222,7 @@ class TrainingTests(unittest.TestCase):
                 try:
                     result = train_batch(None, student, criterion, batch, optimizer, crop_size=0,
                         controls=controls, target_cache=cache, blend_scale=.5, micro_batch_size=2,
-                        augmentation=StudentAugmentation(self.config), augmentation_probability=1.0)
+                        augmentation=StudentAugmentation(self.config), augmentation_ratio=1.0)
                 finally:
                     handle.remove()
                 self.assertEqual(calls, [2, 1, 2] if ragged else [2, 2, 1])
@@ -255,13 +255,13 @@ class TrainingTests(unittest.TestCase):
                                      ('schedule', 'kind', 'unknown'), ('schedule', 'eta_min', -1),
                                      ('schedule', 'eta_min', 1), ('logging', 'progress', 'yes'),
                                      ('augmentation', 'enabled', 'yes'),
-                                     ('augmentation', 'max_probability', 0.251),
-                                     ('augmentation', 'start_probability', 0.26),
+                                     ('augmentation', 'max_ratio', 0.251),
+                                     ('augmentation', 'start_ratio', 0.26),
                                      ('augmentation', 'peak_fraction', 0.75),
                                      ('augmentation', 'stop_fraction', 1.1),
                                      ('augmentation', 'noise_std', -0.01),
-                                     ('augmentation', 'brightness', 1.1),
-                                     ('augmentation', 'contrast', float('nan'))]:
+                                     ('augmentation', 'noise_std', 1.1),
+                                     ('augmentation', 'max_ratio', float('nan'))]:
             with self.subTest(key=key), tempfile.TemporaryDirectory() as directory:
                 c = deepcopy(self.config)
                 c.pop('config_path')
@@ -567,49 +567,48 @@ class TrainingTests(unittest.TestCase):
         c = deepcopy(self.config)
         c['training']['epochs'] = 100
         augmentation = StudentAugmentation(c)
-        self.assertEqual(augmentation.probability(1), 0.10)
-        self.assertAlmostEqual(augmentation.probability(25), 0.10 + 0.15 * 24 / 49)
-        self.assertEqual(augmentation.probability(50), 0.25)
-        self.assertEqual(augmentation.probability(74), 0.25)
-        self.assertEqual(augmentation.probability(75), 0)
-        self.assertEqual(augmentation.probability(100), 0)
-        self.assertTrue(all(0 <= augmentation.probability(epoch) <= 0.25 for epoch in range(1, 102)))
+        self.assertEqual(augmentation.ratio(1), 0.10)
+        self.assertAlmostEqual(augmentation.ratio(25), 0.10 + 0.15 * 24 / 49)
+        self.assertEqual(augmentation.ratio(50), 0.25)
+        self.assertEqual(augmentation.ratio(74), 0.25)
+        self.assertEqual(augmentation.ratio(75), 0)
+        self.assertEqual(augmentation.ratio(100), 0)
+        self.assertTrue(all(0 <= augmentation.ratio(epoch) <= 0.25 for epoch in range(1, 102)))
         c['training']['epochs'] = 10
         augmentation = StudentAugmentation(c)
-        self.assertEqual([augmentation.probability(e) for e in (1, 5, 7, 8, 10)], [.1, .25, .25, 0, 0])
+        self.assertEqual([augmentation.ratio(e) for e in (1, 5, 7, 8, 10)], [.1, .25, .25, 0, 0])
         c['augmentation']['enabled'] = False
-        self.assertEqual(StudentAugmentation(c).probability(1), 0)
+        self.assertEqual(StudentAugmentation(c).ratio(1), 0)
         for epochs in (1, 2, 3):
             c['training']['epochs'] = epochs
             c['augmentation']['enabled'] = True
             short = StudentAugmentation(c)
-            self.assertTrue(all(0 <= short.probability(e) <= .25 for e in range(1, epochs + 1)))
-            self.assertEqual(short.probability(epochs), 0)
+            self.assertTrue(all(0 <= short.ratio(e) <= .25 for e in range(1, epochs + 1)))
+            self.assertEqual(short.ratio(epochs), 0)
 
     def test_augmentation_noise_plus_exactly_one_adjustment(self):
-        rgb = np.linspace(.1, .8, 8 * 8 * 3, dtype=np.float32).reshape(8, 8, 3)
+        rgb = np.linspace(.1, .6, 8 * 8 * 3, dtype=np.float32).reshape(8, 8, 3)
         prepared = identity_prepare(rgb)
         original = prepared.features.clone()
         for mode, name in enumerate(('brightness', 'contrast', 'sharpness')):
             augmentation = StudentAugmentation(self.config)
             with patch('tool.distillation.prepare_image', identity_prepare), \
-                 patch('tool.distillation.torch.rand', side_effect=[torch.tensor(0.), torch.tensor(.5), torch.tensor(.75)]), \
+                 patch('tool.distillation.torch.rand', return_value=torch.tensor(0.)), \
                  patch('tool.distillation.torch.randint', return_value=torch.tensor(mode)), \
                  patch('tool.distillation.torch.randn', return_value=torch.ones(3, 8, 8)), \
                  patch('tool.distillation.TF.adjust_brightness', wraps=TF.adjust_brightness) as brightness, \
                  patch('tool.distillation.TF.adjust_contrast', wraps=TF.adjust_contrast) as contrast, \
                  patch('tool.distillation.TF.adjust_sharpness', wraps=TF.adjust_sharpness) as sharpness:
                 result = augmentation.apply(prepared, .25)
-                calls = [brightness.call_count, contrast.call_count, sharpness.call_count]
-                self.assertEqual(calls, [int(i == mode) for i in range(3)])
+                self.assertEqual([brightness.call_count, contrast.call_count, sharpness.call_count],
+                                 [int(i == mode) for i in range(3)])
                 called = (brightness, contrast, sharpness)[mode]
-                torch.testing.assert_close(called.call_args.args[0], torch.from_numpy(rgb).permute(2, 0, 1) + .01)
-                self.assertAlmostEqual(called.call_args.args[1], 1 + .5 * self.config['augmentation'][name])
+                torch.testing.assert_close(called.call_args.args[0], torch.from_numpy(rgb).permute(2, 0, 1))
+                self.assertEqual(called.call_args.args[1], 1.25)
+                expected = getattr(TF, 'adjust_' + name)(torch.from_numpy(rgb).permute(2, 0, 1), 1.25)
+                expected = (expected + .05).clamp(0, 1).permute(1, 2, 0).numpy()
+                np.testing.assert_allclose(result.rgb, expected)
                 self.assertEqual(augmentation.applied_count, 1)
-                self.assertTrue(np.isfinite(result.rgb).all())
-                self.assertGreaterEqual(result.rgb.min(), 0)
-                self.assertLessEqual(result.rgb.max(), 1)
-                self.assertEqual(result.rgb.shape, rgb.shape)
         torch.testing.assert_close(prepared.features, original)
         np.testing.assert_array_equal(prepared.rgb, rgb)
 
@@ -641,7 +640,7 @@ class TrainingTests(unittest.TestCase):
             with patch('tool.distillation.compose_rgb_tensor', wraps=compose_rgb_tensor) as compose:
                 loss, _, _, augmented_target = sample_objective(
                     teacher, student, criterion, image, crop_size=32, loss_weights=self.config['loss'],
-                    augmentation=augmentation, augmentation_probability=1)
+                    augmentation=augmentation, augmentation_ratio=1)
                 self.assertFalse(np.array_equal(compose.call_args_list[0].args[1].rgb,
                                                 compose.call_args_list[1].args[1].rgb))
             loss.backward()
@@ -669,7 +668,8 @@ class TrainingTests(unittest.TestCase):
         calls = []
         def force_selected(augmentation, prepared, probability):
             calls.append(probability)
-            return original_apply(augmentation, prepared, 1 if probability else 0)
+            with patch('tool.distillation.torch.rand', return_value=torch.tensor(0.)):
+                return original_apply(augmentation, prepared, probability)
         with tempfile.TemporaryDirectory() as directory, \
              patch('tool.distillation.prepare_image', identity_prepare), \
              patch.object(StudentAugmentation, 'apply', force_selected):
@@ -678,7 +678,7 @@ class TrainingTests(unittest.TestCase):
             rows = [json.loads(line) for line in (Path(directory) / 'metrics.jsonl').read_text().splitlines()]
             updates = [row for row in rows if row['event'] == 'train']
             self.assertEqual(calls, [.1, .25, 0, 0])
-            self.assertEqual([row['augmentation_probability'] for row in updates], calls)
+            self.assertEqual([row['augmentation_ratio'] for row in updates], calls)
             self.assertEqual([row['augmented_samples'] for row in updates], [1, 1, 0, 0])
             self.assertEqual([row['loss_weights'] for row in updates], [updates[0]['loss_weights']] * 4)
             self.assertEqual(updates[0]['lr'], .001)

@@ -8,6 +8,28 @@ from torchvision.transforms import functional as TF
 
 from .teacher_pipeline import prepare_image, compose_rgb_tensor
 from .monitoring import benchmark_forward, measure_forward
+from .progress import progress_bar, progress_row
+
+
+def augment_rgb(rgb, mode, ratio, *, noise_std, generator, add_noise=False):
+    """Positive RGB adjustments; training adds noise to one adjustment, reports use one mode."""
+    parameters = {'mode': mode, 'fraction': ratio}
+    if mode == 'original':
+        return rgb.copy(), parameters
+    if mode not in ('noise', 'brightness', 'contrast', 'sharpness') or not 0 < ratio <= 1:
+        raise ValueError('Invalid augmentation mode or ratio')
+    image = torch.from_numpy(rgb.copy()).permute(2, 0, 1)
+    if mode != 'noise':
+        factor = 1 + ratio
+        operation = {'brightness': TF.adjust_brightness, 'contrast': TF.adjust_contrast,
+                     'sharpness': TF.adjust_sharpness}[mode]
+        image = operation(image, factor)
+        parameters['factor'] = factor
+    if mode == 'noise' or add_noise:
+        sigma = noise_std * ratio
+        image = image + torch.randn(image.shape, generator=generator) * sigma
+        parameters['sigma'] = sigma
+    return image.clamp(0, 1).permute(1, 2, 0).contiguous().numpy(), parameters
 
 
 class StudentAugmentation:
@@ -18,27 +40,22 @@ class StudentAugmentation:
         self.generator = torch.Generator().manual_seed(config['loader']['seed'])
         self.applied_count = 0
 
-    def probability(self, epoch):
+    def ratio(self, epoch):
         c = self.config
         if not c['enabled'] or epoch >= self.epochs * c['stop_fraction']:
             return 0.0
         progress = min(max((epoch - 1) / max(self.epochs * c['peak_fraction'] - 1, 1), 0), 1)
-        return c['start_probability'] + (c['max_probability'] - c['start_probability']) * progress
+        return c['start_ratio'] + (c['max_ratio'] - c['start_ratio']) * progress
 
-    def apply(self, prepared, probability):
-        if probability <= 0 or torch.rand((), generator=self.generator).item() >= probability:
+    def apply(self, prepared, ratio):
+        if ratio <= 0 or torch.rand((), generator=self.generator).item() >= ratio:
             return prepared
-        c = self.config
-        rgb = torch.from_numpy(prepared.rgb.copy()).permute(2, 0, 1)
-        sigma = torch.rand((), generator=self.generator).item() * c['noise_std']
-        rgb = (rgb + torch.randn(rgb.shape, generator=self.generator) * sigma).clamp(0, 1)
         mode = torch.randint(3, (), generator=self.generator).item()
-        name, operation = (('brightness', TF.adjust_brightness), ('contrast', TF.adjust_contrast),
-                           ('sharpness', TF.adjust_sharpness))[mode]
-        factor = 1 + (2 * torch.rand((), generator=self.generator).item() - 1) * c[name]
-        rgb = operation(rgb, factor).clamp(0, 1)
+        name = ('brightness', 'contrast', 'sharpness')[mode]
+        rgb, _ = augment_rgb(prepared.rgb, name, ratio, noise_std=self.config['noise_std'],
+                             generator=self.generator, add_noise=True)
         self.applied_count += 1
-        return prepare_image(rgb.permute(1, 2, 0).contiguous().numpy())
+        return prepare_image(rgb)
 
 
 def module_digest(module, *, parameters_only=False):
@@ -63,7 +80,7 @@ def prepare_sample(image, crop_size):
 
 
 def sample_objective(teacher, student, criterion, image, *, crop_size, loss_weights,
-                     augmentation=None, augmentation_probability=0.0, targets=None, blend_scale=None):
+                     augmentation=None, augmentation_ratio=0.0, targets=None, blend_scale=None):
     blend_scale = teacher.blend_scale if blend_scale is None else blend_scale
     prepared = prepare_sample(image, crop_size)
     device = next(student.parameters()).device
@@ -73,7 +90,7 @@ def sample_objective(teacher, student, criterion, image, *, crop_size, loss_weig
             target_rgb = compose_rgb_tensor(target_head, prepared, blend_scale=blend_scale)
     else:
         target_head, target_features, target_rgb = targets
-    student_prepared = augmentation.apply(prepared, augmentation_probability) if augmentation else prepared
+    student_prepared = augmentation.apply(prepared, augmentation_ratio) if augmentation else prepared
     student_inputs = student_prepared.features.to(device)
     if student.layout != 'BHWC':
         student_inputs = student_inputs.permute(0, 3, 1, 2).contiguous()
@@ -90,12 +107,12 @@ def sample_objective(teacher, student, criterion, image, *, crop_size, loss_weig
     return loss, components, prediction_rgb, target_rgb
 
 
-def training_microbatches(images, *, crop_size, micro_batch_size, augmentation, probability):
+def training_microbatches(images, *, crop_size, micro_batch_size, augmentation, ratio):
     """Batch only matching network extents; preserve order and per-image geometry."""
     group = []
     for index, image in enumerate(images):
         prepared = prepare_sample(image, crop_size)
-        augmented = augmentation.apply(prepared, probability) if augmentation else prepared
+        augmented = augmentation.apply(prepared, ratio) if augmentation else prepared
         if group and (len(group) == micro_batch_size or
                       augmented.features.shape != group[0][2].features.shape):
             yield group
@@ -143,7 +160,7 @@ def microbatch_objective(teacher, student, criterion, group, sample_ids, *,
 
 
 def train_batch(teacher, student, criterion, batch, optimizer, *, crop_size, controls,
-                augmentation=None, augmentation_probability=0.0, target_cache=None, blend_scale=None,
+                augmentation=None, augmentation_ratio=0.0, target_cache=None, blend_scale=None,
                 micro_batch_size=1):
     if type(micro_batch_size) is not int or micro_batch_size < 1:
         raise ValueError('micro_batch_size must be a positive integer')
@@ -163,7 +180,7 @@ def train_batch(teacher, student, criterion, batch, optimizer, *, crop_size, con
     sizes = []
     for group in training_microbatches(batch['images'], crop_size=crop_size,
                                       micro_batch_size=micro_batch_size, augmentation=augmentation,
-                                      probability=augmentation_probability):
+                                      ratio=augmentation_ratio):
         loss, components = microbatch_objective(
             teacher, student, criterion, group, batch['sample_ids'],
             loss_weights=controls['loss_weights'], target_cache=target_cache, blend_scale=blend_scale)
@@ -195,8 +212,7 @@ def evaluate(teacher, student, criterion, loader, metrics, monitor, *, config, e
     totals, scene_totals, scene_counts = defaultdict(float), {}, defaultdict(int)
     images, benchmark = 0, None
     gpu_values = []
-    bar = tqdm(loader, desc=f'Epoch {epoch}/{config["training"]["epochs"]} [Val]',
-               unit='it', dynamic_ncols=True, disable=not config['logging']['progress'])
+    bar = progress_bar(loader, enabled=config['logging']['progress'], validation=True)
     try:
         for batch in bar:
             for image, scene, sample_id in zip(batch['images'], batch['scenes'], batch['sample_ids']):
@@ -230,8 +246,10 @@ def evaluate(teacher, student, criterion, loader, metrics, monitor, *, config, e
             gpu = monitor.sample()
             if gpu is not None:
                 gpu_values.append(gpu)
-            bar.set_postfix({'GPU': monitor.display(), 'loss': f'{totals["total"] / images:.5f}',
-                             'psnr': f'{totals["psnr"] / images:.2f}'})
+            bar.set_description_str(progress_row(epoch, config['training']['epochs'],
+                next(student.parameters()).device, monitor, [f'{totals["total"] / images:.5f}',
+                f'{totals["psnr"] / images:.2f}', f'{totals["ssim"] / images:.4f}',
+                f'{totals["lpips"] / images:.4f}', images]), refresh=False)
         if not images:
             raise ValueError('Validation loader has no images')
         scenes = {name: {key: value / scene_counts[name] for key, value in values.items()}

@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "lpips>=0.1.4",
+    "matplotlib>=3.10",
     "mlxdlss",
     "numpy>=1.26",
     "nvidia-ml-py>=12",

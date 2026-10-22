@@ -14,7 +14,7 @@
 <details>
 <summary><em>當前限制</em></summary>
 
-Student 是研究用結構模型，不代表 NVIDIA 的數值等價實作。自訂 SSM 採用純 PyTorch 逐步掃描，並非官方 Mamba／VMamba 融合核心。評估指標衡量與 Teacher RGB 的一致性，不代表相對獨立真實標註的品質提升。目前未實作完整訓練狀態續訓或 Student 影像推論 CLI。
+Student 是研究用結構模型，不代表 NVIDIA 的數值等價實作。自訂 SSM 採用純 PyTorch 逐步掃描，並非官方 Mamba／VMamba 融合核心。評估指標衡量與 Teacher RGB 的一致性，不代表相對獨立真實標註的品質提升。目前未實作完整訓練狀態續訓；`val.py` 提供既有權重驗證與比較圖輸出。
 
 </details>
 
@@ -57,7 +57,7 @@ EchoRender/
 ├── docs/TEACHER_INFERENCE.md
 ├── weights/                     # 本機 Teacher 權重，不納入 Git
 ├── output/feats/                 # 可重用 Teacher 目標，不納入 Git
-├── train.py / infer.py
+├── train.py / val.py / infer.py
 └── pyproject.toml / uv.lock
 ```
 
@@ -156,7 +156,7 @@ schedule:
   eta_min: 0.000001
 ```
 
-Teacher 權重相對專案根目錄解析，且必須位於其 `weights/` 下；其他路徑相對訓練 YAML。因此 `output/test` 會解析為 `config/output/test`。已存在的 run 目錄保留，新訓練依序使用 `_2`、`_3` 等後綴；選定的絕對路徑會印出並保存。
+Teacher 權重與 `runtime.output_dir` 相對專案根目錄解析；權重必須位於其 `weights/` 下。`output/test` 會解析為 `EchoRender/output/test`，其他路徑仍相對訓練 YAML。已存在的 run 目錄保留，新訓練依序使用 `_2`、`_3` 等後綴；選定的絕對路徑會印出並保存。
 
 `runtime.device` 支援 `auto`、`cpu`、`cuda`、`cuda:N`。CUDA 編號對應可見裝置，設定 `CUDA_VISIBLE_DEVICES` 後可能重新編號。
 
@@ -172,9 +172,26 @@ SGD 預設 momentum 與 weight decay 均為零。每次 optimizer 更新前，�
 
 ### Student 增強
 
-被選中的影像加入 Gaussian noise，再均勻隨機選擇亮度、對比或銳利度其中一種調整。機率由 10% 開始，在總 epochs 的 50% 達到 25%，從 75% 起關閉。10 epochs 時，第 1 個 epoch 為 10%、第 5～7 個為 25%、第 8～10 個為 0%。上限是抽樣機率，不保證每批實際張數；短訓練可能無法走完整段上升，`max_steps` 不會重縮放排程。
+每張被選中的訓練影像，先做隨機一種亮度／對比／銳利度調整，再加入 Gaussian 噪聲。
+排程比例同時控制抽樣機率與強度：`factor = 1 + ratio`，`sigma = noise_std * ratio`。
+預設倍率為 1.10～1.25，sigma 為 0.02～0.05；總 epoch 的 50% 到達最大比例 25%，
+從 75% 起關閉。10 epochs 時，第 1 個為 10%，第 5～7 個為 25%，第 8～10 個為 0%。
+實際抽樣數會隨機波動，`max_steps` 不重算 epoch 排程。
 
-噪聲 sigma 取 0～0.02；亮度／對比倍率取 0.8～1.2，銳利度取 0.5～1.5。Teacher 目標保持乾淨，Student 前處理與 RGB 組合使用增強影像；驗證、benchmark 與推論不增強。增強使用獨立 RNG，由 `loader.seed` 設定；以 `augmentation.enabled: false` 關閉。
+```yaml
+augmentation:
+  enabled: true
+  start_ratio: 0.10
+  max_ratio: 0.25
+  peak_fraction: 0.50
+  stop_fraction: 0.75
+  noise_std: 0.20
+```
+
+Teacher 目標保持乾淨且凍結；Student 前處理與 RGB 合成使用增強影像。
+原圖驗證評分、特徵快取重用與 benchmark 維持既有流程。
+增強使用獨立 RNG，由 `loader.seed` 設定；以 `augmentation.enabled: false` 關閉訓練增強。
+驗證比較圖每次只使用一種模式，強度由報表設定控制。
 
 ---
 
@@ -202,7 +219,7 @@ Ltotal     = 3 * Ld + Lrgb
 
 ```bash
 uv run --locked python train.py --config config/train.yaml
-uv run --locked python -m unittest tool.test_training -v
+uv run --locked python -m unittest tool.test_training tool.test_reporting tool.test_val -v
 ```
 
 進度列顯示 epoch、loss、按影像加權的平均 loss、迭代速度與 GPU 使用率。NVML 透過 UUID 對應指定 CUDA 裝置；使用率涵蓋整張卡，無法取得時顯示 `N/A`。
@@ -212,6 +229,7 @@ uv run --locked python -m unittest tool.test_training -v
 | 輸出 | 內容 |
 |---|---|
 | `metrics.jsonl` | 每次更新的 loss、控制參數、增強數量、GPU 使用率與 epoch 評估。 |
+| `best.pt` | 依驗證指標選出的最佳 checkpoint，內容格式與 `last.pt` 相同。 |
 | `last.pt` | v2 Student、特徵 adapters、optimizer、進度、模型／訓練設定與 blend scale。 |
 | `summary.json` | Epoch 結果、參數量與 CUDA 配置峰值。 |
 | `resolved_train.yaml` | 解析後的路徑與本次設定。 |
@@ -227,10 +245,111 @@ uv run --locked python -m unittest tool.test_training -v
 ## Teacher 推論
 
 ```bash
-uv run --locked python infer.py --input input.png --weights weights/dlssnr-logical.safetensors --output outputs/teacher.png --device cuda:1
+uv run --locked python infer.py --input input.png --weights weights/dlssnr-logical.safetensors --output output/teacher.png --device cuda:1
 ```
 
 輸出 PNG 保持原圖尺寸。`--overwrite` 允許覆蓋既有檔案，`--report path.json` 保存耗時與 metadata。詳見 [Teacher 推論](docs/TEACHER_INFERENCE.md)。
+
+---
+
+## 最佳權重與最終報表
+
+訓練只保存 `best.pt` 與 `last.pt`。預設依驗證集影像平均 PSNR 最高選擇 best；
+`reporting.best_metric` 也支援 `loss`、`ssim`、`lpips`，其中 loss／LPIPS 取最小，
+PSNR／SSIM 取最大，相同分數保留原 best。更新時印出
+`[Best]: save best weight | ...`，列出相對前一個 best 的各指標改善百分比；
+正值代表改善，無法定義的百分比顯示 `N/A`。
+
+結束時依各 epoch 的平均值列印 train loss、val loss、PSNR、SSIM、LPIPS 的
+max／min／mean／best。每個指標各自的最佳值，與所選 best checkpoint 當時的值
+會分開記錄。報表輸出至 `runtime.output_dir` 同層的 `val/<project_name>/`，預設為專案根目錄的 `output/val/`；
+null 沿用本次訓練 run 名稱，遇到既有報表目錄會增加流水號。
+
+```yaml
+reporting:
+  enabled: true
+  project_name: null
+  best_metric: psnr
+  crop_size: 0
+  inference_size: 320
+  samples_per_mode: 2
+  strengths: [0.25, 0.50, 0.75, 1.00]
+```
+
+`statistics.json`、`statistics.csv`、`epochs.csv` 與 `training_metrics.png`
+保存統計與四格曲線。訓練進度採固定欄位顯示 epoch、GPU 顯存／使用率、loss、
+LR 與影像數；驗證另顯示 PSNR、SSIM、LPIPS。
+
+統計後依序載入最佳 Student 與凍結 Teacher，推論驗證與測試影像。
+各 split 對 original、noise、brightness、contrast、sharpness 各隨機抽 2 張，
+資料足夠時共 10 張來源影像。`loader.seed` 固定抽樣，兩個模型共用相同來源與輸入。
+小型 split 可跨模式重用來源，每種模式最多選 `samples_per_mode` 張不同影像。
+原圖驗證評分仍處理完整 split。
+
+驗證每次只套用一種增強。四級 noise sigma 為 0.05／0.10／0.15／0.20；
+亮度、對比、銳利度的倍率為 1.25／1.50／1.75／2.00。
+噪聲使用同一圖樣依強度縮放。非 original 模式依序排列原圖與四級增強；
+original 只有一欄。每個檔案只對應一張來源影像，檔名保留影像身分。
+
+```text
+output/val/<project_name>/
+├── statistics.json / statistics.csv / epochs.csv / training_metrics.png
+├── predictions.json / predictions.jsonl / predictions.csv
+├── preview/<mode>/<split>__<sample_id>.png
+└── pred/
+    ├── student/<mode>/<split>__<sample_id>.png
+    └── teacher/<mode>/<split>__<sample_id>.png
+```
+
+preview 為一列輸入；pred 第一列為各強度輸入，第二列為對應預測。
+粗體英文標題包含 `| total infer 1.234 s | avg infer 0.247 s |`。
+時間單位為秒，GPU 會前後同步；計算純模型 forward，排除每種輸入形狀的首次暖機、
+前處理、RGB 合成與存檔。總時間與平均時間均以該圖實際顯示的欄位計算。
+各欄維持長寬比，顯示寬度最多 384 像素。
+
+`reporting.crop_size: 0` 保留完整來源。`reporting.inference_size: 320` 限制推論長邊，
+不放大小圖；增強在 resize 後、特徵前處理前執行，避免縮圖稀釋噪聲。
+相同的輸入增強差值會映射回原始尺寸供顯示。推論尺寸先完成 RGB 合成，
+再將 RGB 預測差值映射至原始尺寸的增強輸入。inference_size 設為 0 可使用原尺寸推論，
+正值 crop_size 則在此流程前先中心裁切。
+
+推論索引記錄抽樣名單、增強參數、排列尺寸、輸入／特徵／預測雜湊及時間。
+`predictions.csv` 保存各版本推論秒數，以及相對同一來源原圖預測的 RGB RMSE。
+缺少測試資料時記錄 `completed_with_missing_splits`，仍輸出可用影像。
+失敗時保留特徵快取，報表完成後才詢問是否刪除。
+`reporting.enabled: false` 跳過最終圖表與圖片，仍保存 best／last 及列印統計。
+
+此功能套用至新啟動的訓練程序。舊訓練若只保留 `last.pt`，無法還原較早 epoch 的最佳權重。
+
+---
+
+## 獨立驗證與預測圖輸出
+
+`val.py` 與 `train.py` 位於同級，可直接驗證既有 checkpoint 並重新輸出比較圖：
+
+```bash
+uv run --locked python val.py --weights output/test_12/last.pt --project my_validation --imgsz 320
+# 只選驗證集一張影像試跑：
+uv run --locked python val.py --weights output/test_12/last.pt --project preview --split val --max-images 1
+```
+
+以 `best.pt` 載入選定的最佳模型，或以 `last.pt` 載入最後一個模型。
+模型結構、特徵 adapters、驗證 crop 與 loss 取自 checkpoint；
+資料路徑、裝置、增強與比較圖設定取自 `--config config/train.yaml`。
+可用 `--device cuda:1` 覆蓋設定的裝置。
+
+`--project` 定義報表名稱。`runtime.output_dir: output/test` 時，報表輸出至
+`output/val/<project>/`；重複名稱自動加上 `_2`、`_3`，不覆蓋既有結果。
+`--split` 支援 `val`、`test`、`both`（預設）；`--max-images N` 限制各 split 的
+重新評分與圖片輸出張數。單獨指定不存在的 split 會報錯；`both` 則記錄缺失並處理可用資料。
+
+`validation.json` 保存重新計算的乾淨影像 loss／PSNR／SSIM／LPIPS（Teacher RGB 參考）
+與所選權重 epoch。若 checkpoint 同目錄有 `summary.json`，會額外重建訓練歷史曲線
+及統計，其最佳 epoch 與手動選取的 `last.pt` 分開記錄。
+缺少歷史資料時仍可驗證與輸出圖片，不會產生虛構曲線。
+驗證使用 checkpoint 的訓練 crop；比較圖由 `reporting.crop_size` 控制裁切，
+由 `reporting.inference_size` 或 `--imgsz 320` 控制縮放推論尺寸；
+既有 Teacher 特徵快取不會被修改或刪除。
 
 ---
 

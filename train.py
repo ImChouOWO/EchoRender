@@ -1,4 +1,4 @@
-"""Train the SSM student using config/train.yaml (all paths relative to YAML)."""
+"""Train the SSM Student; output paths resolve from the project root."""
 import argparse
 import os
 from pathlib import Path
@@ -11,10 +11,11 @@ from model.student import EchoRenderStudent
 from model.teacher import EchoRenderTeacher, resolve_device
 from model.card.loss import DistillationLoss
 from tool.dataloader import load_data_config, build_dataloader
-from tool.training_config import load_training_config, DEFAULT_TRAIN_CONFIG, reserve_output_dir
+from tool.training_config import load_training_config, DEFAULT_TRAIN_CONFIG, reserve_output_dir, PROJECT_ROOT
 from tool.metrics import ImageMetrics
 from tool.trainer import fit, load_student_state
 from tool.teacher_features import ask_delete_cache
+from tool.prediction_report import export_predictions
 
 
 def main(argv=None):
@@ -59,7 +60,23 @@ def main(argv=None):
         print(f'Output: {output}', flush=True)
         print(f'Training on {device}; train={len(train_loader.dataset)}, val={len(val_loader.dataset)}', flush=True)
         print(f"Batch: effective={config['loader']['batch_size']}, micro={config['training']['micro_batch_size']}", flush=True)
-        fit(create_teacher, student, criterion, train_loader, val_loader, optimizer, metrics, config, device=device, cache_cleanup=ask_delete_cache)
+        report_dir = None
+        on_complete = None
+        if config['reporting']['enabled']:
+            project_name = config['reporting']['project_name'] or output.name
+            report_dir = reserve_output_dir(Path(config['runtime']['output_dir']).parent / 'val' / project_name)
+            print(f'Reports: {report_dir}', flush=True)
+            def on_complete(summary):
+                loaders, missing = {'val': val_loader}, {}
+                try:
+                    loaders['test'] = build_dataloader(data, split='test')
+                except (FileNotFoundError, ValueError) as exc:
+                    missing['test'] = str(exc)
+                    print(f'[Report]: Test split unavailable: {exc}', flush=True)
+                export_predictions(summary['best_checkpoint'], create_teacher, loaders, config, report_dir,
+                                   device, missing_splits=missing)
+        fit(create_teacher, student, criterion, train_loader, val_loader, optimizer, metrics, config,
+            device=device, cache_cleanup=ask_delete_cache, report_dir=report_dir, on_complete=on_complete)
     except (OSError, ValueError, RuntimeError, ImportError) as exc:
         parser.exit(2, f'Training failed: {exc}\n')
     return 0

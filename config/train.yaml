@@ -1,4 +1,4 @@
-# teacher_weights resolves from the project root; other paths resolve from this file.
+# teacher_weights and runtime.output_dir resolve from the project root; other paths resolve from this file.
 model:
   student_config: model.yaml
   student_weights: null
@@ -57,14 +57,11 @@ schedule:
 
 augmentation:
   enabled: true
-  start_probability: 0.10
-  max_probability: 0.25
+  start_ratio: 0.10  # sampling probability and operation strength
+  max_ratio: 0.25
   peak_fraction: 0.50
   stop_fraction: 0.75
-  noise_std: 0.02  # maximum Gaussian sigma for RGB in [0,1]
-  brightness: 0.20  # factor sampled from 1 +/- this value
-  contrast: 0.20
-  sharpness: 0.50
+  noise_std: 0.20  # sigma = noise_std * ratio; adjustment factor = 1 + ratio
 
 dataset:
   root: /home/soic/Desktop/MPI-Sintel-complete
@@ -86,3 +83,12 @@ loader:
   num_workers: 0
   seed: 42
   train_shuffle: true
+
+reporting:
+  enabled: true
+  project_name: null  # null uses the reserved training run name
+  best_metric: psnr  # validation image mean; loss/lpips minimize, psnr/ssim maximize
+  crop_size: 0        # 0 exports full-size images; training crop is unchanged
+  inference_size: 320  # longest-edge cap before padding; map predicted RGB correction back to original size; 0 keeps native inference
+  samples_per_mode: 2  # original/noise/brightness/contrast/sharpness: two source images each
+  strengths: [0.25, 0.50, 0.75, 1.00]  # validation strengths; factor = 1 + strength, noise sigma = noise_std * strength
