@@ -4,11 +4,11 @@
 
 ![Python](https://img.shields.io/badge/Python-3.12-blue) ![Framework](https://img.shields.io/badge/Framework-PyTorch-orange) ![Architecture](https://img.shields.io/badge/Student-SSM%20%2F%20Swin%20%2F%20ViT-purple) ![License](https://img.shields.io/badge/License-MIT-green)
 
-將凍結的 DLSS-NR Teacher 蒸餾至可訓練的 PyTorch Student。每張影像獨立處理，不使用 optical flow 或跨影格狀態。
+將凍結的 DLSS-NR Teacher 蒸餾至可訓練的 PyTorch Student。以 Sintel clean 的 1～10 幀連續片段訓練，使用 Sintel 光流重投影歷史，並由同一 Student 支援四種 profile。
 
 ```text
 乾淨影像 -> 凍結 Teacher -> 快取 head／中間特徵／RGB 目標
-同一裁切 -> 可選增強 -> Student -> 蒸餾 loss＋RGB loss
+同一 RGB 裁切 -> 可選增強 -> RGB-only Student -> 蒸餾 loss＋RGB loss
 ```
 
 <details>
@@ -26,7 +26,7 @@ Teacher 使用已解包、`fully_logical=true` 的 logical safetensors，透過�
 
 ### 模型結構
 
-由 [config/model.yaml](config/model.yaml) 定義。以下為目前 Student 的通道與深度，不是 Teacher block 編號。
+由 [config/model.yaml](config/model.yaml) 定義。Student 以 `input_channels: 3` 接收 `[0,1]` 的原始 RGB，影像通道不加入模型噪聲或控制資料；另外接收控制向量，並在內部融合自身前一幀的 RGB 歷史。Teacher 維持 16 通道前處理、四通道 head 與 E1／E2／E3／ViT 蒸餾目標；兩路使用相同的鏡像 padding。目前 checkpoint 格式為 `echorender-rgb-temporal-v3`；舊 Student 權重須重新訓練，舊單張 Teacher 快取不會沿用。以下為目前 Student 的通道與深度，不是 Teacher block 編號。
 
 | Stage | 模組 | 通道 | Blocks |
 |---|---|---:|---:|
@@ -103,7 +103,7 @@ MPI-Sintel-complete/
 | `true` | 建立或重用目標，記錄固定 `blend_scale`，完整釋放 Teacher，再由 Student 使用快取訓練。 |
 | `false` | 凍結 Teacher 並保持 eval，與 Student 同時位於指定 GPU，使用即時蒸餾；不讀寫快取或顯示刪除提示。 |
 
-`releas` 為既有設定鍵名。快取固定放在專案根目錄 `output/feats/`，包含乾淨影像的 E1／E2／E3／ViT、raw 四通道 head 與組合 RGB。依 split 與 sample ID 配對；它們是 loss 目標，不是 Student 輸入。
+`releas` 為既有設定鍵名。快取固定放在專案根目錄 `output/feats/`，包含乾淨影像的 E1／E2／E3／ViT、raw 四通道 head 與組合 RGB。以 profile、split、序列與幀識別配對，路徑為 `output/feats/<profile>/<split>/<source>/<scene>/<frame>/targets.pt`；同檔保存 head、中間特徵、RGB 目標、歷史及識別資料。它們是 loss 目標，不會拿 Teacher 歷史餵給 Student。
 
 完整快取跨 epoch、跨次訓練重用；相容的部分快取逐張續接，只重建缺少或截斷的項目。每個檔案原子寫入後即更新索引，程序鎖保護快取至刪除提示結束。有效性包含 Teacher 權重、資料身分、裁切、前處理、capture／後端程式、裝置與 benchmark 設定。Student 結構、batch、增強或 optimizer 變更不會使乾淨目標失效。
 
@@ -162,7 +162,7 @@ Teacher 權重與 `runtime.output_dir` 相對專案根目錄解析；權重必�
 
 ### 訓練策略
 
-`loader.batch_size` 是每次 optimizer 更新的有效張數；`training.micro_batch_size` 是同時前向的最大張數。預設為 **4 張×4 組**，以 16 張平均梯度，裁剪後更新一次。最後不足一批時使用實際張數平均；不同網路尺寸分組處理，不改變原圖幾何。
+`loader.batch_size` 是每次更新的有效片段數，每個片段對應一種 profile；`training.micro_batch_size` 限制同時前向的幀數。先平均各片段內的逐幀 loss，再依有效 batch 平均梯度。每一幀之間切斷歷史梯度，避免反向圖隨幀數增加；片段越長仍需要更多運算。`rendering.train_min_frames` 到 `max_frames` 控制隨機前綴長度，上限 10 幀。
 
 `training.gradient_checkpointing: true` 會在反向時重算各 SSM block，減少保留張量；`false` 保留張量並省去重算。驗證／推論不使用 checkpointing。
 
@@ -172,11 +172,11 @@ SGD 預設 momentum 與 weight decay 均為零。每次 optimizer 更新前，�
 
 ### Student 增強
 
-每張被選中的訓練影像，先做隨機一種亮度／對比／銳利度調整，再加入 Gaussian 噪聲。
-排程比例同時控制抽樣機率與強度：`factor = 1 + ratio`，`sigma = noise_std * ratio`。
+被選中片段內的每張訓練影像，先做相同的一種亮度／對比／銳利度調整，再加入 Gaussian 噪聲。
+排程比例同時控制增強樣本上限與強度：`factor = 1 + ratio`，`sigma = noise_std * ratio`。
 預設倍率為 1.10～1.25，sigma 為 0.02～0.05；總 epoch 的 50% 到達最大比例 25%，
 從 75% 起關閉。10 epochs 時，第 1 個為 10%，第 5～7 個為 25%，第 8～10 個為 0%。
-實際抽樣數會隨機波動，`max_steps` 不重算 epoch 排程。
+增強數向下取整，並同時受片段與幀數比例上限限制；其餘保留原圖。`max_steps` 不重算 epoch 排程。
 
 ```yaml
 augmentation:
@@ -230,13 +230,13 @@ uv run --locked python -m unittest tool.test_training tool.test_reporting tool.t
 |---|---|
 | `metrics.jsonl` | 每次更新的 loss、控制參數、增強數量、GPU 使用率與 epoch 評估。 |
 | `best.pt` | 依驗證指標選出的最佳 checkpoint，內容格式與 `last.pt` 相同。 |
-| `last.pt` | v2 Student、特徵 adapters、optimizer、進度、模型／訓練設定與 blend scale。 |
+| `last.pt` | v3 條件化 RGB Student、特徵 adapters、optimizer、進度、模型／訓練設定與 blend scale。 |
 | `summary.json` | Epoch 結果、參數量與 CUDA 配置峰值。 |
 | `resolved_train.yaml` | 解析後的路徑與本次設定。 |
 
 `max_steps` 限制更新次數，但仍執行驗證與 checkpoint 保存。`model.student_weights` 僅載入 Student 權重，以新的 optimizer／adapters 開始新 run。測試涵蓋梯度、projection 通道、掃描方向、batch、快取生命週期與排程；合成測試不代表真實資料品質。
 
-目前 E4-512 模型以 crop 192、micro-batch 4、有效 batch 16、checkpointing 關閉，在 GPU 1（RTX 5000 Ada）的兩次短測更新中，配置峰值約 **29.14 GiB**、保留顯存約 **29.81 GiB**，每次更新約 **8～9 秒**。這不是完整 epoch benchmark，也不保證未來顯存需求。
+改為 RGB 輸入前的 16 通道 E4-512 Student 以 crop 192、micro-batch 4、有效 batch 16、checkpointing 關閉，在 GPU 1（RTX 5000 Ada）的兩次短測更新中，配置峰值約 **29.14 GiB**、保留顯存約 **29.81 GiB**，每次更新約 **8～9 秒**。這不是完整 epoch benchmark，也不保證未來顯存需求。
 
 權重、checkpoints、Teacher 快取與輸出目錄由 `.gitignore` 排除；`uv.lock` 保留版本控制以利重現。
 
@@ -330,7 +330,7 @@ preview 為一列輸入；pred 第一列為各強度輸入，第二列為對應�
 ```bash
 uv run --locked python val.py --weights output/test_12/last.pt --project my_validation --imgsz 320
 # 只選驗證集一張影像試跑：
-uv run --locked python val.py --weights output/test_12/last.pt --project preview --split val --max-images 1
+uv run --locked python val.py --weights output/test_12/last.pt --project preview --split val --max-clips 1
 ```
 
 以 `best.pt` 載入選定的最佳模型，或以 `last.pt` 載入最後一個模型。
@@ -340,8 +340,8 @@ uv run --locked python val.py --weights output/test_12/last.pt --project preview
 
 `--project` 定義報表名稱。`runtime.output_dir: output/test` 時，報表輸出至
 `output/val/<project>/`；重複名稱自動加上 `_2`、`_3`，不覆蓋既有結果。
-`--split` 支援 `val`、`test`、`both`（預設）；`--max-images N` 限制各 split 的
-重新評分與圖片輸出張數。單獨指定不存在的 split 會報錯；`both` 則記錄缺失並處理可用資料。
+`--split` 支援 `val`、`test`、`both`（預設）；`--max-clips N` 限制各 split 的
+實體片段數，並保留四種 profile 的評分與圖片輸出。單獨指定不存在的 split 會報錯；`both` 則記錄缺失並處理可用資料。
 
 `validation.json` 保存重新計算的乾淨影像 loss／PSNR／SSIM／LPIPS（Teacher RGB 參考）
 與所選權重 epoch。若 checkpoint 同目錄有 `summary.json`，會額外重建訓練歷史曲線
@@ -349,7 +349,21 @@ uv run --locked python val.py --weights output/test_12/last.pt --project preview
 缺少歷史資料時仍可驗證與輸出圖片，不會產生虛構曲線。
 驗證使用 checkpoint 的訓練 crop；比較圖由 `reporting.crop_size` 控制裁切，
 由 `reporting.inference_size` 或 `--imgsz 320` 控制縮放推論尺寸；
-既有 Teacher 特徵快取不會被修改或刪除。
+獨立驗證使用同一快取根目錄下的 `evaluate` 分類與 `evaluation.json` 索引，不覆寫訓練目標；Teacher 先完成擷取並卸載，才開始 Student 評分。
+
+---
+
+## 四模式與歷史評估
+
+`rendering.profiles` 分別設定 standard、natural、cinematic、neutral。預設採用使用者指定的結構／自動控制／強度組合；neutral 明確指定 style 2，其餘模式跟隨本身 style。`tone: null` 跟隨模式預設。`dataset.render_pass` 固定 clean，motion 固定 Sintel，不提供 control_mask。`temporal: false` 使用單張，`true` 支援最多 10 幀；資料載入器只打亂片段，不打亂片段內幀序，不跨場景或斷幀。
+
+增強保留「噪聲＋隨機一種亮度／對比／銳利度」。每個有效 batch 同時限制片段與幀的增強比例，不超過排程比例；其餘保持原圖。強度從 10% 升至 25%，50% epoch 達最高，75% 起關閉。片段內維持相同模式與強度；Teacher 始終使用未增強影像。
+
+四模式在相同幾何下約產生四倍目標；`releas: true` 仍先建立／續建快取並完整釋放 Teacher，`false` 維持凍結 Teacher 的線上蒸餾。舊平面快取保留但不重用。
+
+`temporal_latest.json/.csv/.png` 列出各 profile 第 1～10 幀的 loss、PSNR、SSIM、LPIPS，以及同張圖重置歷史的分數與差值。兩者對照相同的 temporal Teacher RGB 目標，另記錄實際歷史深度、使用率、有效像素與光流對齊 MAE；這些是 Teacher 一致性與時間穩定性指標，不是獨立清晰 GT 品質。獨立驗證輸出 `temporal_val`／`temporal_test` 報表。
+
+圖像輸出保留 preview／pred，預測路徑加入 profile：`pred/<student|teacher>/<profile>/<mode>/...png`。每種增強模式抽選兩個片段的末幀輸出，先依序推論歷史上下文，再輸出該末幀比較圖。total／avg infer 包含實際推論的上下文幀，單位秒。只有 RGB 的部署影片需要另外由 RGB 估計光流，不能使用 Sintel GT。
 
 ---
 

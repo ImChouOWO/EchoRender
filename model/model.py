@@ -1,4 +1,4 @@
-﻿"""Safe YOLO-style DAG builder; no eval and no arbitrary YAML imports."""
+"""Safe YOLO-style DAG builder; no eval and no arbitrary YAML imports."""
 from pathlib import Path
 from copy import deepcopy
 import yaml
@@ -19,7 +19,7 @@ class Model(nn.Module):
         if not isinstance(cfg, dict):
             raise ValueError('Model config must be a mapping')
         self.config = cfg
-        self.input_channels = int(cfg.get('input_channels', 16))
+        self.input_channels = int(cfg.get('input_channels', 3))
         self.layout = cfg.get('input_layout', 'BHWC')
         if self.input_channels < 1 or self.layout not in ('BHWC', 'BCHW'):
             raise ValueError('Invalid input channels or layout')
@@ -74,7 +74,7 @@ class Model(nn.Module):
         if self.channels[-1] != cfg.get('output_channels', 4):
             raise ValueError('Final channels do not match output_channels')
 
-    def forward(self, x, return_features=False):
+    def forward(self, x, return_features=False, condition=None):
         axis = -1 if self.layout == 'BHWC' else 1
         if x.ndim != 4 or x.shape[axis] != self.input_channels or min(x.shape[1:3] if axis == -1 else x.shape[2:]) < 1:
             raise ValueError(f'Expected {self.layout} tensor with {self.input_channels} input channels')
@@ -85,7 +85,8 @@ class Model(nn.Module):
             def resolve(r):
                 return (outputs[-1] if outputs else x) if r == -1 else outputs[r]
             inputs = [resolve(r) for r in source] if isinstance(source, list) else resolve(source)
-            outputs.append(layer(inputs))
+            value = layer(inputs)
+            outputs.append(condition(len(outputs), value) if condition is not None else value)
         y = outputs[-1]
         if self.layout == 'BHWC':
             y = y.permute(0, 2, 3, 1).contiguous()

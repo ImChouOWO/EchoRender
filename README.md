@@ -4,11 +4,11 @@
 
 ![Python](https://img.shields.io/badge/Python-3.12-blue) ![Framework](https://img.shields.io/badge/Framework-PyTorch-orange) ![Architecture](https://img.shields.io/badge/Student-SSM%20%2F%20Swin%20%2F%20ViT-purple) ![License](https://img.shields.io/badge/License-MIT-green)
 
-Single-image knowledge distillation from a frozen recovered DLSS-NR Teacher into a trainable PyTorch Student. Images are independent, with no optical flow or cross-frame state.
+Controlled RGB sequence distillation from a frozen recovered DLSS-NR Teacher into a PyTorch Student. Clean Sintel clips contain 1–10 consecutive frames; four rendering profiles share one conditioned Student.
 
 ```text
-Clean image -> frozen Teacher -> cached head / features / RGB targets
-Same crop -> optional augmentation -> Student -> distillation + RGB losses
+Clean RGB clip + Sintel flow -> frozen Teacher per profile -> cached targets + history
+Same RGB clip -> optional corruption -> RGB-only Student + controls + own history -> losses
 ```
 
 <details>
@@ -26,7 +26,7 @@ The Teacher uses decoded logical safetensors with `fully_logical=true` and the 7
 
 ### Student architecture
 
-Defined in [config/model.yaml](config/model.yaml). Channels and depths below describe the current configuration, not Teacher block indices.
+Defined in [config/model.yaml](config/model.yaml). Image tensors remain raw RGB `[0,1]` with `input_channels: 3`. A separate 16-value control vector conditions stage-wise scale/bias layers; it is not an image channel tensor. An internal RGB-history projection receives the Student's own detached, reprojected previous neural prediction. Teacher inputs remain BHWC16 and E1/E2/E3/ViT distillation taps are unchanged. Current checkpoints use `echorender-rgb-temporal-v3`; older Student checkpoints require retraining. Old stateless Teacher targets are not reused. Channels/depths below describe the Student, not Teacher block indices.
 
 | Stage | Module | Channels | Blocks |
 |---|---|---:|---:|
@@ -87,10 +87,13 @@ Place decoded Teacher weights at `weights/dlssnr-logical.safetensors` and extrac
 MPI-Sintel-complete/
 ├── training/clean/<scene>/frame_0001.png
 ├── training/final/<scene>/frame_0001.png
+├── training/flow/<scene>/frame_0001.flo
+├── training/occlusions/<scene>/frame_0001.png
+├── training/invalid/<scene>/frame_0001.png
 └── test/clean/<scene>/frame_0001.png
 ```
 
-The current configuration uses the `clean` pass: 19 training scenes and four validation scenes (`alley_1`, `alley_2`, `temple_2`, `temple_3`), with 864/200 images in the current local dataset. Training and validation scenes cannot overlap; official test data remains separate. `clean` and `final` are render passes, not an automatic input/ground-truth pair.
+The current configuration uses the `clean` pass: 19 training scenes and four validation scenes (`alley_1`, `alley_2`, `temple_2`, `temple_3`), with 864/200 images in the current local dataset. Training and validation scenes cannot overlap; official test data remains separate. `dataset.render_pass` is fixed to `clean`; `final` is rejected. Flow/occlusion/invalid guides are required for consecutive frames. Test images without matching temporal guides cannot be scored as a Sintel temporal split. Clips never cross a scene, frame gap, or ten-frame boundary; only whole clips are shuffled.
 
 The shared center crop is **192x192**. Teacher-compatible preprocessing pads to a minimum extent of 320 and multiples of 64, giving a **320x320 network input** for this crop. Head/RGB losses exclude padding. The configured five-scale MS-SSIM requires real dimensions above 160; LPIPS requires at least 64x64.
 
@@ -103,9 +106,9 @@ The shared center crop is **192x192**. Teacher-compatible preprocessing pads to 
 | `true` | Build or reuse targets, save fixed `blend_scale`, fully unload Teacher, then train Student from cache. |
 | `false` | Keep a frozen/eval Teacher and Student on the selected GPU for online distillation; no cache access or deletion prompt. |
 
-The existing `releas` key spelling is intentional. Cached targets live at project-root `output/feats/`: clean E1/E2/E3/ViT features, raw four-channel head and composed RGB. Targets are matched by split and sample ID; they are loss targets, not Student inputs.
+The existing `releas` key spelling is intentional. Cached targets live at project-root `output/feats/`: clean E1/E2/E3/ViT features, raw four-channel head and composed RGB. Targets are matched by profile, split, clip context and frame ID. Each frame group stores its raw head, E1/E2/E3/ViT, RGB target, pre-display neural history and identity metadata in `output/feats/<profile>/<split>/<source>/<scene>/<frame>/targets.pt`. They are targets, not Teacher-forced Student history.
 
-Complete caches are reused across epochs and runs. Compatible partial caches resume per file; missing or truncated targets are rebuilt. Atomic writes update the index after each completed file, and a process lock protects the cache, including the cleanup prompt. Teacher weights, dataset identity, crop, preprocessing, capture/backend code, device and benchmark settings participate in validity. Student architecture, batch sizes, augmentation and optimizer changes do not invalidate clean targets.
+Complete caches are reused across epochs and runs. Compatible partial caches resume per file; missing or truncated targets are rebuilt. Atomic writes update the index after each completed file, and a process lock protects the cache, including the cleanup prompt. Teacher weights, dataset identity, crop, preprocessing, capture/backend code, device and benchmark settings participate in validity. Rendering/profile controls and sequence boundaries also participate in validity. Student architecture, batch sizes, augmentation and optimizer changes do not invalidate clean targets. Four profiles produce approximately four times the targets at unchanged geometry; old flat files are left untouched and are not indexed by new extraction.
 
 Cache generation uses `torch.inference_mode()`, overlapping CPU reading/preparation, a single Teacher GPU forward and background writes. Reader/writer counts are estimated from the first sample and bounded by CPU/cgroup/RAM limits and queue capacity; they are separate from `loader.num_workers`.
 
@@ -162,7 +165,9 @@ Teacher weights and `runtime.output_dir` resolve from the project root. Teacher 
 
 ### Training strategy
 
-`loader.batch_size` is the effective number of images per optimizer update. `training.micro_batch_size` is the maximum number forwarded together. The default runs **four groups of four images**, averages gradients over all 16 images, clips gradients and updates once. Short final batches use their actual image count. Different network extents are processed in separate groups without changing image geometry.
+`loader.batch_size` counts clips with one profile each, not individual frames. `training.micro_batch_size` limits concurrent frames. Each clip contributes its frame-mean loss, then gradients are averaged across the effective batch. RGB history is detached after every frame (one-frame truncated backpropagation), keeping saved activation memory independent of clip length. Longer clips still require more forwards/backwards. Training samples prefix lengths uniformly between `train_min_frames` and the available clip length; evaluation processes the whole clip.
+
+Rendering controls live in `rendering.profiles.standard/natural/cinematic/neutral`. Each profile defines `style_index`, `tone`, `structure`, `skin_structure`, `auto_structure`, `intensity`, `detail_strength`, `colour_strength` and `detail_radius`. Defaults use structure 1.8, skin 1.5, auto 1.0, intensity 1.8, detail 1.5, colour 1.0 and radius 0.5. Neutral explicitly selects style 2; the other profiles inherit their own style. `tone: null` follows the named profile. Global settings are render scale 1.0, minimum extent 320 and noise index 1. `rendering.temporal: false` creates single-frame samples; `true` supports up to `max_frames: 10`. Motion uses Sintel guides; configurable motion modes and artist control masks are unsupported. RGB-only deployment videos require RGB-derived motion estimates rather than Sintel ground truth.
 
 `training.gradient_checkpointing: true` recomputes each SSM block during backward to reduce saved activations. `false` retains activations and avoids that recomputation. Validation/inference do not use checkpointing.
 
@@ -172,13 +177,13 @@ SGD uses no momentum or weight decay by default. Cosine LR is applied before eac
 
 ### Student-only augmentation
 
-Each selected training image receives Gaussian noise plus one uniformly selected
+Each selected training clip receives Gaussian noise plus one uniformly selected
 adjustment: brightness, contrast or sharpness. The scheduled ratio controls both
-selection probability and strength: `factor = 1 + ratio`, followed by Gaussian
+selection cap and strength: `factor = 1 + ratio`, followed by Gaussian
 noise with `sigma = noise_std * ratio`. The defaults produce factors 1.10-1.25
 and sigma 0.02-0.05. The ratio reaches 25% halfway through configured epochs and
 switches off from 75% onward. For 10 epochs: epoch 1 uses 10%, epochs 5-7 use 25%,
-and epochs 8-10 use 0%. Actual selection counts fluctuate around the probability.
+and epochs 8-10 use 0%. Selection is rounded down and bounded by both clip count and frame count, so at least 75% remain original. Frames within a selected clip share the adjustment and strength; noise realizations may differ.
 `max_steps` does not rescale this epoch schedule.
 
 ```yaml
@@ -215,7 +220,7 @@ Ltotal     = 3 * Ld + Lrgb
 
 Feature alignment excludes padding-only cells and preserves physical grid correspondence; see [feature capture and alignment](tool/TEACHER_FEATURES.md). Token affinity uses exact row chunks without token sampling. Teacher targets are detached; only Student and feature adapters enter the optimizer.
 
-Both RGB branches use the Teacher's fixed learned blend cap. RGB composition preserves FP16 rounding in forward and uses a straight-through gradient for rounding only; clamp/sigmoid retain their actual gradients. This is a training surrogate, not NVIDIA numerical equivalence. Reconstruction and PSNR/SSIM/LPIPS all reference Teacher RGB.
+Both temporal RGB branches use the Teacher's fixed learned blend cap; the first frame has no history gate blend. Raw heads are mapped before native RGB composition, followed by the configured grade, intensity and detail/colour split. RGB composition preserves FP16 rounding in forward and uses a straight-through gradient for rounding only; clamp/sigmoid retain their actual gradients. This is a training surrogate, not NVIDIA numerical equivalence. Reconstruction and PSNR/SSIM/LPIPS all reference Teacher RGB.
 
 ---
 
@@ -223,10 +228,10 @@ Both RGB branches use the Teacher's fixed learned blend cap. RGB composition pre
 
 ```bash
 uv run --locked python train.py --config config/train.yaml
-uv run --locked python -m unittest tool.test_training tool.test_reporting tool.test_val -v
+uv run --locked python -m unittest tool.test_training tool.test_reporting tool.test_val tool.test_teacher_infer tool.test_temporal -v
 ```
 
-Progress shows epoch, loss, running image-weighted loss, iteration rate and GPU utilization. NVML matches the configured CUDA device by UUID. Utilization covers the whole device; unavailable readings display `N/A`.
+Progress shows epoch, loss, running clip-weighted loss, iteration rate and GPU utilization. NVML matches the configured CUDA device by UUID. Utilization covers the whole device; unavailable readings display `N/A`.
 
 Every epoch evaluates the full validation split, recording image means and equal-weight scene means for PSNR/SSIM/LPIPS. Infinite PSNR is serialized as `"Infinity"`. The optional batch-1 FP32 latency benchmark uses warmup, synchronization and eval mode, excluding preprocessing, feature capture, composition and backward. Teacher reference timing is retained from cache creation in cached mode; Student timing is measured each epoch.
 
@@ -234,13 +239,13 @@ Every epoch evaluates the full validation split, recording image means and equal
 |---|---|
 | `metrics.jsonl` | Per-update losses, controls, augmentation counts, GPU utilization and epoch evaluation. |
 | `best.pt` | Selected validation-best checkpoint; same payload as `last.pt`. |
-| `last.pt` | v2 Student, feature adapters, optimizer, progress, model/train configurations and blend scale. |
+| `last.pt` | v3 conditioned RGB Student, feature adapters, optimizer, progress, model/train configurations and blend scale. |
 | `summary.json` | Epoch results, parameter counts and peak CUDA allocation. |
 | `resolved_train.yaml` | Resolved paths and run settings. |
 
 `max_steps` caps optimizer updates while still running validation and checkpoint saving. `model.student_weights` loads only Student weights into a new run with fresh optimizer/adapters. Tests cover gradients, projection widths, scan directions, batching, cache lifecycle and scheduling; synthetic fixtures do not establish real-data model quality.
 
-With the current E4-512 model, crop 192, micro-batch 4, effective batch 16 and checkpointing off, two short updates on GPU 1 (RTX 5000 Ada) reached about **29.14 GiB allocated / 29.81 GiB reserved** and took **8-9 seconds per update**. These observations are not a full-epoch benchmark or a memory guarantee.
+Before the RGB input change, the 16-channel E4-512 Student with crop 192, micro-batch 4, effective batch 16 and checkpointing off, two short updates on GPU 1 (RTX 5000 Ada) reached about **29.14 GiB allocated / 29.81 GiB reserved** and took **8-9 seconds per update**. These observations are not a full-epoch benchmark or a memory guarantee.
 
 Weights, checkpoints, Teacher caches and output directories are excluded by `.gitignore`. Keep `uv.lock` versioned for reproducibility.
 
@@ -248,12 +253,13 @@ Weights, checkpoints, Teacher caches and output directories are excluded by `.gi
 
 ## Teacher inference
 
+Edit `demo()` in `teacher_infer.py`, then run:
+
 ```bash
-uv run --locked python infer.py --input input.png --weights weights/dlssnr-logical.safetensors --output output/teacher.png --device cuda:1
+uv run --locked python teacher_infer.py
 ```
 
-Output PNGs keep the original image dimensions. Use `--overwrite` to replace an existing output and `--report path.json` for timings/metadata. See [Teacher inference](docs/TEACHER_INFERENCE.md).
-
+Use `input_image` for a single image or `scene` for clean Sintel frames. `max_frames` is 1–10, motion is fixed to `sintel`, and artist control masks are not accepted by this API. `temporal: true` also accepts a single image as a history-free first frame. Output PNGs keep native dimensions. Teacher-only demo settings do not change training settings in `rendering`.
 ---
 
 ## Best checkpoint and final reports
@@ -289,7 +295,7 @@ PSNR, SSIM and LPIPS.
 
 After statistics, the best Student and frozen Teacher run sequentially on validation
 and test images. Each split randomly selects two sources for each of five modes:
-original, noise, brightness, contrast and sharpness. This gives 10 sources per split
+original, noise, brightness, contrast and sharpness. One endpoint image per selected clip is exported for all profiles. This gives 10 source images per split
 when enough data is available. Selection is reproducible with `loader.seed`; both
 models use the same sources and inputs. Smaller splits reuse sources across modes,
 while each mode contains at most `samples_per_mode` distinct sources. Clean scoring
@@ -307,15 +313,14 @@ output/val/<project_name>/
 ├── predictions.json / predictions.jsonl / predictions.csv
 ├── preview/<mode>/<split>__<sample_id>.png
 └── pred/
-    ├── student/<mode>/<split>__<sample_id>.png
-    └── teacher/<mode>/<split>__<sample_id>.png
+    ├── student/<profile>/<mode>/<split>__<sample_id>.png
+    └── teacher/<profile>/<mode>/<split>__<sample_id>.png
 ```
 
 Each preview contains one input row. Each prediction grid contains the same inputs
 in row one and their corresponding predictions in row two. Bold English titles
 include `| total infer 1.234 s | avg infer 0.247 s |`. Times are synchronized model
-forward seconds, excluding one warmup per input shape, preprocessing, RGB
-composition and file I/O. Total and average cover the displayed columns.
+forward seconds, excluding preprocessing, RGB composition and file I/O. Total includes the context frames for every displayed variant; average divides by all actual frame forwards, including context.
 Panels preserve aspect ratio and use up to 384 pixels of display width.
 
 `reporting.crop_size: 0` keeps the full source image. The inference longest edge is
@@ -326,14 +331,9 @@ display. RGB composition finishes at inference resolution before its correction
 is mapped onto the original-size augmented input. Set inference_size to 0 for
 native inference; a positive crop_size center-crops before this process.
 
-Manifests record source selection, augmentation parameters, layout geometry,
-input/feature/prediction hashes and timings. `predictions.csv` includes each
-variant's inference time and prediction RMSE relative to its original-input
-prediction. Missing test data is recorded as `completed_with_missing_splits`;
-available images still export. Failed exports retain the feature cache, and the
-cleanup prompt runs only after reports finish. `reporting.enabled: false` skips
-final image/plot export while retaining best/last and printed statistics.
+Manifests record source selection, profiles, frame positions, RGB/Teacher input shapes, input hashes and synchronized forward timings. Missing images or temporal guides are reported explicitly. Failed exports retain completed cache files; the cleanup prompt runs after reports finish. Best/last saving, printed metric statistics and end-of-training curves are retained.
 
+`temporal_latest.json/.csv/.png` record each profile at frame positions 1–10. Solid curves use Student history; dashed curves reset history on the same current image. Both are scored against the same matching-profile temporal Teacher RGB target. Rows include loss/PSNR/SSIM/LPIPS, signed temporal-minus-reset deltas, actual history depth/use, valid-pixel counts and flow-warped RGB MAE. Lower loss/LPIPS/warp MAE is better; higher PSNR/SSIM is better. Warp MAE measures consistency, not recovered detail or independent ground-truth quality.
 These features apply to new training processes. Existing runs that only saved
 `last.pt` cannot reconstruct an earlier best checkpoint.
 
@@ -346,8 +346,8 @@ comparison images without training:
 
 ```bash
 uv run --locked python val.py --weights output/test_12/last.pt --project my_validation --imgsz 320
-# Quick validation-only check, limited to one image:
-uv run --locked python val.py --weights output/test_12/last.pt --project preview --split val --max-images 1
+# Quick scoring/export check, one physical clip and all four profiles:
+uv run --locked python val.py --weights output/test_12/last.pt --project preview --split val --max-clips 1
 ```
 
 Use `best.pt` for the selected best model or `last.pt` for the latest model. Model
@@ -358,8 +358,7 @@ checkpoint. Dataset paths, device, augmentation and comparison settings come fro
 `--project` names the report directory. With `runtime.output_dir: output/test`,
 reports go to `output/val/<project>/`. Repeated names receive `_2`, `_3`, etc.,
 without overwriting previous reports. `--split` accepts `val`, `test` or `both`
-(default). `--max-images N` limits each selected split, including both fresh scoring
-and image export. Explicitly requested missing splits fail; `both` reports missing
+(default). `--max-clips N` limits physical clips in each selected split, retaining every profile for both scoring and export. Explicitly requested missing splits fail; `both` reports missing
 splits and processes the available data.
 
 `validation.json` contains freshly recomputed clean-image loss/PSNR/SSIM/LPIPS
@@ -369,7 +368,7 @@ best epoch is independent of the chosen `last.pt`. If no history exists, the CLI
 still scores and exports images without fabricating a training curve. Validation
 uses the checkpoint's training crop; comparison images use `reporting.crop_size`
 and resized inference controlled by `reporting.inference_size` or `--imgsz 320`.
-The existing Teacher feature cache is not modified or deleted.
+Standalone validation extracts/reuses sequential Teacher targets under the same profile-grouped cache using an isolated `evaluate` split and `evaluation.json` index; it does not overwrite training targets. Teacher is unloaded before Student scoring. Per-split `temporal_val`/`temporal_test` JSON/CSV/plots accompany `validation.json`.
 
 ---
 

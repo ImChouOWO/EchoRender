@@ -17,14 +17,17 @@ class ImageMetrics(nn.Module):
         self.ssim_window = ssim_window
 
     @torch.no_grad()
-    def forward(self, prediction, target):
-        mse = (prediction - target).square().mean()
-        psnr = float('inf') if mse.item() == 0 else (-10 * torch.log10(mse)).item()
+    def per_image(self, prediction, target):
         if min(prediction.shape[-2:]) < 64:
             raise ValueError('LPIPS evaluation requires real RGB images at least 64x64')
-        return {
-            'psnr': psnr,
-            'ssim': ssim(prediction, target, data_range=1, win_size=self.ssim_window,
-                         size_average=True).item(),
-            'lpips': self.perceptual(prediction * 2 - 1, target * 2 - 1).mean().item(),
-        }
+        mse = (prediction - target).square().flatten(1).mean(1)
+        psnr = -10 * torch.log10(mse)
+        structural = ssim(prediction, target, data_range=1, win_size=self.ssim_window,
+                          size_average=False)
+        perceptual = self.perceptual(prediction * 2 - 1, target * 2 - 1).flatten(1).mean(1)
+        values = torch.stack((psnr, structural, perceptual), dim=1).cpu().tolist()
+        return [dict(zip(('psnr', 'ssim', 'lpips'), row)) for row in values]
+
+    def forward(self, prediction, target):
+        values = self.per_image(prediction, target)
+        return {key: sum(row[key] for row in values) / len(values) for key in values[0]}

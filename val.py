@@ -33,14 +33,20 @@ def project_name(value):
 def positive_integer(value):
     number = int(value)
     if number < 1:
-        raise argparse.ArgumentTypeError('max-images must be a positive integer')
+        raise argparse.ArgumentTypeError('max-clips must be a positive integer')
     return number
 
 
 def limit_loader(loader, maximum):
     if maximum is None:
         return loader
-    return DataLoader(Subset(loader.dataset, range(min(maximum, len(loader.dataset)))),
+    dataset = loader.dataset
+    if hasattr(dataset, 'items'):
+        chosen = set(range(min(maximum, len(dataset.clips))))
+        indices = [i for i, (clip, profile) in enumerate(dataset.items) if clip in chosen]
+    else:
+        indices = range(min(maximum, len(dataset)))
+    return DataLoader(Subset(dataset, indices),
                       batch_size=loader.batch_size, num_workers=loader.num_workers,
                       collate_fn=loader.collate_fn, shuffle=False)
 
@@ -68,39 +74,84 @@ def export_history(weights, directory, config):
 
 
 def evaluate_checkpoint(payload, teacher_factory, loaders, config, device):
-    """No optimizer or cache writes; score clean inputs against the frozen Teacher."""
+    """Cache isolated evaluation targets, unload Teacher, then score RGB clips."""
     student = EchoRenderStudent(payload['student_config'])
     student.load_state_dict(payload['student'], strict=True)
     widths = {name: student.channels[index] for name, index in student.FEATURE_LAYERS.items()}
     criterion = DistillationLoss(config['loss'], student_channels=widths)
     criterion.load_state_dict(payload['distillation'], strict=True)
     teacher = teacher_factory()
+    from tool.teacher_features import TeacherFeatureCache
+    from tool.distillation import cache_key, make_frame
+    from tool.temporal import teacher_target, crop_rgb, reset_history
+    from tool.trainer import FEATURE_CACHE_DIR
+    cache = TeacherFeatureCache(FEATURE_CACHE_DIR, index_name='evaluation.json', split_override='evaluate')
     metrics = ImageMetrics(net=config['validation']['lpips_net'], ssim_window=config['loss']['ssim_window'])
     monitor = GPUMonitor(device, config['logging']['gpu_poll_seconds'])
     results = {}
     try:
-        for model in (student, criterion, teacher, metrics):
+        cache.open()
+        import hashlib
+        from tool.distillation import module_digest
+        sources = []
+        for loader in loaders.values():
+            dataset = loader.dataset
+            while isinstance(dataset, Subset):
+                dataset = dataset.dataset
+            for scene, paths in dataset.clips:
+                for path in paths:
+                    for item in (path, *(dataset.root / dataset.source / name / scene / (path.stem + suffix)
+                        for name, suffix in (('flow', '.flo'), ('invalid', '.png'), ('occlusions', '.png')))):
+                        if item.is_file():
+                            stat = item.stat()
+                            sources.append((str(item), stat.st_size, stat.st_mtime_ns))
+        from tool import temporal
+        signature = {'teacher': module_digest(teacher), 'rendering': config['rendering'],
+            'crop': config['training']['crop_size'], 'sources': sources, 'device': str(device), 'torch': torch.__version__,
+            'pipeline': hashlib.sha256(Path(temporal.__file__).read_bytes()).hexdigest()}
+        fingerprint = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()
+        cache.prepare(fingerprint, payload['teacher_blend_scale'])
+        teacher.eval().to(device)
+        for split, loader in loaders.items():
+            for batch in loader:
+                for sample in batch['sequences']:
+                    history = previous = None
+                    for position, image in enumerate(sample['images']):
+                        rgb = crop_rgb(image, config['training']['crop_size'])
+                        if reset_history(previous, rgb, config):
+                            history = None
+                        key = cache_key(sample, position)
+                        if cache.finished('val', key):
+                            target = cache.load_payload('val', key)
+                        else:
+                            target = teacher_target(teacher, make_frame(sample, position, config, history, rgb=rgb))
+                            target['history'] = torch.from_numpy(target['history'])
+                            cache.store('val', key, target)
+                        history = target['history'].numpy() if config['rendering']['temporal'] else None
+                        previous = rgb
+        cache.seal(fingerprint)
+        teacher.cpu()
+        teacher = None
+        release_cuda(device)
+        for model in (student, criterion, metrics):
             model.eval().requires_grad_(False).to(device)
-        if device.type == 'cuda' and hasattr(getattr(teacher, 'model', None), 'enable_cuda_graph'):
-            teacher.model.enable_cuda_graph()
         evaluation_config = deepcopy(config)
         evaluation_config['benchmark']['enabled'] = False
         evaluation_config['training']['epochs'] = max(payload['epoch'], config['training']['epochs'])
         controls = {'loss_weights': {name: config['loss'][name] for name in LOSS_WEIGHTS}}
         with torch.inference_mode():
             for split, loader in loaders.items():
-                print(f'[Validate]: {split} | input=original (no augmentation) | reference=Teacher RGB', flush=True)
-                result = evaluate(teacher, student, criterion, loader, metrics, monitor,
-                    config=evaluation_config, epoch=payload['epoch'], controls=controls,
+                print(f'[Validate]: {split} | four profiles | paired temporal/reset predictions', flush=True)
+                results[split] = evaluate(None, student, criterion, loader, metrics, monitor,
+                    config=evaluation_config, epoch=payload['epoch'], controls=controls, target_cache=cache,
                     blend_scale=payload['teacher_blend_scale'])
-                results[split] = result
-                quality = result['image_mean']
-                print(f'[Validate]: {split} | loss={result["components"]["total"]:.6f} | '
-                      f'PSNR={quality["psnr"]:.3f} | SSIM={quality["ssim"]:.4f} | '
-                      f'LPIPS={quality["lpips"]:.4f}', flush=True)
     finally:
-        for model in (student, criterion, teacher, metrics):
+        if teacher is not None:
+            teacher.cpu()
+        for model in (student, criterion, metrics):
             model.cpu()
+        if cache.lock is not None:
+            cache.close(delete=False)
         monitor.close()
         release_cuda(device)
     return results
@@ -113,7 +164,7 @@ def main(argv=None):
     parser.add_argument('--config', type=Path, default=DEFAULT_TRAIN_CONFIG, help='Dataset, device and report settings')
     parser.add_argument('--device', help='Override runtime.device: cpu or cuda:N')
     parser.add_argument('--split', choices=('val', 'test', 'both'), default='both')
-    parser.add_argument('--max-images', type=positive_integer, help='Limit scoring and export source images per split; default scores all')
+    parser.add_argument('--max-clips', type=positive_integer, help='Limit physical clips per split; retain all four profiles')
     parser.add_argument('--imgsz', type=int, help='Comparison inference longest edge; 0 keeps native inference')
     args = parser.parse_args(argv)
     try:
@@ -125,9 +176,10 @@ def main(argv=None):
         weights = args.weights.expanduser().resolve()
         payload = torch.load(weights, map_location='cpu', weights_only=True)
         required = {'student', 'student_config', 'distillation', 'train_config', 'epoch', 'teacher_blend_scale'}
-        if not isinstance(payload, dict) or payload.get('format') != 'echorender-ssm-v2' or not required <= payload.keys():
-            raise ValueError('Expected a complete echorender-ssm-v2 training checkpoint')
+        if not isinstance(payload, dict) or payload.get('format') != 'echorender-rgb-temporal-v3' or not required <= payload.keys():
+            raise ValueError('Expected a complete echorender-rgb-temporal-v3 training checkpoint')
         # Score with the checkpoint's objective; compare inputs using the current augmentation settings.
+        config['rendering'] = deepcopy(payload['train_config']['rendering'])
         config['loss'] = deepcopy(payload['train_config']['loss'])
         config['training']['crop_size'] = payload['train_config']['training']['crop_size']
         torch.set_num_threads(config['runtime']['cpu_threads'])
@@ -142,7 +194,7 @@ def main(argv=None):
         loaders, missing = {}, {}
         for split in (('val', 'test') if args.split == 'both' else (args.split,)):
             try:
-                loaders[split] = limit_loader(build_dataloader(data, split=split), args.max_images)
+                loaders[split] = limit_loader(build_dataloader(data, split=split), args.max_clips)
             except (FileNotFoundError, ValueError) as exc:
                 if args.split != 'both':
                     raise
@@ -158,12 +210,15 @@ def main(argv=None):
         history = export_history(weights, directory, config)
         validation = evaluate_checkpoint(payload, create_teacher, loaders, config, device)
         result = {'checkpoint': str(weights), 'checkpoint_epoch': payload['epoch'], 'history_source': history,
-                  'device': str(device), 'max_images_per_split': args.max_images, 'missing_splits': missing,
+                  'device': str(device), 'max_clips_per_split': args.max_clips, 'missing_splits': missing,
                   'validation_crop_size': config['training']['crop_size'],
                   'comparison_crop_size': config['reporting']['crop_size'],
                   'comparison_inference_size': config['reporting']['inference_size'],
                   'comparison_samples_per_mode': config['reporting']['samples_per_mode'],
                   'scoring_input': 'original (no augmentation)', 'results': validation}
+        from tool.temporal import write_stage_report
+        for split, scores in validation.items():
+            write_stage_report(scores, directory, prefix=f'temporal_{split}')
         (directory / 'validation.json').write_text(json.dumps(json_safe(result), indent=2, allow_nan=False) + '\n')
         del payload
         gc.collect()

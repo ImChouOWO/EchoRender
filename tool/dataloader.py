@@ -1,8 +1,4 @@
-"""Single-image Sintel loading with explicit scene splits and CPU-only batches.
-
-The loader reads RGB images. Teacher feature preparation, models, loss and GPU
-work belong to the caller. Ragged batches keep images at their original sizes.
-"""
+"""Scene-disjoint clean RGB clips; shuffle clips, never frames within a clip."""
 from dataclasses import dataclass
 from pathlib import Path
 import random
@@ -33,6 +29,9 @@ class DataConfig:
     num_workers: int
     seed: int
     train_shuffle: bool
+    max_frames: int
+    temporal: bool
+    profiles: tuple[str, ...]
 
 
 def _integer(value, name, minimum=0):
@@ -74,8 +73,8 @@ def load_data_config(path=DEFAULT_DATA_CONFIG):
     root = Path(root).expanduser()
     root = (root if root.is_absolute() else path.parent / root).resolve()
     render_pass = dataset.get('render_pass', 'clean')
-    if render_pass not in ('clean', 'final'):
-        raise ValueError('dataset.render_pass must be clean or final')
+    if render_pass != 'clean':
+        raise ValueError('dataset.render_pass is fixed to clean')
     raw_splits = dataset.get('splits')
     if not isinstance(raw_splits, dict) or set(raw_splits) != {'train', 'val', 'test'}:
         raise ValueError('dataset.splits must define train, val and test')
@@ -101,56 +100,77 @@ def load_data_config(path=DEFAULT_DATA_CONFIG):
         _integer(loader.get('batch_size', 1), 'loader.batch_size', 1),
         _integer(loader.get('num_workers', 0), 'loader.num_workers'),
         _integer(loader.get('seed', 42), 'loader.seed'), shuffle,
+        config['rendering']['max_frames'], config['rendering']['temporal'],
+        tuple(config['rendering']['profiles']),
     )
 
 
-class SintelImageDataset(Dataset):
-    def __init__(self, root, *, source='training', render_pass='clean', scenes=None):
-        if source not in ('training', 'test') or render_pass not in ('clean', 'final'):
-            raise ValueError('Sintel source must be training/test and render_pass must be clean/final')
-        self.root = Path(root).expanduser().resolve()
-        self.source, self.render_pass = source, render_pass
-        base = self.root / source / render_pass
+class SintelSequenceDataset(Dataset):
+    def __init__(self, config, split):
+        self.root = config.root
+        spec = config.splits[split]
+        self.source, self.render_pass = spec.source, 'clean'
+        self.profiles, self.temporal = config.profiles, config.temporal
+        base = self.root / self.source / 'clean'
         if not base.is_dir():
-            raise FileNotFoundError(f'Sintel image directory not found: {base}')
-        selected = _scene_names(scenes, 'scenes')
-        self.scenes = tuple(sorted(selected if selected is not None else (
-            path.name for path in base.iterdir() if path.is_dir() and not path.name.startswith('.')
-        )))
-        self.samples = []
+            raise FileNotFoundError(f'Sintel clean images not found: {base}')
+        self.scenes = tuple(sorted(spec.scenes or (p.name for p in base.iterdir() if p.is_dir())))
+        self.clips = []
+        size = config.max_frames if self.temporal else 1
         for scene in self.scenes:
-            directory = base / scene
-            if not directory.is_dir():
-                raise FileNotFoundError(f'Sintel scene not found: {directory}')
-            paths = sorted(path for path in directory.glob('frame_*.png') if path.is_file())
+            paths = sorted((base / scene).glob('frame_*.png'))
             if not paths:
-                raise ValueError(f'No frame_*.png images found in {directory}')
-            self.samples.extend((scene, path) for path in paths)
-        if not self.samples:
-            raise ValueError(f'No Sintel image scenes found in {base}')
+                raise ValueError(f'No clean frames found for {scene}')
+            group = []
+            for path in paths:
+                number = int(path.stem.split('_')[-1])
+                if group and (len(group) == size or number != int(group[-1].stem.split('_')[-1]) + 1):
+                    self.clips.append((scene, tuple(group)))
+                    group = []
+                group.append(path)
+            if group:
+                self.clips.append((scene, tuple(group)))
+        self.items = [(index, profile) for index in range(len(self.clips)) for profile in self.profiles]
+        # Fail before model loading when multi-frame ground truth is unavailable.
+        if self.temporal:
+            for scene, paths in self.clips:
+                for previous, current in zip(paths, paths[1:]):
+                    for name, frame, suffix in (('flow', previous, '.flo'), ('occlusions', previous, '.png'),
+                                               ('invalid', previous, '.png'), ('invalid', current, '.png')):
+                        guide = self.root / self.source / name / scene / (frame.stem + suffix)
+                        if not guide.is_file():
+                            raise FileNotFoundError(f'Missing Sintel temporal guide: {guide}')
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.items)
 
-    def __getitem__(self, index):
-        scene, path = self.samples[index]
-        rgb = load_rgb(path)
+    def metadata(self, index):
+        clip_index, profile = self.items[index]
+        scene, paths = self.clips[clip_index]
         return {
-            'image': torch.from_numpy(rgb).permute(2, 0, 1).contiguous(),
-            'sample_id': f'{self.source}/{self.render_pass}/{scene}/{path.stem}',
-            'scene': scene, 'path': str(path), 'original_size': tuple(rgb.shape[:2]),
+            'sample_ids': [f'{self.source}/clean/{scene}/{path.stem}' for path in paths],
+            'clip_id': f'{self.source}/clean/{scene}/{paths[0].stem}',
+            'scene': scene, 'profile': profile, 'paths': list(map(str, paths)),
         }
 
+    def __getitem__(self, index):
+        from .temporal import dataset_motion
+        meta = self.metadata(index)
+        paths = [Path(p) for p in meta['paths']]
+        rgbs = [load_rgb(path) for path in paths]
+        if any(rgb.shape != rgbs[0].shape for rgb in rgbs):
+            raise ValueError('Frame dimensions must remain constant within a clip')
+        motions, confidences = [None], [None]
+        for previous, current in zip(paths, paths[1:]):
+            motion, confidence, _ = dataset_motion(self.root, self.source, meta['scene'], previous, current, rgbs[0].shape[:2])
+            motions.append(motion)
+            confidences.append(confidence)
+        return {**meta, 'images': [torch.from_numpy(rgb).permute(2, 0, 1).contiguous() for rgb in rgbs],
+                'motions': motions, 'confidences': confidences}
 
-def collate_images(samples):
-    """Keep image sizes intact; the caller can accumulate gradients per image."""
-    return {
-        'images': [sample['image'] for sample in samples],
-        'sample_ids': [sample['sample_id'] for sample in samples],
-        'scenes': [sample['scene'] for sample in samples],
-        'paths': [sample['path'] for sample in samples],
-        'original_sizes': [sample['original_size'] for sample in samples],
-    }
+
+def collate_sequences(samples):
+    return {'sequences': samples}
 
 
 def _seed_worker(worker_id):
@@ -163,11 +183,8 @@ def build_dataloader(config=DEFAULT_DATA_CONFIG, *, split='train'):
     config = config if isinstance(config, DataConfig) else load_data_config(config)
     if split not in config.splits:
         raise ValueError('split must be train, val or test')
-    spec = config.splits[split]
-    dataset = SintelImageDataset(config.root, source=spec.source, render_pass=config.render_pass, scenes=spec.scenes)
-    return DataLoader(
-        dataset, batch_size=config.batch_size, num_workers=config.num_workers,
+    dataset = SintelSequenceDataset(config, split)
+    return DataLoader(dataset, batch_size=config.batch_size, num_workers=config.num_workers,
         shuffle=split == 'train' and config.train_shuffle,
-        generator=torch.Generator().manual_seed(config.seed),
-        worker_init_fn=_seed_worker, collate_fn=collate_images, drop_last=False,
-    )
+        generator=torch.Generator().manual_seed(config.seed), worker_init_fn=_seed_worker,
+        collate_fn=collate_sequences, drop_last=False)

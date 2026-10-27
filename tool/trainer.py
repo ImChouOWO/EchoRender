@@ -33,14 +33,16 @@ def json_safe(value):
 
 def load_student_state(student, path):
     payload = torch.load(path, map_location='cpu', weights_only=True)
-    if not isinstance(payload, dict) or payload.get('format') != 'echorender-ssm-v2':
-        raise ValueError('Expected an echorender-ssm-v2 checkpoint; legacy checkpoints are unsupported')
+    if not isinstance(payload, dict) or payload.get('format') != 'echorender-rgb-temporal-v3':
+        raise ValueError('Expected an echorender-rgb-temporal-v3 checkpoint; legacy checkpoints are unsupported')
+    if payload['student_config'].get('input_channels', 3) != 3:
+        raise ValueError('Student checkpoint requires 3-channel RGB input; retrain 16-channel checkpoints')
     student.load_state_dict(payload['student'], strict=True)
 
 
 def save_checkpoint(path, student, criterion, optimizer, *, epoch, step, config, controls, blend_scale):
     payload = {
-        'format': 'echorender-ssm-v2', 'student': student.state_dict(),
+        'format': 'echorender-rgb-temporal-v3', 'student': student.state_dict(),
         'distillation': criterion.state_dict(), 'optimizer': optimizer.state_dict(),
         'student_config': student.config, 'train_config': config,
         'epoch': epoch, 'global_step': step, 'schedule_controls': controls,
@@ -149,7 +151,7 @@ def fit(teacher, student, criterion, train_loader, val_loader, optimizer, metric
                         'gpu_allocated_mib': torch.cuda.memory_allocated(device) / 2**20 if device.type == 'cuda' else None})
                 move_student(student, criterion, optimizer, device)
             for epoch in range(1, config['training']['epochs'] + 1):
-                epoch_loss, epoch_images, batches = 0.0, 0, 0
+                epoch_loss, epoch_images, epoch_clips, batches = 0.0, 0, 0, 0
                 augmentation_ratio = augmentation.ratio(epoch)
                 gpu_values = []
                 bar = progress_bar(train_loader, enabled=config['logging']['progress'])
@@ -160,14 +162,15 @@ def fit(teacher, student, criterion, train_loader, val_loader, optimizer, metric
                         for group in optimizer.param_groups:
                             group['lr'] = controls['lr']
                         result = train_batch(teacher, student, criterion, batch, optimizer,
-                                             crop_size=config['training']['crop_size'], controls=controls,
+                                             config=config, crop_size=config['training']['crop_size'], controls=controls,
                                              augmentation=augmentation,
                                              augmentation_ratio=augmentation_ratio, target_cache=cache,
                                              blend_scale=blend_scale, micro_batch_size=config['training']['micro_batch_size'])
                         global_step += 1
                         batches += 1
-                        epoch_images += result['batch_size']
-                        images_seen += result['batch_size']
+                        epoch_clips += result['batch_size']
+                        epoch_images += result['frames']
+                        images_seen += result['frames']
                         epoch_loss += result['loss'] * result['batch_size']
                         gpu = monitor.sample()
                         if gpu is not None:
@@ -178,8 +181,8 @@ def fit(teacher, student, criterion, train_loader, val_loader, optimizer, metric
                                 'augmentation_ratio': augmentation_ratio,
                                 'gpu_utilization_percent': gpu})
                         bar.set_description_str(progress_row(epoch, config['training']['epochs'], device, monitor, [
-                            f'{result["loss"]:.5f}', f'{epoch_loss / epoch_images:.5f}', f'{controls["lr"]:.2e}',
-                            epoch_images, network_size(batch['images'][0], config['training']['crop_size'])]), refresh=False)
+                            f'{result["loss"]:.5f}', f'{epoch_loss / epoch_clips:.5f}', f'{controls["lr"]:.2e}',
+                            epoch_images, network_size(batch['sequences'][0]['images'][0], config['training']['crop_size'], config['rendering'])]), refresh=False)
                         maximum = config['training']['max_steps']
                         if maximum is not None and global_step >= maximum:
                             break
@@ -194,11 +197,15 @@ def fit(teacher, student, criterion, train_loader, val_loader, optimizer, metric
                 if teacher is not None and module_digest(teacher) != teacher_before:
                     raise RuntimeError('Teacher parameters/buffers changed')
                 row = {'event': 'epoch', 'epoch': epoch, 'step': global_step,
-                       'train_loss': epoch_loss / epoch_images, 'train_images': epoch_images,
+                       'train_loss': epoch_loss / epoch_clips, 'train_images': epoch_images, 'train_clips': epoch_clips,
                        'train_partial': batches < len(train_loader), 'validation': validation,
                        'gpu_utilization_percent': sum(gpu_values) / len(gpu_values) if gpu_values else None}
                 history.append(row)
                 record(row)
+                from .temporal import write_stage_report
+                write_stage_report(validation, report_dir or output, prefix='temporal_latest')
+                for profile, scores in validation['profiles'].items():
+                    tqdm.write(f'[Profile]: {profile} | PSNR={scores["psnr"]:.3f} | SSIM={scores["ssim"]:.4f} | LPIPS={scores["lpips"]:.4f}')
                 quality = validation['image_mean']
                 tqdm.write(f'Epoch {epoch}: loss={row["train_loss"]:.6f}, '
                            f'PSNR={quality["psnr"]:.3f}, SSIM={quality["ssim"]:.4f}, LPIPS={quality["lpips"]:.4f}')
@@ -220,7 +227,7 @@ def fit(teacher, student, criterion, train_loader, val_loader, optimizer, metric
                 if maximum is not None and global_step >= maximum:
                     break
             summary = {
-                'status': 'completed', 'reference': 'teacher_rgb', 'global_step': global_step,
+                'status': 'completed', 'reference': 'matching_profile_temporal_teacher_rgb', 'global_step': global_step,
                 'epochs_run': len(history), 'train_images_seen': images_seen,
                 'student_parameters_updated': module_digest(student, parameters_only=True) != student_before,
                 'teacher_unchanged': True, 'teacher_released': cache is not None,

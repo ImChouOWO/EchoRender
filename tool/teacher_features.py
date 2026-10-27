@@ -186,16 +186,17 @@ class FeatureRecordingBackend(NeuralRenderingModel):
 
 
 class TeacherFeatureCache:
-    """Clean targets shared by all epochs; a process lock protects the directory."""
-    def __init__(self, directory):
+    """Profile/clip/frame targets; exact signatures only, never reuse old image targets."""
+    def __init__(self, directory, *, index_name='manifest.json', split_override=None):
         from pathlib import Path
+        from threading import RLock
         self.directory = Path(directory)
+        self.index_name, self.split_override = index_name, split_override
         self.lock = None
         self.benchmark = None
         self.pipeline = None
         self._progress = None
-        from threading import RLock
-        self._progress_lock = RLock()
+        self._mutex = RLock()
 
     def open(self):
         import fcntl
@@ -206,314 +207,238 @@ class TeacherFeatureCache:
         except BlockingIOError:
             self.lock.close()
             self.lock = None
-            raise RuntimeError(f'Teacher feature cache is in use: {self.directory}') from None
+            raise RuntimeError('Teacher cache is already in use') from None
+
+    def read_manifest(self):
+        import json
         try:
-            self.validate_files()
-        except BaseException:
-            self.lock.close()
-            self.lock = None
-            raise
+            return json.loads((self.directory / self.index_name).read_text())
+        except (OSError, ValueError):
+            return {}
 
-    def validate_files(self):
-        import re
-        paths = list(self.directory.iterdir())
-        if any(not path.is_file() or not re.fullmatch(r'(?:(?:train|val)-[0-9a-f]{64}\.pt(?:\.tmp)?|manifest\.json(?:\.tmp)?)', path.name)
-               for path in paths):
-            raise ValueError(f'Unexpected files in feature cache; refusing to remove them: {self.directory}')
-        return paths
+    def fingerprint(self, teacher_digest, train_loader, val_loader, config, device):
+        import hashlib, json, inspect
+        from pathlib import Path
+        from . import temporal, dataloader
+        from mlxdlss import model as backend, features
+        from model import teacher as wrapper
+        import teacher_infer
+        files = []
+        for split, loader in (('train', train_loader), ('val', val_loader)):
+            for scene, paths in loader.dataset.clips:
+                for path in paths:
+                    for item in (path, *(loader.dataset.root / loader.dataset.source / name / scene / (path.stem + suffix)
+                        for name, suffix in (('flow', '.flo'), ('invalid', '.png'), ('occlusions', '.png')))):
+                        if item.is_file():
+                            stat = item.stat()
+                            files.append((split, str(item), stat.st_size, stat.st_mtime_ns))
+        payload = {'format': 'sequence-targets-v3', 'teacher': teacher_digest,
+            'rendering': config['rendering'], 'crop': config['training']['crop_size'],
+            'data': files, 'dataset': config['dataset'], 'device': str(device), 'torch': torch.__version__,
+            'benchmark': config['benchmark'],
+            'source': {m.__name__: hashlib.sha256(Path(m.__file__).read_bytes()).hexdigest()
+                       for m in (temporal, dataloader, backend, features, wrapper, teacher_infer)},
+            'capture': hashlib.sha256(inspect.getsource(FeatureRecordingBackend).encode()).hexdigest()}
+        if device.type == 'cuda':
+            payload['gpu_uuid'] = str(torch.cuda.get_device_properties(device).uuid)
+        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
-    def clear(self):
-        for path in self.validate_files():
-            path.unlink()
-        self.benchmark = None
-        self._progress = None
+    def reuse(self, fingerprint):
+        manifest = self.read_manifest()
+        self.reason = 'new sequence/profile signature or incomplete extraction'
+        if manifest.get('fingerprint') != fingerprint or not manifest.get('complete'):
+            return False
+        files = manifest.get('files', {})
+        if not files or any(not self.valid_file(name, size) for name, size in files.items()):
+            self.reason = 'missing or incomplete sequence target'
+            return False
+        self.benchmark = manifest.get('benchmark')
+        return True
+
+    def valid_file(self, name, size):
+        from pathlib import Path
+        relative = Path(name)
+        if relative.is_absolute() or '..' in relative.parts or len(relative.parts) != 6:
+            return False
+        path = self.directory / relative
+        return path.is_file() and not path.is_symlink() and path.stat().st_size == size
+
+    def prepare(self, fingerprint, blend_scale):
+        manifest = self.read_manifest()
+        compatible = manifest.get('fingerprint') == fingerprint
+        self._progress = {'format': 'sequence-targets-v3', 'fingerprint': fingerprint,
+            'blend_scale': blend_scale, 'files': manifest.get('files', {}) if compatible else {}}
+        self.benchmark = manifest.get('benchmark') if compatible else None
+        self.write_manifest(complete=False)
+
+    def write_manifest(self, *, complete):
+        import json
+        with self._mutex:
+            temporary = self.directory / (self.index_name + '.tmp')
+            temporary.write_text(json.dumps({**self._progress, 'complete': complete,
+                'benchmark': self.benchmark, 'pipeline': self.pipeline}, sort_keys=True))
+            temporary.replace(self.directory / self.index_name)
+
+    def path(self, split, sample_id):
+        from .temporal import PROFILES
+        profile, clip_id, position, frame_id = sample_id.split(':')
+        source, render_pass, scene, frame = frame_id.split('/')
+        if profile not in PROFILES or split not in ('train', 'val') or render_pass != 'clean':
+            raise ValueError('Invalid cache target identity')
+        if any(part in ('', '.', '..') or '\\' in part for part in (scene, frame)):
+            raise ValueError('Invalid cache path')
+        return self.directory / profile / (self.split_override or split) / source / scene / frame / 'targets.pt'
+
+    def finished(self, split, key):
+        path = self.path(split, key)
+        name = path.relative_to(self.directory).as_posix()
+        size = self._progress['files'].get(name)
+        return size is not None and self.valid_file(name, size)
+
+    def load_payload(self, split, key):
+        payload = torch.load(self.path(split, key), map_location='cpu', weights_only=True)
+        profile, clip_id, position, sample_id = key.split(':')
+        expected = (profile, clip_id, int(position), sample_id)
+        actual = tuple(payload.get(k) for k in ('profile', 'clip_id', 'frame_index', 'sample_id'))
+        if actual != expected:
+            raise ValueError('Cached target identity differs from the requested clip/frame/profile')
+        return payload
+
+    def store(self, split, key, payload):
+        path = self.path(split, key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        profile, clip_id, position, frame_id = key.split(':')
+        payload = {**payload, 'profile': profile, 'clip_id': clip_id, 'frame_index': int(position), 'sample_id': frame_id}
+        temporary = path.with_suffix('.pt.tmp')
+        torch.save(payload, temporary)
+        temporary.replace(path)
+        with self._mutex:
+            self._progress['files'][path.relative_to(self.directory).as_posix()] = path.stat().st_size
+            self.write_manifest(complete=False)
+
+    def seal(self, fingerprint, *, blend_scale=None):
+        self.write_manifest(complete=True)
+
+    def build(self, teacher, train_loader, val_loader, config, *, monitor=None):
+        from concurrent.futures import ThreadPoolExecutor
+        from collections import deque
+        from itertools import islice
+        from time import perf_counter
+        from tqdm.auto import tqdm
+        from .temporal import crop_rgb, reset_history, teacher_target
+        from .distillation import make_frame, cache_key
+        from .monitoring import measure_forward
+        if teacher.device.type == 'cuda' and hasattr(getattr(teacher, 'model', None), 'enable_cuda_graph'):
+            teacher.model.enable_cuda_graph()
+        pending = deque()
+        plan = None
+        writers = None
+        for split, loader in (('train', train_loader), ('val', val_loader)):
+            dataset = loader.dataset
+            indices = []
+            for i in range(len(dataset)):
+                identity = dataset.metadata(i)
+                if not all(self.finished(split, cache_key(identity, j)) for j in range(len(identity['sample_ids']))):
+                    indices.append(i)
+            tqdm.write(f'[Cache {split}]: profiles={len(dataset.profiles)} | reuse clips={len(dataset) - len(indices)}/{len(dataset)} | extract={len(indices)}')
+            if not indices:
+                continue
+            def extract(sample, read_seconds=0.):
+                nonlocal plan
+                history = previous = None
+                for position, image in enumerate(sample['images']):
+                    rgb = crop_rgb(image, config['training']['crop_size'])
+                    if reset_history(previous, rgb, config):
+                        history = None
+                    key = cache_key(sample, position)
+                    if self.finished(split, key):
+                        payload = self.load_payload(split, key)
+                    else:
+                        started = perf_counter()
+                        frame = make_frame(sample, position, config, history, rgb=rgb)
+                        prepared_seconds = perf_counter() - started + read_seconds / len(sample['images'])
+                        started = perf_counter()
+                        payload = teacher_target(teacher, frame)
+                        infer_seconds = perf_counter() - started
+                        payload['history'] = torch.from_numpy(payload['history'].copy())
+                        if plan is None:
+                            started = perf_counter()
+                            self.store(split, key, payload)
+                            write_seconds = perf_counter() - started
+                            target_bytes = sum(v.numel() * v.element_size() for v in
+                                (payload['head'], payload['rgb'], *payload['features'].values()))
+                            plan = cache_worker_plan(prepared_seconds, infer_seconds, write_seconds,
+                                frame.inputs.numel() * 4, target_bytes, len(dataset))
+                            plan['prefetch'] = min(plan['prefetch'], 2)
+                            self.pipeline = plan
+                            tqdm.write(f'[Cache workers]: read/prepare={plan["readers"]}, write={plan["writers"]}, prefetch={plan["prefetch"]}, pending_writes={plan["pending_writes"]}')
+                        elif writers is None:
+                            self.store(split, key, payload)
+                        else:
+                            pending.append(writers.submit(self.store, split, key, payload))
+                            if len(pending) >= plan['pending_writes']:
+                                pending.popleft().result()
+                        if self.benchmark is None and config['benchmark']['enabled']:
+                            timing = config['benchmark']
+                            self.benchmark = {f'teacher_{k}': v for k, v in measure_forward(teacher,
+                                frame.inputs.to(teacher.device), warmup=timing['warmup'], repeats=timing['repeats']).items()}
+                    history = payload['history'].numpy() if config['rendering']['temporal'] else None
+                    previous = rgb
+            groups = {}
+            for index in indices:
+                groups.setdefault(dataset.items[index][0], []).append(index)
+            first_group, *remaining = groups.values()
+            writers = None
+            # Decode one physical clip once, then reuse its RGB/flow for every profile.
+            with torch.inference_mode():
+                started = perf_counter()
+                first_sample = dataset[first_group[0]]
+                extract(first_sample, perf_counter() - started)
+                with ThreadPoolExecutor(max_workers=plan['readers'] if plan else 1) as readers, \
+                     ThreadPoolExecutor(max_workers=plan['writers'] if plan else 1) as writers:
+                    source = iter(remaining)
+                    capacity = max(1, min((plan or {}).get('prefetch', 1), 2))
+                    ready = deque((group, readers.submit(dataset.__getitem__, group[0]))
+                                  for group in islice(source, capacity))
+                    bar = tqdm(total=len(indices), initial=1, desc=f'Teacher cache [{split}]', unit='clip',
+                               disable=not config['logging']['progress'], dynamic_ncols=True)
+                    try:
+                        for index in first_group[1:]:
+                            extract({**first_sample, **dataset.metadata(index)})
+                            bar.update(1)
+                        del first_sample
+                        while ready:
+                            group, future = ready.popleft()
+                            sample = future.result()
+                            following = next(source, None)
+                            if following is not None:
+                                ready.append((following, readers.submit(dataset.__getitem__, following[0])))
+                            for index in group:
+                                extract({**sample, **dataset.metadata(index)})
+                                bar.update(1)
+                                if monitor is not None:
+                                    bar.set_postfix({'GPU': monitor.display()})
+                        while pending:
+                            pending.popleft().result()
+                    finally:
+                        bar.close()
 
     def close(self, *, delete=True):
         if self.lock is not None:
             try:
                 if delete:
-                    self.clear()
+                    import re
+                    paths = list(self.directory.rglob('*'))
+                    for path in paths:
+                        if path.is_symlink():
+                            raise ValueError('Unexpected cache symlink; refusing deletion')
+                        if path.is_file() and path.name not in ('targets.pt', 'targets.pt.tmp', 'manifest.json', 'manifest.json.tmp', 'evaluation.json', 'evaluation.json.tmp') and not re.fullmatch(r'(?:train|val)-[0-9a-f]{64}\.pt(?:\.tmp)?', path.name):
+                            raise ValueError('Unexpected cache file; refusing deletion')
+                    for path in sorted(paths, key=lambda p: len(p.parts), reverse=True):
+                        path.unlink() if path.is_file() else path.rmdir()
             finally:
                 self.lock.close()
                 self.lock = None
-
-    def fingerprint(self, teacher_digest, train_loader, val_loader, config, device):
-        import hashlib
-        import json
-        import inspect
-        from pathlib import Path
-        import torch
-        from . import teacher_pipeline
-        def samples(loader):
-            dataset = getattr(loader, 'dataset', None)
-            if dataset is not None and hasattr(dataset, 'samples'):
-                return [(scene, str(path.resolve()), path.stat().st_size, path.stat().st_mtime_ns)
-                        for scene, path in dataset.samples]
-            result = []
-            for batch in loader:
-                for sample_id, image in zip(batch['sample_ids'], batch['images']):
-                    result.append((sample_id, list(image.shape), str(image.dtype),
-                                   hashlib.sha256(image.detach().cpu().contiguous().numpy().tobytes()).hexdigest()))
-            return result
-        from mlxdlss import model as backend, features as preparation_backend
-        from model import teacher as teacher_wrapper
-        payload = {'version': 1, 'teacher': teacher_digest,
-                   'crop_size': config['training']['crop_size'], 'dataset': config['dataset'],
-                   'train': samples(train_loader), 'val': samples(val_loader),
-                   'benchmark': config['benchmark'], 'device': str(device), 'torch': torch.__version__,
-                   'preparation_backend': hashlib.sha256(Path(preparation_backend.__file__).read_bytes()).hexdigest(),
-                   'teacher_wrapper': hashlib.sha256(Path(teacher_wrapper.__file__).read_bytes()).hexdigest(),
-                   'preprocessing': hashlib.sha256(Path(teacher_pipeline.__file__).read_bytes()).hexdigest(),
-                   'capture': hashlib.sha256(inspect.getsource(FeatureRecordingBackend).encode()).hexdigest(),
-                   'backend': hashlib.sha256(Path(backend.__file__).read_bytes()).hexdigest()}
-        if device.type == 'cuda':
-            payload['gpu'] = str(torch.cuda.get_device_properties(device).uuid)
-        fingerprint = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
-        payload['capture'] = 'c9a0c25a43a460839ea3bc2ecab6b56de32cad73113f5396ece004fbe2516d93'
-        self._previous_capture_fingerprint = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
-        payload['capture'] = 'a80bd129c1d83250b706a0d9ba1706b70691bf3c85a0d4da2ff1eca5d0e00c33'
-        self._legacy_fingerprint = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
-        return fingerprint
-
-    def read_manifest(self):
-        import json
-        try:
-            payload = json.loads((self.directory / 'manifest.json').read_text())
-            return payload if isinstance(payload, dict) else {}
-        except (OSError, ValueError):
-            return {}
-
-    def compatible(self, payload, fingerprint):
-        return payload.get('fingerprint') in (fingerprint, getattr(self, '_legacy_fingerprint', fingerprint),
-                                             getattr(self, '_previous_capture_fingerprint', fingerprint))
-
-    def reuse(self, fingerprint):
-        payload = self.read_manifest()
-        self.reason = 'cache index missing or unreadable'
-        if not self.compatible(payload, fingerprint):
-            if payload:
-                self.reason = 'Teacher/data/preprocessing signature changed'
-            return False
-        if not payload.get('complete', True):
-            self.reason = 'cache extraction was interrupted'
-            return False
-        if not isinstance(payload.get('files'), dict) or not payload['files']:
-            return False
-        for name, size in payload['files'].items():
-            path = self.directory / name
-            if path.parent != self.directory or not path.is_file() or path.stat().st_size != size:
-                self.reason = f'missing or incomplete target: {name}'
-                return False
-        self.benchmark = payload.get('benchmark')
-        return True
-
-    def prepare(self, fingerprint, blend_scale):
-        payload = self.read_manifest()
-        if not self.compatible(payload, fingerprint) or not isinstance(payload.get('files'), dict):
-            self.clear()
-            payload = {'files': {}}
-        self.benchmark = payload.get('benchmark')
-        self.pipeline = payload.get('pipeline')
-        self._progress = {'fingerprint': fingerprint, 'blend_scale': blend_scale, 'files': dict(payload['files'])}
-        self.write_manifest(complete=False)
-
-    def write_manifest(self, *, complete):
-        import json
-        with self._progress_lock:
-            payload = {**self._progress, 'files': dict(self._progress['files']), 'complete': complete,
-                       'benchmark': self.benchmark, 'pipeline': self.pipeline}
-            temporary = self.directory / 'manifest.json.tmp'
-            temporary.write_text(json.dumps(payload, sort_keys=True))
-            temporary.replace(self.directory / 'manifest.json')
-
-    def finished(self, split, sample_id):
-        if self._progress is None:
-            return False
-        path = self.path(split, sample_id)
-        size = self._progress['files'].get(path.name)
-        return size is not None and path.is_file() and path.stat().st_size == size
-
-    def record_file(self, path):
-        if self._progress is not None:
-            with self._progress_lock:
-                self._progress['files'][path.name] = path.stat().st_size
-                self.write_manifest(complete=False)
-
-    def seal(self, fingerprint, *, blend_scale=None):
-        self._progress = {'fingerprint': fingerprint, 'blend_scale': blend_scale,
-                          'files': {path.name: path.stat().st_size for path in self.directory.glob('*.pt')}}
-        self.write_manifest(complete=True)
-
-    def path(self, split, sample_id):
-        import hashlib
-        if split not in ('train', 'val'):
-            raise ValueError('Feature cache split must be train or val')
-        digest = hashlib.sha256(sample_id.encode()).hexdigest()
-        return self.directory / f'{split}-{digest}.pt'
-
-    def load(self, split, sample_id, device):
-        import torch
-        payload = torch.load(self.path(split, sample_id), map_location=device, weights_only=True)
-        return payload['head'], payload['features'], payload['rgb']
-
-    def build(self, teacher, train_loader, val_loader, config, *, monitor=None):
-        from collections import deque
-        from concurrent.futures import ThreadPoolExecutor
-        from time import perf_counter
-        import torch
-        from tqdm.auto import tqdm
-        from .teacher_pipeline import compose_rgb_tensor
-        from .monitoring import measure_forward
-        if self._progress is None:
-            self.clear()
-        model = getattr(teacher, 'model', None)
-        if isinstance(model, FeatureRecordingBackend) and teacher.device.type == 'cuda':
-            model.enable_cuda_graph()
-        plan = None
-        pending = deque()
-
-        def write(path, payload):
-            temporary = path.with_suffix('.pt.tmp')
-            torch.save(payload, temporary)
-            temporary.replace(path)
-            self.record_file(path)
-
-        def infer(prepared):
-            inputs = prepared.features.to(teacher.device)
-            head, features = teacher(inputs, return_features=True)
-            rgb = compose_rgb_tensor(head, prepared, blend_scale=teacher.blend_scale)
-            payload = {'head': head.detach().cpu(),
-                       'features': {name: value.detach().cpu() for name, value in features.items()},
-                       'rgb': rgb.detach().cpu()}
-            return inputs, payload
-
-        with torch.inference_mode():
-            for split, loader in (('train', train_loader), ('val', val_loader)):
-                source, total = cache_source(loader)
-                items = list(source)
-                missing = [item for item in items if not self.finished(split, cache_item_id(item))]
-                reused = total - len(missing)
-                tqdm.write(f'[Cache {split}]: reuse={reused}/{total}, extract={len(missing)}')
-                if not missing and split == 'val' and config['benchmark']['enabled'] and self.benchmark is None:
-                    missing = items[:1]
-                    reused = total - len(missing)
-                if not missing:
-                    continue
-                source = iter(missing)
-                first = next(source)
-                bar = tqdm(total=total, initial=reused, desc=f'Teacher cache [{split}]', unit='img',
-                           disable=not config['logging']['progress'], dynamic_ncols=True)
-                try:
-                    if plan is None:
-                        started = perf_counter()
-                        sample_id, prepared = prepare_cache_item(first, config['training']['crop_size'])
-                        prepare_seconds = perf_counter() - started
-                        started = perf_counter()
-                        inputs, payload = infer(prepared)
-                        infer_seconds = perf_counter() - started
-                        if isinstance(model, FeatureRecordingBackend) and model._graph is not None:
-                            started = perf_counter()
-                            model.forward_with_features(inputs)
-                            torch.cuda.synchronize(inputs.device)
-                            infer_seconds = perf_counter() - started
-                        started = perf_counter()
-                        write(self.path(split, sample_id), payload)
-                        write_seconds = perf_counter() - started
-                        sample_bytes = prepared.features.numel() * prepared.features.element_size() + prepared.rgb.nbytes
-                        target_bytes = sum(value.numel() * value.element_size() for value in
-                                           [payload['head'], payload['rgb'], *payload['features'].values()])
-                        plan = cache_worker_plan(prepare_seconds, infer_seconds, write_seconds,
-                                                 sample_bytes, target_bytes, total)
-                        self.pipeline = {**plan, 'sample_prepare_ms': prepare_seconds * 1000,
-                                         'sample_infer_ms': infer_seconds * 1000,
-                                         'sample_write_ms': write_seconds * 1000}
-                        tqdm.write(f'[Cache workers]: read/prepare={plan["readers"]}, write={plan["writers"]}, '
-                                   f'prefetch={plan["prefetch"]}, pending_writes={plan["pending_writes"]}')
-                        if split == 'val' and self.benchmark is None and config['benchmark']['enabled']:
-                            timing = config['benchmark']
-                            self.benchmark = {
-                                'device': str(inputs.device), 'precision': 'float32', 'batch_size': 1,
-                                'network_bhwc': list(inputs.shape), 'warmup': timing['warmup'],
-                                'repeats': timing['repeats'], 'scope': 'forward_only_without_feature_capture',
-                                **{f'teacher_{key}': value for key, value in measure_forward(
-                                    teacher, inputs, warmup=timing['warmup'], repeats=timing['repeats']).items()},
-                            }
-                        bar.update(1)
-                        if monitor is not None:
-                            bar.set_postfix({'GPU': monitor.display()})
-                        del inputs, payload, prepared
-                    else:
-                        # Return the first item to this split without decoding it on the main thread.
-                        from itertools import chain
-                        source = chain([first], source)
-                    with ThreadPoolExecutor(max_workers=plan['readers'], thread_name_prefix='cache-read') as readers, \
-                         ThreadPoolExecutor(max_workers=plan['writers'], thread_name_prefix='cache-write') as writers:
-                        prepared_items = bounded_cache_prepare(readers, source, config['training']['crop_size'], plan['prefetch'])
-                        try:
-                            for sample_id, prepared in prepared_items:
-                                inputs, payload = infer(prepared)
-                                path = self.path(split, sample_id)
-                                # Duplicate IDs must never race on their atomic temporary file.
-                                for pending_path, future in pending:
-                                    if pending_path == path:
-                                        future.result()
-                                pending.append((path, writers.submit(write, path, payload)))
-                                if len(pending) >= plan['pending_writes']:
-                                    pending.popleft()[1].result()
-                                if split == 'val' and self.benchmark is None and config['benchmark']['enabled']:
-                                    timing = config['benchmark']
-                                    self.benchmark = {
-                                        'device': str(inputs.device), 'precision': 'float32', 'batch_size': 1,
-                                        'network_bhwc': list(inputs.shape), 'warmup': timing['warmup'],
-                                        'repeats': timing['repeats'], 'scope': 'forward_only_without_feature_capture',
-                                        **{f'teacher_{key}': value for key, value in measure_forward(
-                                            teacher, inputs, warmup=timing['warmup'], repeats=timing['repeats']).items()},
-                                    }
-                                del inputs, payload, prepared
-                                bar.update(1)
-                                if monitor is not None:
-                                    bar.set_postfix({'GPU': monitor.display()})
-                            while pending:
-                                pending.popleft()[1].result()
-                        finally:
-                            prepared_items.close()
-                            # Executors finish before an error can release the cache directory lock.
-                finally:
-                    bar.close()
-
-
-def cache_item_id(item):
-    source, value = item
-    if isinstance(source, str):
-        return source
-    if hasattr(source, 'samples') and hasattr(source, 'source') and hasattr(source, 'render_pass'):
-        scene, path = source.samples[value]
-        return f'{source.source}/{source.render_pass}/{scene}/{path.stem}'
-    return source[value]['sample_id']
-
-
-def cache_source(loader):
-    dataset = getattr(loader, 'dataset', None)
-    if dataset is not None:
-        return iter((dataset, index) for index in range(len(dataset))), len(dataset)
-    def samples():
-        for batch in loader:
-            for sample_id, image in zip(batch['sample_ids'], batch['images']):
-                yield sample_id, image
-    return samples(), sum(len(batch['images']) for batch in loader)
-
-
-def prepare_cache_item(item, crop_size):
-    import torch
-    from .distillation import prepare_sample
-    source, value = item
-    with torch.inference_mode():
-        if isinstance(source, str):
-            sample_id, image = source, value
-        else:
-            sample = source[value]
-            sample_id, image = sample['sample_id'], sample['image']
-        return sample_id, prepare_sample(image, crop_size)
 
 
 def cache_worker_plan(prepare_seconds, infer_seconds, write_seconds, sample_bytes, target_bytes, total):
@@ -549,22 +474,6 @@ def cache_worker_plan(prepare_seconds, infer_seconds, write_seconds, sample_byte
             'prefetch': max(1, min(2 * readers, budget // max(4 * sample_bytes, 1))),
             'pending_writes': max(1, min(2 * writers, budget // max(2 * target_bytes, 1))),
             'cpu_limit': cpus, 'buffer_budget_mib': round(budget / 2**20, 2)}
-
-
-def bounded_cache_prepare(pool, source, crop_size, capacity):
-    from collections import deque
-    from itertools import islice
-    pending = deque(pool.submit(prepare_cache_item, item, crop_size) for item in islice(source, capacity))
-    try:
-        while pending:
-            result = pending.popleft().result()
-            yield result
-            item = next(source, None)
-            if item is not None:
-                pending.append(pool.submit(prepare_cache_item, item, crop_size))
-    finally:
-        for future in pending:
-            future.cancel()
 
 
 def ask_delete_cache(directory):

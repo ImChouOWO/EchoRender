@@ -76,14 +76,15 @@ def measure_forward(model, inputs, *, warmup, repeats):
 
 
 @torch.no_grad()
-def benchmark_forward(teacher, student, features, *, warmup, repeats):
+def benchmark_forward(teacher, student, features, student_inputs, *, warmup, repeats):
     """Batch-1 float32 forward only, features disabled, eval mode, CUDA synced."""
     result = {'device': str(features.device), 'precision': 'float32', 'batch_size': 1,
               'network_bhwc': list(features.shape), 'warmup': warmup, 'repeats': repeats,
+              'student_input_shape': list(student_inputs.shape),
               'scope': 'forward_only_without_feature_capture'}
     for name, model, inputs in (
         ('teacher', teacher, features),
-        ('student', student, features if student.layout == 'BHWC' else features.permute(0, 3, 1, 2).contiguous()),
+        ('student', student, student_inputs),
     ):
         result.update({f'{name}_{key}': value for key, value in measure_forward(
             model, inputs, warmup=warmup, repeats=repeats).items()})

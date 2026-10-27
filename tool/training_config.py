@@ -38,7 +38,7 @@ def load_training_config(path=DEFAULT_TRAIN_CONFIG):
     with path.open(encoding='utf-8-sig') as source:
         c = yaml.safe_load(source)
     required = {'model', 'runtime', 'training', 'loss', 'validation', 'benchmark',
-                'logging', 'schedule', 'augmentation', 'dataset', 'loader', 'reporting'}
+                'logging', 'schedule', 'augmentation', 'dataset', 'loader', 'reporting', 'rendering'}
     if not isinstance(c, dict) or set(c) != required or any(not isinstance(c[k], dict) for k in required):
         raise ValueError(f'train.yaml must contain exactly these mappings: {sorted(required)}')
     expected = {
@@ -53,6 +53,8 @@ def load_training_config(path=DEFAULT_TRAIN_CONFIG):
         'reporting': {'enabled', 'project_name', 'best_metric', 'crop_size', 'inference_size', 'samples_per_mode', 'strengths'},
         'dataset': {'root', 'render_pass', 'splits'},
         'loader': {'batch_size', 'num_workers', 'seed', 'train_shuffle'},
+        'rendering': {'render_scale', 'min_extent', 'noise_index', 'temporal', 'max_frames',
+                      'train_min_frames', 'history_strength', 'scene_cut_threshold', 'profiles'},
     }
     for section, keys in expected.items():
         if set(c[section]) != keys:
@@ -142,6 +144,38 @@ def load_training_config(path=DEFAULT_TRAIN_CONFIG):
             raise ValueError('reporting.strengths must be within (0,1]')
     if strengths != sorted(set(strengths)):
         raise ValueError('reporting.strengths must be sorted and unique')
+    rendering = c['rendering']
+    if c['dataset']['render_pass'] != 'clean':
+        raise ValueError('dataset.render_pass is fixed to clean')
+    if type(rendering['temporal']) is not bool:
+        raise ValueError('rendering.temporal must be boolean')
+    for key in ('max_frames', 'train_min_frames', 'min_extent', 'noise_index'):
+        _positive(rendering[key], f'rendering.{key}', integer=True, zero=key == 'noise_index')
+    if not 1 <= rendering['train_min_frames'] <= rendering['max_frames'] <= 10:
+        raise ValueError('Frame limits must satisfy 1 <= train_min_frames <= max_frames <= 10')
+    if not 320 <= rendering['min_extent'] <= 4096 or rendering['min_extent'] % 64:
+        raise ValueError('rendering.min_extent must be a multiple of 64 within [320,4096]')
+    for key, low, high in (('render_scale', .05, 1), ('history_strength', 0, 1), ('scene_cut_threshold', 0, 1)):
+        _positive(rendering[key], f'rendering.{key}', zero=True)
+        if not low <= rendering[key] <= high:
+            raise ValueError(f'rendering.{key} must be within [{low},{high}]')
+    profiles = rendering['profiles']
+    if not isinstance(profiles, dict) or set(profiles) != {'standard', 'natural', 'cinematic', 'neutral'}:
+        raise ValueError('Define all four rendering profiles')
+    keys = {'style_index', 'tone', 'structure', 'skin_structure', 'auto_structure',
+            'intensity', 'detail_strength', 'colour_strength', 'detail_radius'}
+    for name, settings in profiles.items():
+        if not isinstance(settings, dict) or set(settings) != keys:
+            raise ValueError(f'Profile {name} requires exactly {sorted(keys)}; control_mask is unsupported')
+        for key, value in settings.items():
+            if value is None and key in ('style_index', 'tone', 'structure', 'skin_structure', 'auto_structure'):
+                continue
+            if isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(value):
+                raise ValueError(f'{name}.{key} must be finite and numeric')
+            low, high = ((-1, 2) if key in ('skin_structure', 'auto_structure') else
+                         (.1, 64) if key == 'detail_radius' else (0, 2))
+            if not low <= value <= high or key == 'style_index' and type(value) is not int:
+                raise ValueError(f'Invalid {name}.{key}')
     c['config_path'] = str(path)
     return c
 

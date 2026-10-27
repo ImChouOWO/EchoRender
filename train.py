@@ -37,14 +37,14 @@ def main(argv=None):
         train_loader = build_dataloader(data, split='train')
         val_loader = build_dataloader(data, split='val')
         device = resolve_device(config['runtime']['device'])
+        if device.type == 'cuda':
+            torch.cuda.set_device(device)
         def create_teacher():
             teacher = EchoRenderTeacher(config['model']['teacher_weights'], device='cpu')
             if teacher.model.topology.name != 'ht':
                 raise ValueError('This student targets the HT Teacher (71 blocks), not small/custom topology')
             return teacher
         student = EchoRenderStudent(config['model']['student_config'])
-        if student.input_channels != 16 or student.channels[-1] != 4:
-            raise ValueError('Student must have 16 input and 4 output channels')
         student_channels = {name: student.channels[index] for name, index in student.FEATURE_LAYERS.items()}
         if config['model']['student_weights']:
             load_student_state(student, config['model']['student_weights'])
@@ -58,8 +58,8 @@ def main(argv=None):
         output = reserve_output_dir(output)
         config['runtime']['output_dir'] = str(output)
         print(f'Output: {output}', flush=True)
-        print(f'Training on {device}; train={len(train_loader.dataset)}, val={len(val_loader.dataset)}', flush=True)
-        print(f"Batch: effective={config['loader']['batch_size']}, micro={config['training']['micro_batch_size']}", flush=True)
+        print(f'Training on {device}; train clips/profiles={len(train_loader.dataset)}, val={len(val_loader.dataset)}', flush=True)
+        print(f"Batch: effective={config['loader']['batch_size']} clips, micro={config['training']['micro_batch_size']} concurrent frames", flush=True)
         report_dir = None
         on_complete = None
         if config['reporting']['enabled']:

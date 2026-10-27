@@ -16,7 +16,6 @@ from tqdm.auto import tqdm
 
 from model.student import EchoRenderStudent
 from .distillation import augment_rgb
-from .teacher_pipeline import prepare_image, compose_rgb_tensor
 
 MODES = ('original', 'noise', 'brightness', 'contrast', 'sharpness')
 
@@ -63,78 +62,6 @@ def prepare_variant(rgb, mode, fraction, config, *, seed, sample_id, inference_s
             size=rgb.shape[:2], mode='bilinear', align_corners=False)
         display_rgb = np.clip(rgb + mapped[0].permute(1, 2, 0).numpy(), 0, 1)
     return VariantInput(display_rgb, network_rgb, parameters)
-
-
-def sample_modes(loader, maximum, seed):
-    """Use distinct sources across modes when enough exist; never decode unselected images."""
-    if hasattr(loader, 'dataset'):
-        available = len(loader.dataset)
-        def read(index):
-            sample = loader.dataset[index]
-            return sample['image'], sample['sample_id']
-    else:
-        samples = [(image, sample_id) for batch in loader
-                   for image, sample_id in zip(batch['images'], batch['sample_ids'])]
-        available = len(samples)
-        def read(index):
-            return samples[index]
-    if not available:
-        raise ValueError('Prediction loader has no images')
-    generator = random.Random(seed)
-    if available >= maximum * len(MODES):
-        selected = generator.sample(range(available), maximum * len(MODES))
-        indices = {mode: selected[i * maximum:(i + 1) * maximum] for i, mode in enumerate(MODES)}
-    else:
-        indices = {mode: generator.sample(range(available), min(maximum, available)) for mode in MODES}
-    decoded = {i: read(i) for i in {i for group in indices.values() for i in group}}
-    return {mode: [decoded[i] for i in group] for mode, group in indices.items()}, available
-
-
-@torch.inference_mode()
-def predict_resized(model, variant, *, device, blend_scale, layout='BHWC', teacher_graph=False, warmup=False):
-    """Time only synchronized model forward; compose RGB before mapping its correction back."""
-    device = torch.device(device)
-    rgb, resized = variant.display_rgb, variant.network_rgb
-    h, w = rgb.shape[:2]
-    prepared = prepare_image(resized)
-    inputs = prepared.features.to(device)
-    if layout == 'BCHW':
-        inputs = inputs.permute(0, 3, 1, 2).contiguous()
-    def forward():
-        if teacher_graph:
-            head, captured = model(inputs, return_features=True)
-            del captured
-            return head
-        return model(inputs)
-    def synchronize():
-        if device.type == 'cuda':
-            torch.cuda.synchronize(device)
-    if warmup:
-        unused = forward()
-        del unused
-    synchronize()
-    started = perf_counter()
-    head = forward()
-    synchronize()
-    seconds = perf_counter() - started
-    if layout == 'BCHW':
-        head = head.permute(0, 2, 3, 1).contiguous()
-    if tuple(head.shape) != (*prepared.features.shape[:-1], 4):
-        raise RuntimeError('Inference returned an invalid four-channel head')
-    prediction = compose_rgb_tensor(head, prepared, blend_scale=blend_scale)
-    if resized.shape[:2] != (h, w):
-        base = torch.from_numpy(resized).permute(2, 0, 1).unsqueeze(0).to(device)
-        correction = F.interpolate(prediction - base, size=(h, w), mode='bilinear', align_corners=False)
-        full_input = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).to(device)
-        prediction = (full_input + correction).clamp(0, 1)
-    prediction = prediction[0].permute(1, 2, 0).cpu().numpy()
-    geometry = {'image_hw': [h, w], 'resized_hw': list(resized.shape[:2]),
-        'network_hw': list(prepared.features.shape[1:3]), 'inference_seconds': seconds,
-        'input_sha256': hashlib.sha256(rgb.tobytes()).hexdigest(),
-        'inference_input_sha256': hashlib.sha256(resized.tobytes()).hexdigest(),
-        'prepared_features_sha256': hashlib.sha256(prepared.features.numpy().tobytes()).hexdigest(),
-        'prediction_sha256': hashlib.sha256(prediction.tobytes()).hexdigest()}
-    return prediction, geometry
 
 
 def bold_font(size):
@@ -211,128 +138,162 @@ def release_model(model, device):
             torch.cuda.empty_cache()
 
 
+def sample_modes(loader, maximum, seed):
+    """Select physical clips once; all profiles use the identical selected sources."""
+    dataset = loader.dataset
+    from torch.utils.data import Subset
+    if isinstance(dataset, Subset):
+        base = dataset.dataset
+        indices = sorted({base.items[i][0] for i in dataset.indices})
+    else:
+        base, indices = dataset, list(range(len(dataset.clips)))
+    generator = random.Random(seed)
+    chosen = generator.sample(indices, min(len(indices), maximum * len(MODES)))
+    groups = {}
+    for mode_index, mode in enumerate(MODES):
+        subset = chosen[mode_index * maximum:(mode_index + 1) * maximum]
+        needed = min(maximum, len(indices)) - len(subset)
+        if needed:
+            subset += generator.sample([i for i in indices if i not in subset], needed)
+        groups[mode] = [base[base.items.index((i, base.profiles[0]))] for i in subset]
+    return groups, len(indices)
+
+
+@torch.inference_mode()
+def predict_clip(model, sample, mode, fraction, profile, config, device, blend_scale, is_teacher):
+    from .temporal import (crop_rgb, prepare_frame, student_arguments, compose_tensor, teacher_target,
+                           frame_guides, reset_history, resample)
+    history = previous = None
+    total = 0.
+    last_prediction = last_variant = None
+    geometry = {}
+    for position, image in enumerate(sample['images']):
+        rgb = crop_rgb(image, config['reporting']['crop_size'])
+        variant = prepare_variant(rgb, mode, fraction, config['augmentation'], seed=config['loader']['seed'],
+            sample_id=sample['sample_ids'][position], inference_size=config['reporting']['inference_size'])
+        if reset_history(previous, variant.network_rgb, config):
+            history = None
+        motion, confidence = frame_guides(sample, position, config['reporting']['crop_size'])
+        if motion is not None:
+            h, w = variant.network_rgb.shape[:2]
+            motion, confidence = resample(motion, w, h), resample(confidence, w, h)
+        frame = prepare_frame(variant.network_rgb, config, profile, history=history,
+                              motion=motion, confidence=confidence)
+        if is_teacher:
+            target = teacher_target(model, frame)
+            prediction = target['rgb'][0].permute(1, 2, 0).numpy()
+            next_history = target['history']
+            seconds = target['inference_seconds']
+            input_shape = list(frame.inputs.shape)
+        else:
+            inputs, controls, memory = student_arguments(frame, device, model.layout)
+            if device.type == 'cuda':
+                torch.cuda.synchronize(device)
+            started = perf_counter()
+            head = model(inputs, controls=controls, history=memory)
+            if device.type == 'cuda':
+                torch.cuda.synchronize(device)
+            seconds = perf_counter() - started
+            if model.layout == 'BCHW':
+                head = head.permute(0, 2, 3, 1)
+            output, next_history = compose_tensor(head, frame, blend_scale)
+            prediction = output[0].permute(1, 2, 0).cpu().numpy()
+            input_shape = list(inputs.shape)
+        total += seconds
+        # Show the actual augmented input; map only the model correction back to native size.
+        correction = resample(prediction - variant.network_rgb, rgb.shape[1], rgb.shape[0])
+        last_prediction = np.clip(variant.display_rgb + correction, 0, 1)
+        last_variant = variant
+        geometry = {'model_input_shape': input_shape, 'history_used': frame.history is not None,
+            'frame_index': position + 1, 'sample_id': sample['sample_ids'][position],
+            'inference_input_sha256': hashlib.sha256(variant.network_rgb.tobytes()).hexdigest(),
+            'input_sha256': hashlib.sha256(variant.display_rgb.tobytes()).hexdigest(),
+            'prediction_sha256': hashlib.sha256(last_prediction.tobytes()).hexdigest(),
+            'network_hw': list(frame.inputs.shape[1:3]), 'parameters': variant.parameters}
+        history = next_history if config['rendering']['temporal'] else None
+        previous = variant.network_rgb
+    return last_variant, last_prediction, {**geometry, 'inference_seconds': total,
+        'inference_frames': len(sample['images'])}
+
+
 @torch.inference_mode()
 def export_predictions(checkpoint, teacher_factory, loaders, config, directory, device, *, missing_splits=None):
+    from .temporal import FORMAT
     device, directory = torch.device(device), Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     payload = torch.load(checkpoint, map_location='cpu', weights_only=True)
-    if payload.get('format') != 'echorender-ssm-v2':
-        raise ValueError('Prediction reports require an echorender-ssm-v2 checkpoint')
-    epoch, blend_scale = payload['epoch'], payload['teacher_blend_scale']
-    student_config, student_state = payload['student_config'], payload['student']
-    del payload
-    manifest = {'status': 'running', 'report_format': 'augmentation-grids-v1',
-        'checkpoint': str(Path(checkpoint).resolve()), 'checkpoint_epoch': epoch,
-        'teacher_weights': config['model']['teacher_weights'], 'device': str(device),
-        'crop_size': config['reporting']['crop_size'], 'inference_size': config['reporting']['inference_size'],
-        'samples_per_mode': config['reporting']['samples_per_mode'], 'seed': config['loader']['seed'],
-        'strengths': config['reporting']['strengths'], 'noise_std': config['augmentation']['noise_std'],
-        'augmentation': 'one mode per validation input; factor=1+strength; sigma=noise_std*strength',
-        'mapping': 'compose RGB at inference size; bilinear-map RGB correction onto original-size augmented input',
-        'timing_scope': 'synchronized model forward in seconds; excludes warmup, preprocessing, RGB composition and file I/O',
-        'selection': {}, 'counts': {'preview': {}}, 'inference_counts': {}, 'grids': [],
-        'missing_splits': missing_splits or {}}
-    manifest_path = directory / 'predictions.json'
-    manifest_path.write_text(json.dumps(manifest, indent=2) + '\n')
-    cases, model = {}, None
+    if payload.get('format') != FORMAT:
+        raise ValueError('Expected a current RGB temporal checkpoint; retraining is required')
+    config = dict(config, rendering=payload['train_config']['rendering'])
+    blend_scale = payload['teacher_blend_scale']
+    manifest = {'status': 'running', 'checkpoint': str(checkpoint), 'checkpoint_epoch': payload['epoch'],
+        'rendering': config['rendering'], 'missing_splits': missing_splits or {},
+        'selection': {}, 'grids': [], 'counts': {'preview': {}, 'student': {}, 'teacher': {}}, 'timing_scope': 'synchronized forward only; totals include clip context frames'}
+    cases = {}
+    for split, loader in loaders.items():
+        groups, available = sample_modes(loader, config['reporting']['samples_per_mode'], config['loader']['seed'])
+        manifest['selection'][split] = {mode: [s['sample_ids'][-1] for s in samples] for mode, samples in groups.items()}
+        cases[split] = groups
+    model = None
     try:
-        for split, loader in loaders.items():
-            seed = int.from_bytes(hashlib.sha256(f'{config["loader"]["seed"]}:{split}'.encode()).digest()[:8], 'little')
-            groups, available = sample_modes(loader, config['reporting']['samples_per_mode'], seed)
-            manifest['selection'][split] = {'available_images': available, 'modes': {}}
-            cases[split] = []
-            for mode, samples in groups.items():
-                manifest['selection'][split]['modes'][mode] = [sid for _, sid in samples]
-                for image, sample_id in samples:
-                    rgb = image.detach().cpu().permute(1, 2, 0).contiguous().numpy()
-                    crop = config['reporting']['crop_size']
-                    if crop:
-                        h, w = rgb.shape[:2]
-                        top, left = max(0, (h - crop) // 2), max(0, (w - crop) // 2)
-                        rgb = rgb[top:top + crop, left:left + crop]
-                    levels = [0.] if mode == 'original' else [0., *config['reporting']['strengths']]
-                    variants = [prepare_variant(rgb, 'original' if value == 0 else mode, value,
-                        config['augmentation'], seed=config['loader']['seed'], sample_id=sample_id,
-                        inference_size=config['reporting']['inference_size']) for value in levels]
-                    filename = output_name(split, sample_id)
-                    relative = Path('preview') / mode / filename
-                    grid = save_grid(directory / relative, variants, f'{mode.title()} | {sample_id} | Input preview')
-                    manifest['grids'].append({'kind': 'preview', 'split': split, 'mode': mode,
-                        'sample_id': sample_id, 'path': relative.as_posix(), **grid})
-                    cases[split].append((mode, sample_id, filename, variants))
-            manifest['counts']['preview'][split] = len(cases[split])
-            tqdm.write(f'[Preview]: {split} | {len(cases[split])} grids | {config["reporting"]["samples_per_mode"]} sources per mode')
-        manifest_path.write_text(json.dumps(manifest, indent=2) + '\n')
-        with (directory / 'predictions.jsonl').open('x') as stream, \
-             (directory / 'predictions.csv').open('x', newline='') as table:
-            columns = ('model', 'split', 'mode', 'sample_id', 'strength', 'sigma', 'factor',
-                'input_delta_mae', 'prediction_change_rmse', 'inference_seconds',
-                'total_infer_seconds', 'avg_infer_seconds', 'path')
+        with (directory / 'predictions.jsonl').open('w') as stream, (directory / 'predictions.csv').open('w', newline='') as table:
+            columns = ['model', 'split', 'profile', 'mode', 'sample_id', 'strength', 'sigma', 'factor',
+                       'input_delta_mae', 'prediction_change_rmse', 'inference_seconds', 'inference_frames', 'path']
             writer = csv.DictWriter(table, fieldnames=columns)
             writer.writeheader()
             for name in ('student', 'teacher'):
+                model = EchoRenderStudent(payload['student_config']) if name == 'student' else teacher_factory()
                 if name == 'student':
-                    model = EchoRenderStudent(student_config)
-                    model.load_state_dict(student_state, strict=True)
-                    del student_state
-                else:
-                    model = teacher_factory()
+                    model.load_state_dict(payload['student'], strict=True)
                 model.eval().requires_grad_(False).to(device)
-                graph_teacher = name == 'teacher' and device.type == 'cuda' and hasattr(
-                    getattr(model, 'model', None), 'enable_cuda_graph')
-                if graph_teacher:
+                if name == 'teacher' and device.type == 'cuda' and hasattr(model.model, 'enable_cuda_graph'):
                     model.model.enable_cuda_graph()
-                warmed_shapes, counts, inference_counts = set(), {}, {}
-                for split, samples in cases.items():
-                    count = inference_count = 0
-                    bar = tqdm(samples, desc=f'[Predict] {name.title()} {split}', unit='grid',
-                        dynamic_ncols=True, disable=not config['logging']['progress'])
-                    try:
-                        for mode, sample_id, filename, variants in bar:
-                            predictions, geometries = [], []
-                            for variant in variants:
-                                shape = variant.network_rgb.shape
-                                prediction, geometry = predict_resized(model, variant, device=device,
-                                    blend_scale=blend_scale, layout=model.layout if name == 'student' else 'BHWC',
-                                    teacher_graph=graph_teacher, warmup=shape not in warmed_shapes)
-                                warmed_shapes.add(shape)
-                                predictions.append(prediction)
-                                geometries.append(geometry)
-                            total = sum(g['inference_seconds'] for g in geometries)
-                            average = total / len(geometries)
-                            relative = Path('pred') / name / mode / filename
-                            title = (f'{name.title()} | {mode.title()} | {sample_id} | '
-                                     f'total infer {total:.3f} s | avg infer {average:.3f} s |')
-                            grid = save_grid(directory / relative, variants, title, predictions)
-                            manifest['grids'].append({'kind': name, 'split': split, 'mode': mode,
-                                'sample_id': sample_id, 'path': relative.as_posix(),
-                                'total_infer_seconds': total, 'avg_infer_seconds': average, **grid})
-                            for variant, prediction, geometry in zip(variants, predictions, geometries):
-                                parameters = variant.parameters
-                                change = float(np.sqrt(np.mean((prediction - predictions[0]) ** 2)))
-                                record = {'model': name, 'split': split, 'mode': mode, 'sample_id': sample_id,
-                                    'path': relative.as_posix(), 'parameters': parameters, 'grid': grid,
-                                    'prediction_change_rmse': change, 'total_infer_seconds': total,
-                                    'avg_infer_seconds': average, **geometry}
-                                stream.write(json.dumps(record) + '\n')
-                                writer.writerow({'model': name, 'split': split, 'mode': mode, 'sample_id': sample_id,
-                                    'strength': parameters['fraction'], 'sigma': parameters.get('sigma', ''),
-                                    'factor': parameters.get('factor', ''), 'input_delta_mae': parameters['inference_delta_mae'],
-                                    'prediction_change_rmse': change, 'inference_seconds': geometry['inference_seconds'],
-                                    'total_infer_seconds': total, 'avg_infer_seconds': average, 'path': relative.as_posix()})
-                            stream.flush()
-                            table.flush()
-                            count += 1
-                            inference_count += len(variants)
-                    finally:
-                        bar.close()
-                    counts[split], inference_counts[split] = count, inference_count
+                for split, groups in cases.items():
+                    for mode, samples in groups.items():
+                        for sample in samples:
+                            for profile in config['rendering']['profiles']:
+                                levels = [0.] if mode == 'original' else [0., *config['reporting']['strengths']]
+                                variants, predictions, geometries = [], [], []
+                                for level in levels:
+                                    variant, prediction, geometry = predict_clip(model, sample,
+                                        'original' if level == 0 else mode, level, profile, config, device,
+                                        blend_scale, name == 'teacher')
+                                    variants.append(variant)
+                                    predictions.append(prediction)
+                                    geometries.append(geometry)
+                                sample_id = sample['sample_ids'][-1]
+                                filename = output_name(split, sample_id)
+                                if name == 'student' and profile == next(iter(config['rendering']['profiles'])):
+                                    preview = Path('preview') / mode / filename
+                                    save_grid(directory / preview, variants, f'{mode.title()} | {sample_id} | Input preview')
+                                total = sum(g['inference_seconds'] for g in geometries)
+                                frames = sum(g['inference_frames'] for g in geometries)
+                                average = total / frames
+                                relative = Path('pred') / name / profile / mode / filename
+                                title = f'{name.title()} | {profile} | {mode} | frame {len(sample["images"])} | total infer {total:.3f} s | avg infer {average:.3f} s |'
+                                grid = save_grid(directory / relative, variants, title, predictions)
+                                manifest['grids'].append({'model': name, 'split': split, 'profile': profile, 'mode': mode,
+                                    'sample_id': sample_id, 'path': relative.as_posix(), 'total_infer_seconds': total,
+                                    'avg_infer_seconds': average, **grid})
+                                for level, geometry, prediction, variant in zip(levels, geometries, predictions, variants):
+                                    row = {'model': name, 'split': split, 'profile': profile, 'mode': mode,
+                                        'sample_id': sample_id, 'strength': level,
+                                        'sigma': variant.parameters.get('sigma', ''), 'factor': variant.parameters.get('factor', ''),
+                                        'input_delta_mae': variant.parameters['inference_delta_mae'],
+                                        'prediction_change_rmse': float(np.sqrt(np.mean((prediction - predictions[0]) ** 2))),
+                                        'inference_seconds': geometry['inference_seconds'],
+                                        'inference_frames': geometry['inference_frames'], 'path': relative.as_posix()}
+                                    writer.writerow(row)
+                                    stream.write(json.dumps({**row, **geometry}) + '\n')
+                                stream.flush()
+                                table.flush()
+                                tqdm.write(f'[Predict]: {name} | {profile} | {mode} | {sample_id}')
                 release_model(model, device)
                 model = None
-                gc.collect()
-                manifest['counts'][name] = counts
-                manifest['inference_counts'][name] = inference_counts
-                manifest_path.write_text(json.dumps(manifest, indent=2) + '\n')
+        for split in cases:
+            manifest['counts']['preview'][split] = sum(len(samples) for samples in cases[split].values())
+            for name in ('student', 'teacher'):
+                manifest['counts'][name][split] = sum(g['model'] == name and g['split'] == split for g in manifest['grids'])
         manifest['status'] = 'completed_with_missing_splits' if missing_splits else 'completed'
     except BaseException as exc:
         manifest.update(status='failed', error=str(exc))
@@ -340,5 +301,5 @@ def export_predictions(checkpoint, teacher_factory, loaders, config, directory, 
     finally:
         if model is not None:
             release_model(model, device)
-        manifest_path.write_text(json.dumps(manifest, indent=2) + '\n')
+        (directory / 'predictions.json').write_text(json.dumps(manifest, indent=2) + '\n')
     return manifest

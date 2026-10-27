@@ -9,7 +9,7 @@ runtime:
   output_dir: output/test  # existing directories get _2, _3, ...
 training:
   epochs: 10
-  gradient_checkpointing: false  # SSM 反向重算：true 節省顯存，false 減少重算
+  gradient_checkpointing: false  # recompute SSM activations to trade speed for memory
   micro_batch_size: 4  # simultaneous Student images; gradients accumulate to loader.batch_size
   releas: true  # true: cache once and unload Teacher; false: frozen online Teacher, no cache
   max_steps: null
@@ -57,7 +57,7 @@ schedule:
 
 augmentation:
   enabled: true
-  start_ratio: 0.10  # sampling probability and operation strength
+  start_ratio: 0.10  # augmentation cap and operation strength
   max_ratio: 0.25
   peak_fraction: 0.50
   stop_fraction: 0.75
@@ -79,8 +79,8 @@ dataset:
       source: test
       scenes: null
 loader:
-  batch_size: 16  # effective images per optimizer update6
-  num_workers: 0
+  batch_size: 16  # effective clips per optimizer update; each clip has one profile
+  num_workers: 2
   seed: 42
   train_shuffle: true
 
@@ -92,3 +92,19 @@ reporting:
   inference_size: 320  # longest-edge cap before padding; map predicted RGB correction back to original size; 0 keeps native inference
   samples_per_mode: 2  # original/noise/brightness/contrast/sharpness: two source images each
   strengths: [0.25, 0.50, 0.75, 1.00]  # validation strengths; factor = 1 + strength, noise sigma = noise_std * strength
+
+# Image inputs remain RGB. Motion is fixed to Sintel guides; control masks are unsupported.
+rendering:
+  render_scale: 1.0
+  min_extent: 320
+  noise_index: 1
+  temporal: true
+  max_frames: 10
+  train_min_frames: 1  # sample clip prefixes of length 1..10; frame gradients are truncated
+  history_strength: 1.0
+  scene_cut_threshold: 0.15
+  profiles:
+    standard: {style_index: null, tone: null, structure: 1.8, skin_structure: 1.5, auto_structure: 1.0, intensity: 1.8, detail_strength: 1.5, colour_strength: 1.0, detail_radius: 0.5}
+    natural: {style_index: null, tone: null, structure: 1.8, skin_structure: 1.5, auto_structure: 1.0, intensity: 1.8, detail_strength: 1.5, colour_strength: 1.0, detail_radius: 0.5}
+    cinematic: {style_index: null, tone: null, structure: 1.8, skin_structure: 1.5, auto_structure: 1.0, intensity: 1.8, detail_strength: 1.5, colour_strength: 1.0, detail_radius: 0.5}
+    neutral: {style_index: 2, tone: null, structure: 1.8, skin_structure: 1.5, auto_structure: 1.0, intensity: 1.8, detail_strength: 1.5, colour_strength: 1.0, detail_radius: 0.5}
