@@ -16,7 +16,7 @@ from torch.nn import functional as F
 
 from .training_config import load_training_config, TrainingSchedule
 from .dataloader import load_data_config, build_dataloader
-from .temporal import (prepare_frame, student_arguments, compose_tensor, teacher_target, crop_rgb,
+from .temporal import (prepare_student_frame, prepare_frame, student_inputs, compose_tensor, teacher_target, crop_rgb,
                        compose_output, frame_guides, write_stage_report, FORMAT)
 from .distillation import StudentAugmentation, train_batch, evaluate, cache_key, make_frame, module_digest
 from .teacher_features import TeacherFeatureCache
@@ -104,22 +104,170 @@ class TemporalTests(unittest.TestCase):
     def criterion(self):
         return DistillationLoss(self.config['loss'], channels=dict.fromkeys(('e1', 'e2', 'e3', 'vit'), 4))
 
-    def test_profile_controls_and_rgb_history_have_effect_without_extra_channels(self):
+    def test_student_input_layout_matches_teacher_and_zeros_unused_channels(self):
         student = tiny_model().eval()
         rgb = crop_rgb(sample()['images'][0], 0)
-        outputs, vectors = [], []
+        outputs, inputs = [], []
         for profile in self.config['rendering']['profiles']:
             frame = prepare_frame(rgb, self.config, profile)
-            x, c, h = student_arguments(frame, 'cpu')
-            self.assertEqual(x.shape[-1], 3)
-            self.assertEqual(c.shape[-1], 16)
-            outputs.append(student(x, controls=c, history=h))
-            vectors.append(c)
-        self.assertTrue(all(not torch.equal(vectors[0], c) for c in vectors[1:]))
+            x = student_inputs(frame, 'cpu')
+            self.assertEqual(x.shape[-1], 16)
+            self.assertEqual(float(x[..., :3].abs().sum()), 0)
+            self.assertEqual(float(x[..., 15].abs().sum()), 0)
+            self.assertTrue(torch.all(x[..., 3] == 1))
+            torch.testing.assert_close(x[..., 4:15], frame.inputs[..., 4:15], atol=0, rtol=0)
+            outputs.append(student(x))
+            inputs.append(x)
+        self.assertTrue(all(not torch.equal(inputs[0], value) for value in inputs[1:]))
         self.assertGreater(float((outputs[0] - outputs[-1]).detach().abs().max()), 1e-6)
-        self.assertFalse(torch.equal(student(x, controls=c, history=h + .1), outputs[-1]))
+        changed = x.clone()
+        changed[..., 7:10] += .01
+        self.assertFalse(torch.equal(student(changed), outputs[-1]))
+        self.assertFalse(any('control_layers' in key or 'history_projection' in key for key in student.state_dict()))
         with self.assertRaises(ValueError):
-            student(torch.zeros(1, 32, 32, 16), controls=c)
+            student(torch.zeros(1, 32, 32, 3))
+        with self.assertRaises(TypeError):
+            student(x, controls=torch.zeros(1, 16))
+        bchw = deepcopy(student.config)
+        bchw['input_layout'] = 'BCHW'
+        other = type(student)(bchw).eval()
+        other.load_state_dict(student.state_dict(), strict=True)
+        torch.testing.assert_close(other(student_inputs(frame, 'cpu', 'BCHW')).permute(0, 2, 3, 1), outputs[-1])
+
+    def test_raw_motion_recovers_backward_translation_without_guides(self):
+        from model.motion import raw_motion
+        rng = np.random.default_rng(45)
+        previous = rng.random((96, 96, 3), dtype=np.float32)
+        current = np.roll(previous, (2, 4), axis=(0, 1))
+        motion, confidence = raw_motion(previous, current)
+        pixels = motion[20:-20, 20:-20] * 96
+        np.testing.assert_allclose(np.median(pixels, axis=(0, 1)), [-4, -2], atol=.4)
+        self.assertGreater(float(confidence[20:-20, 20:-20].mean()), .8)
+
+    def test_warp_direction_boundaries_and_displacement_gradients(self):
+        from model.motion import warp_history
+        source = torch.arange(64, dtype=torch.float32).view(1, 1, 1, 64).expand(1, 3, 32, 64)
+        field = torch.zeros(1, 2, 32, 64)
+        field[:, 0] = 2 / 64
+        field.requires_grad_()
+        aligned, valid = warp_history(source, field, torch.ones(1, 1, 32, 64))
+        torch.testing.assert_close(aligned[..., :-2], source[..., 2:], atol=2e-5, rtol=0)
+        self.assertEqual(float(valid[..., -2:].sum()), 0)
+        aligned[..., 3:-3].mean().backward()
+        self.assertGreater(float(field.grad[:, 0].abs().sum()), 0)
+
+    def test_feature_motion_is_independent_trainable_and_not_ground_truth_driven(self):
+        student = tiny_model('feat')
+        self.assertEqual(set(dict(student.motion.named_children())), {'encoder', 'decoder'})
+        self.assertEqual(student.motion.encoder[2].out_channels, 64)
+        prior = crop_rgb(sample()['images'][0], 0)
+        current = np.roll(prior, 2, axis=1)
+        target = np.zeros((*prior.shape[:2], 2), np.float32)
+        target[..., 0] = -2 / prior.shape[1]
+        mask = np.ones((*prior.shape[:2], 1), np.float32)
+        optimizer = torch.optim.Adam(student.motion.parameters(), lr=.003)
+        errors = []
+        for _ in range(12):
+            optimizer.zero_grad()
+            frame = prepare_student_frame(current, self.config, 'neutral', student,
+                previous=prior, history=prior, motion=target, confidence=mask)
+            errors.append(float(frame.motion_loss.detach()))
+            frame.motion_loss.backward()
+            optimizer.step()
+        self.assertLess(errors[-1], errors[0])
+        self.assertGreater(float(student.motion.encoder[0].weight.grad.abs().sum()), 0)
+        a = prepare_student_frame(current, self.config, 'neutral', student,
+            previous=prior, history=prior, motion=target, confidence=mask)
+        b = prepare_student_frame(current, self.config, 'neutral', student,
+            previous=prior, history=prior, motion=target * -10, confidence=mask * 0)
+        torch.testing.assert_close(a.history, b.history, atol=0, rtol=0)
+        torch.testing.assert_close(a.confidence, b.confidence, atol=0, rtol=0)
+        b = prepare_student_frame(current * .5, self.config, 'neutral', student,
+            previous=prior, history=prior)
+        self.assertGreater(float((a.history - b.history).detach().abs().max()), 1e-6)
+        x = student_inputs(a, 'cpu')
+        head = student(x)
+        output, _ = compose_tensor(head, a, .5)
+        student.zero_grad()
+        output.mean().backward()
+        self.assertGreater(float(student.motion.decoder[-1].weight.grad.abs().sum()), 0)
+
+    def test_feature_mode_updates_and_single_frame_has_no_missing_gradients(self):
+        config = deepcopy(self.config)
+        config['rendering']['train_min_frames'] = 2
+        student, criterion = tiny_model('feat'), self.criterion()
+        teacher = FixtureTeacher()
+        before = module_digest(teacher)
+        optimizer = torch.optim.SGD([*student.parameters(), *criterion.parameters()], lr=.01)
+        controls = TrainingSchedule(config, total_steps=2).values(epoch=1, step=0)
+        for frames in (1, 2):
+            batch = {'sequences': [sample(frames=frames, name=str(i)) for i in range(2)]}
+            result = train_batch(teacher, student, criterion, batch, optimizer, config=config,
+                crop_size=0, controls=controls, blend_scale=.5, micro_batch_size=2)
+            self.assertGreaterEqual(result['components']['motion'], 0)
+            self.assertTrue(all(p.grad is not None for p in student.motion.parameters()))
+        self.assertEqual(module_digest(teacher), before)
+        self.assertGreater(float(student.motion.decoder[-1].weight.detach().abs().sum()), 0)
+        frame = prepare_student_frame(crop_rgb(sample()['images'][0], 0), config, 'neutral', student)
+        self.assertIsNone(frame.history)
+
+    def test_feature_checkpoint_reloads_exactly_and_rejects_retired_formats(self):
+        from .trainer import save_checkpoint, load_student_state
+        student, criterion = tiny_model('feat').eval(), self.criterion()
+        optimizer = torch.optim.SGD([*student.parameters(), *criterion.parameters()], lr=.001)
+        rgb = crop_rgb(sample()['images'][0], 0)
+        frame = prepare_student_frame(rgb, self.config, 'neutral', student, previous=rgb, history=rgb)
+        inputs = student_inputs(frame, 'cpu')
+        expected = student(inputs).detach()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'best.pt'
+            save_checkpoint(path, student, criterion, optimizer, epoch=1, step=1, config=self.config,
+                controls={'loss_weights': self.config['loss']}, blend_scale=.5)
+            payload = torch.load(path, weights_only=True)
+            restored = type(student)(payload['student_config']).eval()
+            load_student_state(restored, path)
+            self.assertEqual(restored.motion_mode, 'feat')
+            self.assertEqual(restored.input_channels, 16)
+            torch.testing.assert_close(restored(inputs), expected, atol=0, rtol=0)
+            payload['format'] = 'echorender-rgb-temporal-v3'
+            torch.save(payload, path)
+            with self.assertRaises(ValueError):
+                load_student_state(restored, path)
+        retired = deepcopy(student.config)
+        retired['input_channels'] = 3
+        with self.assertRaises(ValueError):
+            type(student)(retired)
+
+    def test_rgb_only_prediction_has_no_dependency_on_dataset_flow_in_either_mode(self):
+        from .prediction_report import predict_clip
+        config = deepcopy(self.config)
+        config['reporting'].update(crop_size=0, inference_size=0)
+        rgb_only = sample(frames=2)
+        rgb_only['motions'] = [None, None]
+        rgb_only['confidences'] = [None, None]
+        for mode in ('raw', 'feat'):
+            student = tiny_model(mode).eval()
+            with patch('tool.temporal.frame_guides', side_effect=AssertionError('Student must not read flow')):
+                _, prediction, info = predict_clip(student, rgb_only, 'original', 0, 'neutral', config,
+                    torch.device('cpu'), .5, False)
+            self.assertTrue(np.isfinite(prediction).all())
+            self.assertTrue(info['history_used'])
+            self.assertEqual(info['motion_source'], mode)
+
+    def test_test_sequences_need_only_rgb_and_label_estimated_reference_motion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            folder = root / 'test/clean/demo'
+            folder.mkdir(parents=True)
+            for index in (1, 2):
+                Image.fromarray(np.full((32, 32, 3), 100 + index, np.uint8)).save(folder / f'frame_{index:04}.png')
+            config = deepcopy(self.config)
+            config['dataset']['root'] = str(root)
+            loader = build_dataloader(load_data_config(config), split='test')
+            item = loader.dataset[0]
+            self.assertEqual(item['motion_reference'], 'estimated_from_rgb')
+            self.assertEqual(len(item['images']), 2)
+            self.assertEqual(item['motions'][1].shape, (32, 32, 2))
 
     def test_composition_matches_teacher_host_for_all_profiles_and_history(self):
         rgb = crop_rgb(sample()['images'][0], 0)
@@ -267,14 +415,14 @@ class TemporalTests(unittest.TestCase):
             finally:
                 cache.close(delete=False)
 
-    def test_forward_benchmark_receives_external_controls(self):
+    def test_forward_benchmark_receives_prepared_16_channels(self):
         self.config['benchmark'].update(enabled=True, warmup=0, repeats=1)
         result = evaluate(FixtureTeacher(), tiny_model(), self.criterion(),
             [{'sequences': [sample(frames=1)]}], Metrics(), Monitor(), config=self.config, epoch=1,
             controls={'loss_weights': self.config['loss']}, blend_scale=.5)
         self.assertGreater(result['benchmark']['teacher_latency_ms'], 0)
         self.assertGreater(result['benchmark']['student_latency_ms'], 0)
-        self.assertEqual(result['benchmark']['student_input_shape'][-1], 3)
+        self.assertEqual(result['benchmark']['student_input_shape'][-1], 16)
 
     def test_cache_groups_frame_payloads_and_rejects_old_signature(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -312,8 +460,8 @@ class TemporalTests(unittest.TestCase):
         disabled = deepcopy(self.config)
         disabled['rendering']['history_strength'] = 0
         self.assertIsNone(make_frame(s, 1, disabled, target['history']).history)
-        x, c, history = student_arguments(second, 'cpu')
-        np.testing.assert_allclose(history[0].permute(1, 2, 0).numpy(), second.small, atol=0)
+        x = student_inputs(second, 'cpu')
+        torch.testing.assert_close(x[..., 4:7], x[..., 7:10], atol=0, rtol=0)
 
     def test_loader_orders_consecutive_clips_and_expands_four_profiles(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -458,7 +606,7 @@ class TemporalTests(unittest.TestCase):
         from .prediction_report import export_predictions
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            student = tiny_model()
+            student = tiny_model('feat')
             weights = root / 'best.pt'
             torch.save({'format': FORMAT, 'epoch': 1, 'student_config': student.config,
                 'student': student.state_dict(), 'teacher_blend_scale': .5, 'train_config': self.config}, weights)
@@ -484,7 +632,7 @@ class TemporalTests(unittest.TestCase):
                 self.assertIn('avg infer', grid['title'])
                 self.assertTrue((root / 'report' / grid['path']).is_file())
             rows = [json.loads(line) for line in (root / 'report/predictions.jsonl').read_text().splitlines()]
-            self.assertTrue(all(r['model_input_shape'][-1] == (3 if r['model'] == 'student' else 16) for r in rows))
+            self.assertTrue(all(r['model_input_shape'][-1] == 16 for r in rows))
 
 
 if __name__ == '__main__':

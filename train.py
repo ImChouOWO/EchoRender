@@ -59,6 +59,7 @@ def main(argv=None):
         config['runtime']['output_dir'] = str(output)
         print(f'Output: {output}', flush=True)
         print(f'Training on {device}; train clips/profiles={len(train_loader.dataset)}, val={len(val_loader.dataset)}', flush=True)
+        print(f'Student motion: {student.motion_mode}', flush=True)
         print(f"Batch: effective={config['loader']['batch_size']} clips, micro={config['training']['micro_batch_size']} concurrent frames", flush=True)
         report_dir = None
         on_complete = None

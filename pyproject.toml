@@ -9,6 +9,7 @@ dependencies = [
     "matplotlib>=3.10",
     "mlxdlss",
     "numpy>=1.26",
+    "opencv-python-headless>=4.10,<4.12",
     "nvidia-ml-py>=12",
     "pillow>=10.0",
     "pytorch-msssim>=1.0",

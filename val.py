@@ -91,7 +91,9 @@ def evaluate_checkpoint(payload, teacher_factory, loaders, config, device):
     results = {}
     try:
         cache.open()
-        import hashlib
+        import hashlib, inspect
+        from model.motion import raw_motion
+        import cv2
         from tool.distillation import module_digest
         sources = []
         for loader in loaders.values():
@@ -108,7 +110,9 @@ def evaluate_checkpoint(payload, teacher_factory, loaders, config, device):
         from tool import temporal
         signature = {'teacher': module_digest(teacher), 'rendering': config['rendering'],
             'crop': config['training']['crop_size'], 'sources': sources, 'device': str(device), 'torch': torch.__version__,
-            'pipeline': hashlib.sha256(Path(temporal.__file__).read_bytes()).hexdigest()}
+            'pipeline': hashlib.sha256(Path(temporal.__file__).read_bytes()).hexdigest(),
+            'external_motion': hashlib.sha256(inspect.getsource(raw_motion).encode()).hexdigest(),
+            'opencv': cv2.__version__}
         fingerprint = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()
         cache.prepare(fingerprint, payload['teacher_blend_scale'])
         teacher.eval().to(device)
@@ -176,8 +180,8 @@ def main(argv=None):
         weights = args.weights.expanduser().resolve()
         payload = torch.load(weights, map_location='cpu', weights_only=True)
         required = {'student', 'student_config', 'distillation', 'train_config', 'epoch', 'teacher_blend_scale'}
-        if not isinstance(payload, dict) or payload.get('format') != 'echorender-rgb-temporal-v3' or not required <= payload.keys():
-            raise ValueError('Expected a complete echorender-rgb-temporal-v3 training checkpoint')
+        if not isinstance(payload, dict) or payload.get('format') != 'echorender-bhwc16-motion-v4' or not required <= payload.keys():
+            raise ValueError('Expected a complete echorender-bhwc16-motion-v4 training checkpoint')
         # Score with the checkpoint's objective; compare inputs using the current augmentation settings.
         config['rendering'] = deepcopy(payload['train_config']['rendering'])
         config['loss'] = deepcopy(payload['train_config']['loss'])

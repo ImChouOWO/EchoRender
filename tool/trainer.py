@@ -33,16 +33,16 @@ def json_safe(value):
 
 def load_student_state(student, path):
     payload = torch.load(path, map_location='cpu', weights_only=True)
-    if not isinstance(payload, dict) or payload.get('format') != 'echorender-rgb-temporal-v3':
-        raise ValueError('Expected an echorender-rgb-temporal-v3 checkpoint; legacy checkpoints are unsupported')
-    if payload['student_config'].get('input_channels', 3) != 3:
-        raise ValueError('Student checkpoint requires 3-channel RGB input; retrain 16-channel checkpoints')
+    if not isinstance(payload, dict) or payload.get('format') != 'echorender-bhwc16-motion-v4':
+        raise ValueError('Expected an echorender-bhwc16-motion-v4 checkpoint; legacy checkpoints are unsupported')
+    if payload['student_config'].get('input_channels') != 16:
+        raise ValueError('Student checkpoint requires the current prepared 16-channel layout; retraining is required')
     student.load_state_dict(payload['student'], strict=True)
 
 
 def save_checkpoint(path, student, criterion, optimizer, *, epoch, step, config, controls, blend_scale):
     payload = {
-        'format': 'echorender-rgb-temporal-v3', 'student': student.state_dict(),
+        'format': 'echorender-bhwc16-motion-v4', 'student': student.state_dict(),
         'distillation': criterion.state_dict(), 'optimizer': optimizer.state_dict(),
         'student_config': student.config, 'train_config': config,
         'epoch': epoch, 'global_step': step, 'schedule_controls': controls,

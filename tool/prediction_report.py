@@ -161,7 +161,7 @@ def sample_modes(loader, maximum, seed):
 
 @torch.inference_mode()
 def predict_clip(model, sample, mode, fraction, profile, config, device, blend_scale, is_teacher):
-    from .temporal import (crop_rgb, prepare_frame, student_arguments, compose_tensor, teacher_target,
+    from .temporal import (crop_rgb, prepare_frame, prepare_student_frame, student_inputs, compose_tensor, teacher_target,
                            frame_guides, reset_history, resample)
     history = previous = None
     total = 0.
@@ -173,24 +173,26 @@ def predict_clip(model, sample, mode, fraction, profile, config, device, blend_s
             sample_id=sample['sample_ids'][position], inference_size=config['reporting']['inference_size'])
         if reset_history(previous, variant.network_rgb, config):
             history = None
-        motion, confidence = frame_guides(sample, position, config['reporting']['crop_size'])
-        if motion is not None:
-            h, w = variant.network_rgb.shape[:2]
-            motion, confidence = resample(motion, w, h), resample(confidence, w, h)
-        frame = prepare_frame(variant.network_rgb, config, profile, history=history,
-                              motion=motion, confidence=confidence)
         if is_teacher:
+            motion, confidence = frame_guides(sample, position, config['reporting']['crop_size'])
+            if motion is not None:
+                h, w = variant.network_rgb.shape[:2]
+                motion, confidence = resample(motion, w, h), resample(confidence, w, h)
+            frame = prepare_frame(variant.network_rgb, config, profile, history=history,
+                                  motion=motion, confidence=confidence)
             target = teacher_target(model, frame)
             prediction = target['rgb'][0].permute(1, 2, 0).numpy()
             next_history = target['history']
             seconds = target['inference_seconds']
             input_shape = list(frame.inputs.shape)
         else:
-            inputs, controls, memory = student_arguments(frame, device, model.layout)
             if device.type == 'cuda':
                 torch.cuda.synchronize(device)
             started = perf_counter()
-            head = model(inputs, controls=controls, history=memory)
+            frame = prepare_student_frame(variant.network_rgb, config, profile, model,
+                previous=previous, history=history)
+            inputs = student_inputs(frame, device, model.layout)
+            head = model(inputs)
             if device.type == 'cuda':
                 torch.cuda.synchronize(device)
             seconds = perf_counter() - started
@@ -209,7 +211,9 @@ def predict_clip(model, sample, mode, fraction, profile, config, device, blend_s
             'inference_input_sha256': hashlib.sha256(variant.network_rgb.tobytes()).hexdigest(),
             'input_sha256': hashlib.sha256(variant.display_rgb.tobytes()).hexdigest(),
             'prediction_sha256': hashlib.sha256(last_prediction.tobytes()).hexdigest(),
-            'network_hw': list(frame.inputs.shape[1:3]), 'parameters': variant.parameters}
+            'network_hw': list(frame.inputs.shape[1:3]), 'parameters': variant.parameters,
+            'motion_source': 'sintel' if is_teacher and sample['sample_ids'][0].startswith('training/') else
+                             'raw' if is_teacher else model.motion_mode}
         history = next_history if config['rendering']['temporal'] else None
         previous = variant.network_rgb
     return last_variant, last_prediction, {**geometry, 'inference_seconds': total,
@@ -223,12 +227,12 @@ def export_predictions(checkpoint, teacher_factory, loaders, config, directory, 
     directory.mkdir(parents=True, exist_ok=True)
     payload = torch.load(checkpoint, map_location='cpu', weights_only=True)
     if payload.get('format') != FORMAT:
-        raise ValueError('Expected a current RGB temporal checkpoint; retraining is required')
+        raise ValueError('Expected a current BHWC16 motion checkpoint; retraining is required')
     config = dict(config, rendering=payload['train_config']['rendering'])
     blend_scale = payload['teacher_blend_scale']
     manifest = {'status': 'running', 'checkpoint': str(checkpoint), 'checkpoint_epoch': payload['epoch'],
         'rendering': config['rendering'], 'missing_splits': missing_splits or {},
-        'selection': {}, 'grids': [], 'counts': {'preview': {}, 'student': {}, 'teacher': {}}, 'timing_scope': 'synchronized forward only; totals include clip context frames'}
+        'selection': {}, 'grids': [], 'counts': {'preview': {}, 'student': {}, 'teacher': {}}, 'timing_scope': 'Student includes motion, input preparation and backbone; Teacher is forward only; totals include context frames'}
     cases = {}
     for split, loader in loaders.items():
         groups, available = sample_modes(loader, config['reporting']['samples_per_mode'], config['loader']['seed'])

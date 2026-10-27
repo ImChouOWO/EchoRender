@@ -2,7 +2,6 @@
 from dataclasses import dataclass
 import csv
 import json
-import math
 from time import perf_counter
 from pathlib import Path
 
@@ -16,7 +15,7 @@ from teacher_infer import (network_controls, network_geometry, render_extent, re
                            truncate_half, compose_output, dataset_motion)
 
 PROFILES = ('standard', 'natural', 'cinematic', 'neutral')
-FORMAT = 'echorender-rgb-temporal-v3'
+FORMAT = 'echorender-bhwc16-motion-v4'
 
 
 @dataclass
@@ -25,12 +24,13 @@ class Frame:
     small: np.ndarray
     geometry: object
     inputs: torch.Tensor
-    history: np.ndarray | None
-    confidence: np.ndarray | None
+    history: np.ndarray | torch.Tensor | None
+    confidence: np.ndarray | torch.Tensor | None
     controls: dict
     profile: str
     settings: dict
     rendering: dict
+    motion_loss: torch.Tensor | None = None
 
 
 def crop_rgb(image, size):
@@ -67,29 +67,55 @@ def prepare_frame(rgb, config, profile, *, history=None, motion=None, confidence
                  confidence if aligned is not None else None, controls, profile, settings, rendering)
 
 
-def student_arguments(frame, device, layout='BHWC'):
-    g, rgb = frame.geometry, frame.small
-    aligned = rgb[g.source_rows()[:, None], g.source_columns()[None, :]]
-    image = torch.from_numpy(aligned.copy()).unsqueeze(0).to(device)
-    history = np.zeros_like(aligned)
+def prepare_student_frame(rgb, config, profile, student, *, previous=None, history=None,
+                          motion=None, confidence=None):
+    """Student motion sees only RGB; dataset guides supervise feat, never drive its warp."""
+    from model.motion import raw_motion, warp_history
+    frame = prepare_frame(rgb, config, profile)
+    device = next(student.parameters()).device
+    if student.motion is not None:
+        frame.motion_loss = sum(parameter.sum() * 0 for parameter in student.motion.parameters())
+    if (previous is None or history is None or not config['rendering']['temporal']
+            or config['rendering']['history_strength'] == 0):
+        return frame
+    def tensor(value):
+        return torch.as_tensor(np.asarray(value).copy(), device=device, dtype=torch.float32).permute(2, 0, 1)[None]
+    current, prior = tensor(rgb), tensor(previous)
+    if current.shape != prior.shape:
+        raise ValueError('Reset history when frame dimensions change')
+    if student.motion_mode == 'raw':
+        field, valid = raw_motion(previous, rgb)
+        field, valid = tensor(field), tensor(valid)
+    else:
+        field, logits = student.motion(prior, current)
+        valid = torch.sigmoid(logits)
+        if motion is not None and confidence is not None:
+            target, mask = tensor(motion), tensor(confidence)
+            units = field.new_tensor([rgb.shape[1], rgb.shape[0]]).view(1, 2, 1, 1)
+            error = F.smooth_l1_loss(field * units, target * units, reduction='none')
+            flow_loss = (error * mask).sum() / (2 * mask.sum()).clamp_min(1)
+            frame.motion_loss = flow_loss + F.binary_cross_entropy_with_logits(logits, mask)
+    aligned, valid = warp_history(tensor(history), field, valid)
+    frame.history = aligned[0].permute(1, 2, 0)
+    frame.confidence = valid[0].permute(1, 2, 0)
+    return frame
+
+
+def student_inputs(frame, device, layout='BHWC'):
+    """Teacher channel layout: 0:3=0, 3=1, 4:7=RGB, 7:10=history, 10:15=controls, 15=0."""
+    image = frame.inputs.to(device).clone()
+    image[..., :3] = 0
+    image[..., 15] = 0
     if frame.history is not None:
-        memory = frame.rgb + frame.confidence * (frame.history - frame.rgb)
-        memory = resample(memory, rgb.shape[1], rgb.shape[0])
-        history = memory[g.source_rows()[:, None], g.source_columns()[None, :]]
-    history = torch.from_numpy(history.copy()).unsqueeze(0).permute(0, 3, 1, 2).to(device)
-    s, c, rendering = frame.settings, frame.controls, frame.rendering
-    scalar = [c['normalized_style'] * 64, c['local_tone_strength'] / 2,
-        c['local_structure_strength'] / 2,
-        (s['skin_structure'] + 1) / 3 if s['skin_structure'] is not None else -1,
-        (s['auto_structure'] + 1) / 3 if s['auto_structure'] is not None else -1,
-        s['intensity'] / 2, s['detail_strength'] / 2, s['colour_strength'] / 2,
-        s['detail_radius'] / 64, math.sin(rendering['noise_index']),
-        rendering['history_strength'], float(frame.history is not None)]
-    vector = [float(frame.profile == name) for name in PROFILES] + scalar
-    controls = torch.tensor([vector], device=device, dtype=torch.float32)
-    if layout == 'BCHW':
-        image = image.permute(0, 3, 1, 2).contiguous()
-    return image, controls, history
+        current = torch.as_tensor(frame.rgb.copy(), device=device)
+        memory = current + torch.as_tensor(frame.confidence, device=device) * (torch.as_tensor(frame.history, device=device) - current)
+        memory = F.interpolate(memory.permute(2, 0, 1)[None], frame.small.shape[:2], mode='bilinear', align_corners=False)
+        g = frame.geometry
+        rows = torch.as_tensor(g.source_rows(), device=device, dtype=torch.long)
+        columns = torch.as_tensor(g.source_columns(), device=device, dtype=torch.long)
+        sampled = memory[:, :, rows[:, None], columns[None, :]].permute(0, 2, 3, 1)
+        image[..., 7:10] = half_ste(half_ste(half_ste(sampled) - .5) * .125)
+    return image if layout == 'BHWC' else image.permute(0, 3, 1, 2).contiguous()
 
 
 def half_ste(value):
@@ -126,8 +152,8 @@ def compose_tensor(head, frame, blend_scale):
     colour = torch.from_numpy(frame.rgb).to(head.device).unsqueeze(0)
     neural = (colour + .25 * half_ste(raw[..., :3])).clamp(0, 1)
     if frame.history is not None:
-        history = torch.from_numpy(frame.history.copy()).to(head.device).unsqueeze(0)
-        confidence = torch.from_numpy(frame.confidence).to(head.device).unsqueeze(0)
+        history = torch.as_tensor(frame.history, device=head.device).unsqueeze(0)
+        confidence = torch.as_tensor(frame.confidence, device=head.device).unsqueeze(0)
         alpha = torch.sigmoid(half_ste(raw[..., 3:])) * float(np.float16(blend_scale))
         alpha = alpha * frame.rendering['history_strength'] * confidence
         neural = neural + alpha * (history - neural)

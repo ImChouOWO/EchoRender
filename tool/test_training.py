@@ -30,7 +30,7 @@ from torchvision.transforms import functional as TF
 
 
 
-def tiny_model():
+def tiny_model(motion='raw'):
     rows = [
         [-1, 1, 'InputAdapter', [4]], [-1, 1, 'SwinStage', [4, 1, 1, 2, 1]],
         [-1, 1, 'Downsample', [4]], [-1, 1, 'SSMStage', [4, 1, 2, 2, 1]],
@@ -44,7 +44,7 @@ def tiny_model():
                      [[-1, skip], 1, 'Add', []],
                      [-1, 1, 'SwinStage', [4, 1, 1, 2, 1]]])
     rows.append([-1, 1, 'OutputHead', [4]])
-    return EchoRenderStudent({'input_channels': 3, 'output_channels': 4,
+    return EchoRenderStudent({'motion': motion, 'input_channels': 16, 'output_channels': 4,
                               'input_layout': 'BHWC', 'backbone': rows, 'head': []})
 
 
@@ -183,7 +183,7 @@ class TrainingTests(unittest.TestCase):
         import yaml
         c = yaml.safe_load(Path(self.config['model']['student_config']).read_text(encoding='utf-8-sig'))
         self.assertEqual([c['backbone'][i][2] for i in (3, 5, 7)], ['SSMStage'] * 3)
-        self.assertEqual(c['input_channels'], 3)
+        self.assertEqual(c['input_channels'], 16)
         self.assertEqual(c['ssm'], {'rotation': 'clockwise', 'directions': 2})
         self.assertEqual([c['backbone'][i][3][1] for i in (1, 3, 5, 7, 9, 11)], [2, 2, 4, 6, 8, 8])
         controls = TrainingSchedule(self.config, total_steps=1001)

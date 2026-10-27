@@ -8,7 +8,7 @@
 
 ```text
 乾淨影像 -> 凍結 Teacher -> 快取 head／中間特徵／RGB 目標
-同一 RGB 裁切 -> 可選增強 -> RGB-only Student -> 蒸餾 loss＋RGB loss
+同一 RGB 裁切 -> 可選增強 -> raw／feat 歷史對齊 -> 16 通道 Student -> 蒸餾 loss＋RGB loss
 ```
 
 <details>
@@ -26,7 +26,7 @@ Teacher 使用已解包、`fully_logical=true` 的 logical safetensors，透過�
 
 ### 模型結構
 
-由 [config/model.yaml](config/model.yaml) 定義。Student 以 `input_channels: 3` 接收 `[0,1]` 的原始 RGB，影像通道不加入模型噪聲或控制資料；另外接收控制向量，並在內部融合自身前一幀的 RGB 歷史。Teacher 維持 16 通道前處理、四通道 head 與 E1／E2／E3／ViT 蒸餾目標；兩路使用相同的鏡像 padding。目前 checkpoint 格式為 `echorender-rgb-temporal-v3`；舊 Student 權重須重新訓練，舊單張 Teacher 快取不會沿用。以下為目前 Student 的通道與深度，不是 Teacher block 編號。
+由 [config/model.yaml](config/model.yaml) 定義。外部仍提供 `[0,1]` RGB；前處理組成與 Teacher 相同布局的 `input_channels: 16`。0～2 與 15 通道固定為 0，3 固定為 1，4～6 為當前 RGB，7～9 為對齊的 Student 歷史 RGB（首幀用當前 RGB），10～14 為 style／tone／structure 控制。移除獨立控制向量、FiLM 與歷史投影介面；強度、色彩／細節倍率與半徑仍由輸出合成處理。`config/model.yaml` 的 `motion: raw` 使用外部 Farneback 從前後 RGB 計算光流；`motion: feat` 使用獨立的 6→32→64 通道編碼器及 64→32→3 解碼器，預測兩維位移與可信度，不與其他 stage 跳接。位移從零開始，以 Sintel 光流監督及可微分 RGB 對齊共同訓練，權重由 `loss.motion: 0.01` 定義。兩種 Student 模式在推論時都不需要資料集光流；首幀與場景切換會重置歷史。Teacher 訓練／驗證快取仍使用 Sintel 真實光流，無真實光流的 test 目標改用 RGB 估計，須與真實光流參考區分。Teacher 維持 16 通道前處理、四通道 head 與 E1／E2／E3／ViT 蒸餾目標；兩路使用相同的鏡像 padding。目前 checkpoint 格式為 `echorender-bhwc16-motion-v4`；舊 Student 權重須重新訓練，舊單張 Teacher 快取不會沿用。以下為目前 Student 的通道與深度，不是 Teacher block 編號。
 
 | Stage | 模組 | 通道 | Blocks |
 |---|---|---:|---:|
@@ -148,7 +148,7 @@ training:
   grad_clip: 1.0
 loader:
   batch_size: 16
-  num_workers: 0
+  num_workers: 2
   seed: 42
   train_shuffle: true
 schedule:
@@ -206,7 +206,7 @@ Lmid       = (E1 + E2 + E3 + ViT) / 4
 Lout       = raw 四通道 head MSE
 Ld         = 0.5 * Lmid + 0.5 * Lout
 Lrgb       = 0.5 * RGB MSE + 0.2 * (1 - SSIM) + 0.3 * (1 - MS-SSIM)
-Ltotal     = 3 * Ld + Lrgb
+Ltotal     = 3 * Ld + Lrgb + motion_weight * Lmotion  # feat only; motion_weight = 0.01
 ```
 
 特徵對齊排除純 padding 區域，維持實際空間網格對應，詳見 [特徵擷取與對齊](tool/TEACHER_FEATURES.md)。Token affinity 以精確 row chunks 計算，不抽樣 tokens。Teacher 目標 detach，optimizer 僅包含 Student 與特徵 adapters。
@@ -355,7 +355,7 @@ uv run --locked python val.py --weights output/test_12/last.pt --project preview
 
 ## 四模式與歷史評估
 
-`rendering.profiles` 分別設定 standard、natural、cinematic、neutral。預設採用使用者指定的結構／自動控制／強度組合；neutral 明確指定 style 2，其餘模式跟隨本身 style。`tone: null` 跟隨模式預設。`dataset.render_pass` 固定 clean，motion 固定 Sintel，不提供 control_mask。`temporal: false` 使用單張，`true` 支援最多 10 幀；資料載入器只打亂片段，不打亂片段內幀序，不跨場景或斷幀。
+`rendering.profiles` 分別設定 standard、natural、cinematic、neutral。預設採用使用者指定的結構／自動控制／強度組合；neutral 明確指定 style 2，其餘模式跟隨本身 style。`tone: null` 跟隨模式預設。`dataset.render_pass` 固定 clean；Teacher 使用 Sintel 光流，Student 在 model.yaml 選擇 raw／feat，不提供 control_mask。`temporal: false` 使用單張，`true` 支援最多 10 幀；資料載入器只打亂片段，不打亂片段內幀序，不跨場景或斷幀。
 
 增強保留「噪聲＋隨機一種亮度／對比／銳利度」。每個有效 batch 同時限制片段與幀的增強比例，不超過排程比例；其餘保持原圖。強度從 10% 升至 25%，50% epoch 達最高，75% 起關閉。片段內維持相同模式與強度；Teacher 始終使用未增強影像。
 

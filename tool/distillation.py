@@ -8,7 +8,7 @@ import torch
 from torchvision.transforms import functional as TF
 from mlxdlss.temporal import sample_history
 
-from .temporal import (prepare_frame, crop_rgb, frame_guides, reset_history, student_arguments,
+from .temporal import (prepare_student_frame, prepare_frame, crop_rgb, frame_guides, reset_history, student_inputs,
                        teacher_target, device_target, compose_tensor)
 from .progress import progress_bar, progress_row
 from .monitoring import measure_forward
@@ -94,8 +94,8 @@ def make_frame(sample, position, config, history=None, *, rgb=None, crop_size=No
 def objective(student, criterion, frame, target, blend_scale, loss_weights, *, head=None, features=None):
     device = next(student.parameters()).device
     if head is None:
-        image, controls, history = student_arguments(frame, device, student.layout)
-        head, features = student(image, controls=controls, history=history, return_features=True)
+        image = student_inputs(frame, device, student.layout)
+        head, features = student(image, return_features=True)
         if student.layout == 'BCHW':
             head = head.permute(0, 2, 3, 1).contiguous()
     target_head, target_features, target_rgb = device_target(target, device)
@@ -104,6 +104,10 @@ def objective(student, criterion, frame, target, blend_scale, loss_weights, *, h
         raise RuntimeError('Student and Teacher head geometry differs')
     loss, parts = criterion(head, target_head, features, target_features, prediction, target_rgb,
         image_hw=frame.small.shape[:2], network_hw=frame.inputs.shape[1:3], weights=loss_weights)
+    if frame.motion_loss is not None:
+        weighted = loss_weights['motion'] * frame.motion_loss
+        loss = loss + weighted
+        parts.update(motion=frame.motion_loss.detach().item(), weighted_motion=weighted.detach().item(), total=loss.detach().item())
     return loss, parts, prediction, target_rgb, history
 
 
@@ -125,6 +129,7 @@ def train_batch(teacher, student, criterion, batch, optimizer, *, config, crop_s
     for begin in range(0, count, micro_batch_size):
         group = samples[begin:begin + micro_batch_size]
         histories, teacher_histories, previous = [None] * len(group), [None] * len(group), [None] * len(group)
+        previous_student = [None] * len(group)
         for position in range(max(lengths[begin:begin + len(group)])):
             prepared, targets = [], []
             for offset, sample in enumerate(group):
@@ -133,12 +138,15 @@ def train_batch(teacher, student, criterion, batch, optimizer, *, config, crop_s
                     continue
                 rgb = crop_rgb(sample['images'][position], crop_size)
                 if reset_history(previous[offset], rgb, config):
-                    histories[offset] = teacher_histories[offset] = None
+                    histories[offset] = teacher_histories[offset] = previous_student[offset] = None
                 clean = make_frame(sample, position, config, teacher_histories[offset], rgb=rgb)
                 target = target_cache.load_payload('train', cache_key(sample, position)) if target_cache else teacher_target(teacher, clean)
                 teacher_histories[offset] = target['history'] if config['rendering']['temporal'] else None
                 student_rgb = augmentation.apply_rgb(rgb, plan[index], augmentation_ratio) if index in plan else rgb
-                frame = make_frame(sample, position, config, histories[offset], rgb=student_rgb)
+                motion, confidence = frame_guides(sample, position, crop_size)
+                frame = prepare_student_frame(student_rgb, config, sample['profile'], student,
+                    previous=previous_student[offset], history=histories[offset], motion=motion, confidence=confidence)
+                previous_student[offset] = student_rgb
                 prepared.append((offset, index, frame))
                 targets.append(target)
                 previous[offset] = rgb
@@ -147,9 +155,9 @@ def train_batch(teacher, student, criterion, batch, optimizer, *, config, crop_s
             for i, (_, _, frame) in enumerate(prepared):
                 buckets[tuple(frame.inputs.shape)].append(i)
             for indices in buckets.values():
-                arguments = [student_arguments(prepared[i][2], device, student.layout) for i in indices]
-                image, conditioning, memory = [torch.cat([args[k] for args in arguments]) for k in range(3)]
-                head, features = student(image, controls=conditioning, history=memory, return_features=True)
+                arguments = [student_inputs(prepared[i][2], device, student.layout) for i in indices]
+                image = torch.cat(arguments)
+                head, features = student(image, return_features=True)
                 if student.layout == 'BCHW':
                     head = head.permute(0, 2, 3, 1).contiguous()
                 combined = None
@@ -167,7 +175,7 @@ def train_batch(teacher, student, criterion, batch, optimizer, *, config, crop_s
                 # Detach RGB history at every frame: activation memory does not grow with clip length.
                 combined.backward()
                 sizes.append(len(indices))
-                del combined, head, features, arguments, image, conditioning, memory
+                del combined, head, features, arguments, image
     parameters = [p for group in optimizer.param_groups for p in group['params'] if p.requires_grad]
     if any(p.grad is None for p in parameters):
         raise RuntimeError('A trainable Student/adapter parameter has no gradient')
@@ -193,9 +201,9 @@ def validation_forward(student, criterion, jobs, blend_scale, loss_weights, maxi
     for indices in buckets.values():
         for begin in range(0, len(indices), maximum):
             selected = indices[begin:begin + maximum]
-            arguments = [student_arguments(jobs[i][0], device, student.layout) for i in selected]
-            inputs, conditioning, memory = [torch.cat([a[k] for a in arguments]) for k in range(3)]
-            head, features = student(inputs, controls=conditioning, history=memory, return_features=True)
+            arguments = [student_inputs(jobs[i][0], device, student.layout) for i in selected]
+            inputs = torch.cat(arguments)
+            head, features = student(inputs, return_features=True)
             if student.layout == 'BCHW':
                 head = head.permute(0, 2, 3, 1).contiguous()
             for row, index in enumerate(selected):
@@ -224,13 +232,15 @@ def validation_items(teacher, student, criterion, samples, metrics, config, cont
                 else:
                     clean = make_frame(sample, position, config, state['teacher_history'], rgb=rgb)
                     target = teacher_target(teacher, clean)
-                frame = make_frame(sample, position, config, state['history'], rgb=rgb)
+                motion, confidence = frame_guides(sample, position, config['training']['crop_size'])
+                frame = prepare_student_frame(rgb, config, sample['profile'], student, previous=state['previous'],
+                    history=state['history'], motion=motion, confidence=confidence)
                 main = len(jobs)
                 jobs.append((frame, target))
                 single = main
                 if frame.history is not None:
                     single = len(jobs)
-                    jobs.append((make_frame(sample, position, config, None, rgb=rgb), target))
+                    jobs.append((prepare_student_frame(rgb, config, sample['profile'], student), target))
                 entries.append((sample, state, rgb, frame, target, main, single))
             results = validation_forward(student, criterion, jobs, blend_scale, controls['loss_weights'], maximum)
             quality, buckets = {}, defaultdict(list)
@@ -254,30 +264,26 @@ def evaluate(teacher, student, criterion, loader, metrics, monitor, *, config, e
     criterion.eval()
     totals, scene_totals, scene_counts, stage = defaultdict(float), {}, defaultdict(int), {}
     images, benchmark = 0, None
+    reference_motion = set()
     bar = progress_bar(loader, enabled=config['logging']['progress'], validation=True)
     try:
         for batch in bar:
             for sample, position, state, rgb, frame, target, primary, reset, quality, single_quality in validation_items(
                     teacher, student, criterion, batch['sequences'], metrics, config, controls, target_cache, blend_scale):
+                reference_motion.add(sample.get('motion_reference', 'unspecified'))
                 history, teacher_history, previous_output, previous_single, depth = (
                     state[key] for key in ('history', 'teacher_history', 'previous_output', 'previous_single', 'depth'))
                 if benchmark is None and config['benchmark']['enabled']:
                     device = next(student.parameters()).device
-                    inputs, conditioning, memory = student_arguments(frame, device, student.layout)
-                    class ControlledForward(torch.nn.Module):
-                        def __init__(self):
-                            super().__init__()
-                            self.network = student
-                        def forward(self, value):
-                            return self.network(value, controls=conditioning, history=memory)
+                    inputs = student_inputs(frame, device, student.layout)
                     timing = config['benchmark']
-                    benchmark = {f'student_{k}': v for k, v in measure_forward(ControlledForward().eval(),
+                    benchmark = {f'student_{k}': v for k, v in measure_forward(student,
                         inputs, warmup=timing['warmup'], repeats=timing['repeats']).items()}
                     benchmark.update(target_cache.benchmark or {} if target_cache else
                         {f'teacher_{k}': v for k, v in measure_forward(teacher, frame.inputs.to(device),
                          warmup=timing['warmup'], repeats=timing['repeats']).items()})
                     benchmark.update(device=str(device), profile=sample['profile'],
-                        scope='synchronized forward only, batch=1, no feature capture',
+                        scope='synchronized backbone forward only, batch=1; motion and preprocessing excluded',
                         student_input_shape=list(inputs.shape))
                 loss, parts, prediction, target_rgb, next_history = primary
                 _, single_parts, single_prediction, _, _ = reset
@@ -344,6 +350,7 @@ def evaluate(teacher, student, criterion, loader, metrics, monitor, *, config, e
             if n:
                 profiles[profile] = {k: sum(r[k] * r['images'] for r in rows) / n for k in ('loss', 'psnr', 'ssim', 'lpips')}
         return {'images': images, 'reference': 'matching_profile_temporal_teacher_rgb',
+            'student_motion': student.motion_mode, 'reference_motion': sorted(reference_motion),
             'components': {k: v / images for k, v in totals.items() if k not in ('psnr', 'ssim', 'lpips')},
             'image_mean': {k: totals[k] / images for k in ('psnr', 'ssim', 'lpips')},
             'scene_mean': {k: sum(r[k] for r in scenes.values()) / len(scenes) for k in ('psnr', 'ssim', 'lpips')},

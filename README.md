@@ -8,7 +8,7 @@ Controlled RGB sequence distillation from a frozen recovered DLSS-NR Teacher int
 
 ```text
 Clean RGB clip + Sintel flow -> frozen Teacher per profile -> cached targets + history
-Same RGB clip -> optional corruption -> RGB-only Student + controls + own history -> losses
+Same RGB clip -> optional corruption -> raw/feat history alignment -> BHWC16 Student -> losses
 ```
 
 <details>
@@ -26,7 +26,7 @@ The Teacher uses decoded logical safetensors with `fully_logical=true` and the 7
 
 ### Student architecture
 
-Defined in [config/model.yaml](config/model.yaml). Image tensors remain raw RGB `[0,1]` with `input_channels: 3`. A separate 16-value control vector conditions stage-wise scale/bias layers; it is not an image channel tensor. An internal RGB-history projection receives the Student's own detached, reprojected previous neural prediction. Teacher inputs remain BHWC16 and E1/E2/E3/ViT distillation taps are unchanged. Current checkpoints use `echorender-rgb-temporal-v3`; older Student checkpoints require retraining. Old stateless Teacher targets are not reused. Channels/depths below describe the Student, not Teacher block indices.
+Defined in [config/model.yaml](config/model.yaml). Callers supply RGB `[0,1]`; preprocessing builds `input_channels: 16` in the Teacher channel layout. Channels 0-2 and 15 are zero, channel 3 is one, 4-6 hold scaled current RGB, 7-9 hold scaled aligned Student history (current RGB on the first frame), and 10-14 hold style/tone/structure controls. No separate control vector, FiLM layers or history-projection interface remains. The independent raw/feat motion branch only produces displacement/confidence and has no stage skip connections. Intensity, colour/detail strength and radius remain output-composition settings, matching Teacher processing. Teacher inputs remain BHWC16 and E1/E2/E3/ViT distillation taps are unchanged. Current checkpoints use `echorender-bhwc16-motion-v4` and store the Student motion mode/weights; older Student checkpoints require retraining. Old stateless Teacher targets are not reused. Channels/depths below describe the Student, not Teacher block indices.
 
 | Stage | Module | Channels | Blocks |
 |---|---|---:|---:|
@@ -151,7 +151,7 @@ training:
   grad_clip: 1.0
 loader:
   batch_size: 16
-  num_workers: 0
+  num_workers: 2
   seed: 42
   train_shuffle: true
 schedule:
@@ -167,7 +167,7 @@ Teacher weights and `runtime.output_dir` resolve from the project root. Teacher 
 
 `loader.batch_size` counts clips with one profile each, not individual frames. `training.micro_batch_size` limits concurrent frames. Each clip contributes its frame-mean loss, then gradients are averaged across the effective batch. RGB history is detached after every frame (one-frame truncated backpropagation), keeping saved activation memory independent of clip length. Longer clips still require more forwards/backwards. Training samples prefix lengths uniformly between `train_min_frames` and the available clip length; evaluation processes the whole clip.
 
-Rendering controls live in `rendering.profiles.standard/natural/cinematic/neutral`. Each profile defines `style_index`, `tone`, `structure`, `skin_structure`, `auto_structure`, `intensity`, `detail_strength`, `colour_strength` and `detail_radius`. Defaults use structure 1.8, skin 1.5, auto 1.0, intensity 1.8, detail 1.5, colour 1.0 and radius 0.5. Neutral explicitly selects style 2; the other profiles inherit their own style. `tone: null` follows the named profile. Global settings are render scale 1.0, minimum extent 320 and noise index 1. `rendering.temporal: false` creates single-frame samples; `true` supports up to `max_frames: 10`. Motion uses Sintel guides; configurable motion modes and artist control masks are unsupported. RGB-only deployment videos require RGB-derived motion estimates rather than Sintel ground truth.
+Rendering controls live in `rendering.profiles.standard/natural/cinematic/neutral`. Each profile defines `style_index`, `tone`, `structure`, `skin_structure`, `auto_structure`, `intensity`, `detail_strength`, `colour_strength` and `detail_radius`. Defaults use structure 1.8, skin 1.5, auto 1.0, intensity 1.8, detail 1.5, colour 1.0 and radius 0.5. Neutral explicitly selects style 2; the other profiles inherit their own style. `tone: null` follows the named profile. Global settings are render scale 1.0, minimum extent 320 and noise index 1. `rendering.temporal: false` creates single-frame samples; `true` supports up to `max_frames: 10`. Teacher uses Sintel ground-truth guides for training/validation targets. Student motion is selected by `motion: raw` or `motion: feat` in `config/model.yaml`. `raw` estimates backward optical flow with external Farneback from consecutive RGB frames; `feat` uses an independent RGB-pair encoder (6 -> 32 -> 64 channels) and decoder (64 -> 32 -> 3) to predict two displacements and one confidence logit. It has no skip connections to backbone/decoder stages. Flow starts at zero; masked flow supervision and differentiable RGB warping train the branch with `loss.motion: 0.01`. The external source remains RGB; the assembled network tensor has 16 channels. Neither Student mode requires dataset flow during inference; first frames and scene cuts reset history. Test targets without Sintel guides use externally estimated RGB flow, explicitly distinct from ground-truth motion. Artist control masks remain unsupported.
 
 `training.gradient_checkpointing: true` recomputes each SSM block during backward to reduce saved activations. `false` retains activations and avoids that recomputation. Validation/inference do not use checkpointing.
 
@@ -215,7 +215,7 @@ Lmid       = (E1 + E2 + E3 + ViT) / 4
 Lout       = raw four-channel head MSE
 Ld         = 0.5 * Lmid + 0.5 * Lout
 Lrgb       = 0.5 * RGB MSE + 0.2 * (1 - SSIM) + 0.3 * (1 - MS-SSIM)
-Ltotal     = 3 * Ld + Lrgb
+Ltotal     = 3 * Ld + Lrgb + motion_weight * Lmotion  # feat only; motion_weight = 0.01
 ```
 
 Feature alignment excludes padding-only cells and preserves physical grid correspondence; see [feature capture and alignment](tool/TEACHER_FEATURES.md). Token affinity uses exact row chunks without token sampling. Teacher targets are detached; only Student and feature adapters enter the optimizer.

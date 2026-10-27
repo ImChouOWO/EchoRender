@@ -22,6 +22,7 @@ training:
 loss:
   distillation: 3.0
   reconstruction: 1.0
+  motion: 0.01  # feat only: valid-pixel flow error in pixels plus confidence BCE
   mid: 0.5
   output: 0.5
   e1: 1.0
@@ -93,7 +94,7 @@ reporting:
   samples_per_mode: 2  # original/noise/brightness/contrast/sharpness: two source images each
   strengths: [0.25, 0.50, 0.75, 1.00]  # validation strengths; factor = 1 + strength, noise sigma = noise_std * strength
 
-# Image inputs remain RGB. Motion is fixed to Sintel guides; control masks are unsupported.
+# Teacher uses Sintel guides; Student motion is selected in model.yaml. Control masks are unsupported.
 rendering:
   render_scale: 1.0
   min_extent: 320

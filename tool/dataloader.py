@@ -132,7 +132,7 @@ class SintelSequenceDataset(Dataset):
                 self.clips.append((scene, tuple(group)))
         self.items = [(index, profile) for index in range(len(self.clips)) for profile in self.profiles]
         # Fail before model loading when multi-frame ground truth is unavailable.
-        if self.temporal:
+        if self.temporal and self.source == 'training':
             for scene, paths in self.clips:
                 for previous, current in zip(paths, paths[1:]):
                     for name, frame, suffix in (('flow', previous, '.flo'), ('occlusions', previous, '.png'),
@@ -151,6 +151,7 @@ class SintelSequenceDataset(Dataset):
             'sample_ids': [f'{self.source}/clean/{scene}/{path.stem}' for path in paths],
             'clip_id': f'{self.source}/clean/{scene}/{paths[0].stem}',
             'scene': scene, 'profile': profile, 'paths': list(map(str, paths)),
+            'motion_reference': 'sintel_ground_truth' if self.source == 'training' else 'estimated_from_rgb',
         }
 
     def __getitem__(self, index):
@@ -161,8 +162,12 @@ class SintelSequenceDataset(Dataset):
         if any(rgb.shape != rgbs[0].shape for rgb in rgbs):
             raise ValueError('Frame dimensions must remain constant within a clip')
         motions, confidences = [None], [None]
-        for previous, current in zip(paths, paths[1:]):
-            motion, confidence, _ = dataset_motion(self.root, self.source, meta['scene'], previous, current, rgbs[0].shape[:2])
+        for i, (previous, current) in enumerate(zip(paths, paths[1:])):
+            if self.source == 'training':
+                motion, confidence, _ = dataset_motion(self.root, self.source, meta['scene'], previous, current, rgbs[0].shape[:2])
+            else:
+                from model.motion import raw_motion
+                motion, confidence = raw_motion(rgbs[i], rgbs[i + 1])
             motions.append(motion)
             confidences.append(confidence)
         return {**meta, 'images': [torch.from_numpy(rgb).permute(2, 0, 1).contiguous() for rgb in rgbs],

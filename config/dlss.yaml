@@ -2,7 +2,8 @@
 # Each row: [from, repeats, module, args]. -1 means previous layer.
 # Stage args: [channels, depth, heads, window, ffn_ratio] (ViT omits window).
 # The recovered teacher owns special sampling, grouped FFN, gates and FP8 rounding.
-input_channels: 3  # raw RGB in [0,1]
+input_channels: 16  # Teacher layout; preprocessing accepts RGB and fills auxiliary channels
+motion: raw  # raw: external RGB optical flow; feat: trainable parallel RGB-pair branch
 output_channels: 4
 input_layout: BHWC
 backbone:
