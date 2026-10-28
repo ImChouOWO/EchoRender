@@ -8,14 +8,14 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.nn import functional as F
-from mlxdlss.features import make_features, scaled_color
+from mlxdlss.features import make_features, scaled_color, half
 from mlxdlss.temporal import sample_history
 from mlxdlss.composition import gaussian_kernel
 from teacher_infer import (network_controls, network_geometry, render_extent, resample,
                            truncate_half, compose_output, dataset_motion)
 
 PROFILES = ('standard', 'natural', 'cinematic', 'neutral')
-FORMAT = 'echorender-bhwc16-motion-v4'
+FORMAT = 'echorender-bhwc8-motion-v5'
 
 
 @dataclass
@@ -86,7 +86,20 @@ def prepare_student_frames(requests, config, student):
             return value.to(device=device, dtype=torch.float32)
         return torch.as_tensor(np.asarray(value).copy(), device=device, dtype=torch.float32)
     for index, request in enumerate(requests):
-        frame = prepare_frame(request['rgb'], config, request['profile'])
+        rgb, profile = request['rgb'], request['profile']
+        rendering, settings = config['rendering'], config['rendering']['profiles'][profile]
+        controls, _ = network_controls(profile, **{key: settings[key] for key in
+            ('style_index', 'tone', 'structure', 'skin_structure', 'auto_structure')})
+        width, height = render_extent(rgb.shape[1], rgb.shape[0], rendering['render_scale'], rendering['min_extent'])
+        small = resample(rgb, width, height)
+        geometry = network_geometry(width, height, rendering['min_extent'])
+        extended = small[geometry.source_rows()[:, None], geometry.source_columns()[None, :]]
+        network = np.empty((geometry.network_height, geometry.network_width, 8), dtype=np.float32)
+        network[..., :3] = network[..., 3:6] = scaled_color(extended)
+        network[..., 6] = half(controls['normalized_style'])
+        network[..., 7] = half(controls['local_tone_strength'])
+        frame = Frame(rgb, small, geometry, torch.from_numpy(network).unsqueeze(0), None, None,
+                      controls, profile, settings, rendering)
         colour_tensor(frame, device)
         frame.motion_loss = zero
         frames.append(frame)
@@ -135,10 +148,10 @@ def student_previous(frame, student):
 
 
 def student_inputs(frame, device, layout='BHWC'):
-    """Teacher channel layout: 0:3=0, 3=1, 4:7=RGB, 7:10=history, 10:15=controls, 15=0."""
+    """Eight channels: current RGB, confidence-mixed aligned history RGB, style and tone."""
+    if frame.inputs.shape[-1] != 8:
+        raise ValueError('Student inputs require an 8-channel Student frame')
     image = frame.inputs.to(device).clone()
-    image[..., :3] = 0
-    image[..., 15] = 0
     if frame.history is not None:
         current = colour_tensor(frame, device)
         memory = current + torch.as_tensor(frame.confidence, device=device) * (torch.as_tensor(frame.history, device=device) - current)
@@ -147,7 +160,7 @@ def student_inputs(frame, device, layout='BHWC'):
         rows = torch.as_tensor(g.source_rows(), device=device, dtype=torch.long)
         columns = torch.as_tensor(g.source_columns(), device=device, dtype=torch.long)
         sampled = memory[:, :, rows[:, None], columns[None, :]].permute(0, 2, 3, 1)
-        image[..., 7:10] = half_ste(half_ste(half_ste(sampled) - .5) * .125)
+        image[..., 3:6] = half_ste(half_ste(half_ste(sampled) - .5) * .125)
     return image if layout == 'BHWC' else image.permute(0, 3, 1, 2).contiguous()
 
 

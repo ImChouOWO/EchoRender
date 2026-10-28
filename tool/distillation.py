@@ -191,11 +191,8 @@ def train_batch(teacher, student, criterion, batch, optimizer, *, config, crop_s
                 buckets = defaultdict(list)
                 for i, frame in enumerate(frames):
                     buckets[tuple(frame.inputs.shape)].append(i)
-                    offset, index = prepared[i]
-                    # Training motion previously paired clean prior RGB with the current variant.
-                    previous_student[offset] = (previous[offset] if student.motion_mode == 'raw' else
-                        torch.as_tensor(previous[offset].copy(), device=device) if index in plan else
-                        student_previous(frame, student))
+                    offset, _ = prepared[i]
+                    previous_student[offset] = student_previous(frame, student)
                 for indices in buckets.values():
                     image = torch.cat([student_inputs(frames[i], device, student.layout) for i in indices])
                     head, features = student(image, return_features=True)
@@ -334,7 +331,8 @@ def evaluate(teacher, student, criterion, loader, metrics, monitor, *, config, e
                     benchmark = {f'student_{k}': v for k, v in measure_forward(student,
                         inputs, warmup=timing['warmup'], repeats=timing['repeats']).items()}
                     benchmark.update(target_cache.benchmark or {} if target_cache else
-                        {f'teacher_{k}': v for k, v in measure_forward(teacher, frame.inputs.to(device),
+                        {f'teacher_{k}': v for k, v in measure_forward(teacher,
+                         make_frame(sample, position, config, teacher_history, rgb=rgb).inputs.to(device),
                          warmup=timing['warmup'], repeats=timing['repeats']).items()})
                     benchmark.update(device=str(device), profile=sample['profile'],
                         scope='synchronized backbone forward only, batch=1; motion and preprocessing excluded',

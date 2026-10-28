@@ -26,7 +26,7 @@ Teacher 使用已解包、`fully_logical=true` 的 logical safetensors，透過�
 
 ### 模型結構
 
-由 [config/model.yaml](config/model.yaml) 定義。外部仍提供 `[0,1]` RGB；前處理組成與 Teacher 相同布局的 `input_channels: 16`。0～2 與 15 通道固定為 0，3 固定為 1，4～6 為當前 RGB，7～9 為對齊的 Student 歷史 RGB（首幀用當前 RGB），10～14 為 style／tone／structure 控制。移除獨立控制向量、FiLM 與歷史投影介面；強度、色彩／細節倍率與半徑仍由輸出合成處理。`config/model.yaml` 的 `motion: raw` 使用外部 Farneback 從前後 RGB 計算光流；`motion: feat` 使用獨立的 6→32→64 通道編碼器及 64→32→3 解碼器，預測兩維位移與可信度，不與其他 stage 跳接。位移從零開始，以 Sintel 光流監督及可微分 RGB 對齊共同訓練，權重由 `loss.motion: 0.01` 定義。兩種 Student 模式在推論時都不需要資料集光流；首幀與場景切換會重置歷史。Teacher 訓練／驗證快取仍使用 Sintel 真實光流，無真實光流的 test 目標改用 RGB 估計，須與真實光流參考區分。Teacher 維持 16 通道前處理、四通道 head 與 E1／E2／E3／ViT 蒸餾目標；兩路使用相同的鏡像 padding。目前 checkpoint 格式為 `echorender-bhwc16-motion-v4`；舊 Student 權重須重新訓練，舊單張 Teacher 快取不會沿用。以下為目前 Student 的通道與深度，不是 Teacher block 編號。
+由 [config/model.yaml](config/model.yaml) 定義。外部提供 `[0,1]` RGB；前處理直接建立 `input_channels: 8`：0～2 為當前 RGB、3～5 為依可信度混合的對齊 Student 歷史 RGB、6 為正規化 style、7 為解析後的 tone。首幀兩組 RGB 都使用當前影像。Student 移除固定噪聲、常數與 structure 控制通道；structure／skin／auto 保留為固定 Teacher 目標設定，改變時須重新產生目標並訓練。`tone: null` 在 standard／natural／cinematic 解析為 1，neutral 為 0，因此能區分同為 style 2 的 cinematic 與 neutral。`motion: raw` 從前後 RGB 以外部 Farneback 估計光流；`motion: feat` 保留獨立的 6→32→64 編碼器及 64→32→3 解碼器，預測位移與可信度，輸出層零初始化，不與主幹跳接。兩種模式均在輸入層前對齊 Student 自己的歷史，部署不需要資料集光流。Teacher 維持 16 通道、四通道 head 與 E1／E2／E3／ViT 蒸餾層，符合設定的既有時序快取可繼續使用。目前 checkpoint 格式為 `echorender-bhwc8-motion-v5`；不支援舊 16 通道 Student 權重，須重新訓練。以下為目前 Student 的通道與深度，不是 Teacher block 編號。
 
 | Stage | 模組 | 通道 | Blocks |
 |---|---|---:|---:|
@@ -236,7 +236,7 @@ uv run --locked python train.py --config config/train.yaml --resume output/test/
 
 從下一個 epoch 恢復 Student、蒸餾 adapters、SGD、global step、cosine 總步數、增強與 loader 的隨機狀態、歷史指標、最佳權重選擇與早停計數。請保留同目錄的 `best.pt` 與 `metrics.jsonl`；資料、模型、loss 與排程等核心設定須相同，`epochs` 仍代表原訂總數。既有同格式 checkpoint 可恢復進度與 optimizer，但缺少隨機狀態時會明確提示，後續抽樣無法完全重現。輸出鎖防止兩個程序同時寫入。`model.student_weights` 仍只載入權重，不能與 `--resume` 同用。
 
-Student 歷史與 feat 的 RGB pair 保留在指定設備；相同尺寸的 feat pair 合併運算，網路、warp 與逐張 loss 計算不變。訓練先抽取增強雜訊，再將相近長度 clips 分組，保留原抽樣前綴、影像與逐 clip 平均 loss 權重。快取目標由兩條 CPU 讀取執行緒預取，上限為兩倍 micro batch（至少兩個檔案）及 256 MiB，單一超大檔案可超過容量上限；之後以 pinned memory 非同步傳送至指定 GPU。Teacher 目標與蒸餾層不變。
+Student 歷史與 feat 的 RGB pair 保留在指定設備；光流配對使用實際送入 Student 的前後 RGB，包含已套用的增強，對齊的歷史則為 Student 自己經 detach 的後處理前預測。相同尺寸的 feat pair 合併運算，網路、warp 與逐張 loss 計算不變。訓練先抽取增強雜訊，再將相近長度 clips 分組，保留原抽樣前綴、影像與逐 clip 平均 loss 權重。快取目標由兩條 CPU 讀取執行緒預取，上限為兩倍 micro batch（至少兩個檔案）及 256 MiB，單一超大檔案可超過容量上限；之後以 pinned memory 非同步傳送至指定 GPU。Teacher 目標與蒸餾層不變。
 
 `best.pt` 成功存檔後，終端會以粗體亮黃色顯示 `[Best]` 與各指標改善比例；重新導向的 log 保持純文字，設定 `NO_COLOR` 可停用顏色。
 

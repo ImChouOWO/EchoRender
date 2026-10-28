@@ -230,7 +230,7 @@ def export_predictions(checkpoint, teacher_factory, loaders, config, directory, 
     directory.mkdir(parents=True, exist_ok=True)
     payload = torch.load(checkpoint, map_location='cpu', weights_only=True)
     if payload.get('format') != FORMAT:
-        raise ValueError('Expected a current BHWC16 motion checkpoint; retraining is required')
+        raise ValueError(f'Expected a {FORMAT} checkpoint; retraining is required')
     config = dict(config, rendering=payload['train_config']['rendering'])
     blend_scale = payload['teacher_blend_scale']
     manifest = {'status': 'running', 'checkpoint': str(checkpoint), 'checkpoint_epoch': payload['epoch'],

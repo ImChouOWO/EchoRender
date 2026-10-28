@@ -1,11 +1,11 @@
-# Single-image distillation Student; not numerically equivalent to the NVIDIA Teacher.
+# RGB sequence distillation Student; not numerically equivalent to the NVIDIA Teacher.
 # Each row: [from, repeats, module, args]. -1 means the previous layer.
 # Comment indices identify DAG layers, not individual blocks.
 # Swin: [channels, depth, heads, window, ffn_ratio].
 # ViT: [channels, depth, heads, ffn_ratio].
 # SSM: [channels, depth, state_dim, d_conv, expand].
 # Upsample output channels must match the skip connection used by Add.
-input_channels: 16  # Teacher layout; preprocessing accepts RGB and fills auxiliary channels
+input_channels: 8  # current RGB (0:3), aligned history RGB (3:6), style (6), tone (7)
 motion: feat  # raw: external RGB optical flow; feat: trainable parallel RGB-pair branch
 output_channels: 4
 input_layout: BHWC
@@ -13,7 +13,7 @@ ssm:
   rotation: clockwise  # clockwise or counterclockwise
   directions: 2       # 1-4 directions per block; each stage starts scanning right
 backbone:
-  - [-1, 1, InputAdapter, [32]]             # 0: input projection, prepared 16 -> 32
+  - [-1, 1, InputAdapter, [32]]             # 0: input projection, prepared 8 -> 32
   - [-1, 1, SwinStage, [32, 2, 1, 8, 4]]   # 1: E0, 2 blocks, skip -> 25
   - [-1, 1, Downsample, [32]]               # 2: downsample to E1
   - [-1, 1, SSMStage, [32, 2, 16, 4, 2]]   # 3: E1, 2 blocks, distillation features, skip -> 22

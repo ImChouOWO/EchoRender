@@ -21,6 +21,7 @@ from tool.prediction_report import export_predictions
 from tool.reporting import (DIRECTIONS, validation_values, metric_statistics,
                             print_statistics, write_training_report)
 from tool.trainer import json_safe, release_cuda
+from tool.temporal import FORMAT
 from tool.training_config import DEFAULT_TRAIN_CONFIG, PROJECT_ROOT, LOSS_WEIGHTS, load_training_config, reserve_output_dir, selected_data_config
 
 
@@ -181,8 +182,8 @@ def main(argv=None):
         weights = args.weights.expanduser().resolve()
         payload = torch.load(weights, map_location='cpu', weights_only=True)
         required = {'student', 'student_config', 'distillation', 'train_config', 'epoch', 'teacher_blend_scale'}
-        if not isinstance(payload, dict) or payload.get('format') != 'echorender-bhwc16-motion-v4' or not required <= payload.keys():
-            raise ValueError('Expected a complete echorender-bhwc16-motion-v4 training checkpoint')
+        if not isinstance(payload, dict) or payload.get('format') != FORMAT or not required <= payload.keys():
+            raise ValueError(f'Expected a complete {FORMAT} training checkpoint; retraining is required')
         # Score with the checkpoint's objective; compare inputs using the current augmentation settings.
         config['rendering'] = deepcopy(payload['train_config']['rendering'])
         config['training']['profiles'] = list(config['rendering']['profiles'])

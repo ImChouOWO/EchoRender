@@ -104,35 +104,71 @@ class TemporalTests(unittest.TestCase):
     def criterion(self):
         return DistillationLoss(self.config['loss'], channels=dict.fromkeys(('e1', 'e2', 'e3', 'vit'), 4))
 
-    def test_student_input_layout_matches_teacher_and_zeros_unused_channels(self):
+    def test_student_input_keeps_rgb_history_style_tone_and_rejects_teacher_layout(self):
         student = tiny_model().eval()
         rgb = crop_rgb(sample()['images'][0], 0)
         outputs, inputs = [], []
         for profile in self.config['rendering']['profiles']:
-            frame = prepare_frame(rgb, self.config, profile)
+            teacher_frame = prepare_frame(rgb, self.config, profile)
+            with patch('tool.temporal.make_features', side_effect=AssertionError('Teacher preprocessing used by Student')):
+                frame = prepare_student_frame(rgb, self.config, profile, student)
             x = student_inputs(frame, 'cpu')
-            self.assertEqual(x.shape[-1], 16)
-            self.assertEqual(float(x[..., :3].abs().sum()), 0)
-            self.assertEqual(float(x[..., 15].abs().sum()), 0)
-            self.assertTrue(torch.all(x[..., 3] == 1))
-            torch.testing.assert_close(x[..., 4:15], frame.inputs[..., 4:15], atol=0, rtol=0)
+            self.assertEqual(x.shape[-1], 8)
+            self.assertEqual(teacher_frame.inputs.shape[-1], 16)
+            torch.testing.assert_close(x, teacher_frame.inputs[..., 4:12], atol=0, rtol=0)
+            with self.assertRaisesRegex(ValueError, 'Student frame'):
+                student_inputs(teacher_frame, 'cpu')
             outputs.append(student(x))
             inputs.append(x)
         self.assertTrue(all(not torch.equal(inputs[0], value) for value in inputs[1:]))
         self.assertGreater(float((outputs[0] - outputs[-1]).detach().abs().max()), 1e-6)
         changed = x.clone()
-        changed[..., 7:10] += .01
+        changed[..., 3:6] += .01
         self.assertFalse(torch.equal(student(changed), outputs[-1]))
         self.assertFalse(any('control_layers' in key or 'history_projection' in key for key in student.state_dict()))
         with self.assertRaises(ValueError):
             student(torch.zeros(1, 32, 32, 3))
         with self.assertRaises(TypeError):
-            student(x, controls=torch.zeros(1, 16))
+            student(x, controls=torch.zeros(1, 8))
         bchw = deepcopy(student.config)
         bchw['input_layout'] = 'BCHW'
         other = type(student)(bchw).eval()
         other.load_state_dict(student.state_dict(), strict=True)
         torch.testing.assert_close(other(student_inputs(frame, 'cpu', 'BCHW')).permute(0, 2, 3, 1), outputs[-1])
+
+    def test_student_retained_channels_match_teacher_with_real_padding(self):
+        from teacher_infer import network_geometry
+        student = tiny_model('feat')
+        rgb = np.random.default_rng(3).random((37, 53, 3), dtype=np.float32)
+        with patch('tool.temporal.network_geometry', network_geometry):
+            for profile in self.config['rendering']['profiles']:
+                teacher = prepare_frame(rgb, self.config, profile)
+                frame = prepare_student_frame(rgb, self.config, profile, student)
+                x = student_inputs(frame, 'cpu')
+                self.assertEqual(tuple(x.shape), (1, 320, 320, 8))
+                torch.testing.assert_close(x, teacher.inputs[..., 4:12], atol=0, rtol=0)
+        cinematic = prepare_student_frame(rgb, self.config, 'cinematic', student)
+        neutral = prepare_student_frame(rgb, self.config, 'neutral', student)
+        torch.testing.assert_close(cinematic.inputs[..., :7], neutral.inputs[..., :7], atol=0, rtol=0)
+        self.assertTrue(torch.all(cinematic.inputs[..., 7] == 1))
+        self.assertTrue(torch.all(neutral.inputs[..., 7] == 0))
+
+    def test_predicted_flow_aligns_history_before_input_and_rejects_invalid_pixels(self):
+        from mlxdlss.features import scaled_color
+        student = tiny_model('feat')
+        rgb = np.full((32, 32, 3), .2, np.float32)
+        history = np.broadcast_to(np.arange(32, dtype=np.float32)[None, :, None] / 32, rgb.shape).copy()
+        field = torch.zeros(1, 2, 32, 32)
+        field[:, 0] = 1 / 32
+        logit = torch.full((1, 1, 32, 32), float(np.log(4)))
+        with patch.object(student.motion, 'forward', return_value=(field, logit)):
+            frame = prepare_student_frame(rgb, self.config, 'neutral', student, previous=rgb, history=history)
+        expected = rgb + .8 * (np.concatenate((history[:, 1:], history[:, -1:]), axis=1) - rgb)
+        expected[:, -1] = rgb[:, -1]
+        x = student_inputs(frame, 'cpu')
+        torch.testing.assert_close(x[0, ..., :3], torch.from_numpy(scaled_color(rgb)), atol=0, rtol=0)
+        torch.testing.assert_close(x[0, ..., 3:6], torch.from_numpy(scaled_color(expected)), atol=0, rtol=0)
+        self.assertGreater(float((x[..., :3] - x[..., 3:6]).abs().sum()), 0)
 
     def test_selected_profiles_and_early_stopping_config_are_validated(self):
         import yaml
@@ -344,14 +380,14 @@ class TemporalTests(unittest.TestCase):
             restored = type(student)(payload['student_config']).eval()
             load_student_state(restored, path)
             self.assertEqual(restored.motion_mode, 'feat')
-            self.assertEqual(restored.input_channels, 16)
+            self.assertEqual(restored.input_channels, 8)
             torch.testing.assert_close(restored(inputs), expected, atol=0, rtol=0)
-            payload['format'] = 'echorender-rgb-temporal-v3'
+            payload['format'] = 'echorender-bhwc16-motion-v4'
             torch.save(payload, path)
             with self.assertRaises(ValueError):
                 load_student_state(restored, path)
         retired = deepcopy(student.config)
-        retired['input_channels'] = 3
+        retired['input_channels'] = 16
         with self.assertRaises(ValueError):
             type(student)(retired)
 
@@ -532,14 +568,14 @@ class TemporalTests(unittest.TestCase):
             finally:
                 cache.close(delete=False)
 
-    def test_forward_benchmark_receives_prepared_16_channels(self):
+    def test_forward_benchmark_uses_8_student_and_16_teacher_channels(self):
         self.config['benchmark'].update(enabled=True, warmup=0, repeats=1)
         result = evaluate(FixtureTeacher(), tiny_model(), self.criterion(),
             [{'sequences': [sample(frames=1)]}], Metrics(), Monitor(), config=self.config, epoch=1,
             controls={'loss_weights': self.config['loss']}, blend_scale=.5)
         self.assertGreater(result['benchmark']['teacher_latency_ms'], 0)
         self.assertGreater(result['benchmark']['student_latency_ms'], 0)
-        self.assertEqual(result['benchmark']['student_input_shape'][-1], 16)
+        self.assertEqual(result['benchmark']['student_input_shape'][-1], 8)
 
     def test_cache_groups_frame_payloads_and_rejects_old_signature(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -577,8 +613,13 @@ class TemporalTests(unittest.TestCase):
         disabled = deepcopy(self.config)
         disabled['rendering']['history_strength'] = 0
         self.assertIsNone(make_frame(s, 1, disabled, target['history']).history)
-        x = student_inputs(second, 'cpu')
-        torch.testing.assert_close(x[..., 4:7], x[..., 7:10], atol=0, rtol=0)
+        student = tiny_model('feat')
+        current = crop_rgb(s['images'][1], 0)
+        frame = prepare_student_frame(current, self.config, 'neutral', student,
+            previous=current, history=target['history'])
+        frame.confidence = torch.zeros_like(frame.confidence)
+        x = student_inputs(frame, 'cpu')
+        torch.testing.assert_close(x[..., :3], x[..., 3:6], atol=0, rtol=0)
 
     def test_loader_orders_consecutive_clips_and_expands_four_profiles(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -774,7 +815,7 @@ class TemporalTests(unittest.TestCase):
                 self.assertIn('avg infer', grid['title'])
                 self.assertTrue((root / 'report' / grid['path']).is_file())
             rows = [json.loads(line) for line in (root / 'report/predictions.jsonl').read_text().splitlines()]
-            self.assertTrue(all(r['model_input_shape'][-1] == 16 for r in rows))
+            self.assertTrue(all(r['model_input_shape'][-1] == (8 if r['model'] == 'student' else 16) for r in rows))
 
 
 if __name__ == '__main__':

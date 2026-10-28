@@ -11,6 +11,7 @@ from model.card.mamba import MambaStage
 from .distillation import train_batch, evaluate, module_digest, StudentAugmentation
 from .training_config import TrainingSchedule, PROJECT_ROOT
 from .teacher_features import TeacherFeatureCache
+from .temporal import FORMAT
 from .progress import progress_bar, progress_row, network_size, profile_row, highlight_best
 from .reporting import (validation_values, is_better, best_message, metric_statistics,
                         print_statistics, write_training_report, EarlyStopping)
@@ -34,10 +35,10 @@ def json_safe(value):
 
 def load_student_state(student, path):
     payload = torch.load(path, map_location='cpu', weights_only=True)
-    if not isinstance(payload, dict) or payload.get('format') != 'echorender-bhwc16-motion-v4':
-        raise ValueError('Expected an echorender-bhwc16-motion-v4 checkpoint; legacy checkpoints are unsupported')
-    if payload['student_config'].get('input_channels') != 16:
-        raise ValueError('Student checkpoint requires the current prepared 16-channel layout; retraining is required')
+    if not isinstance(payload, dict) or payload.get('format') != FORMAT:
+        raise ValueError(f'Expected a {FORMAT} checkpoint; retraining is required')
+    if payload['student_config']['input_channels'] != 8:
+        raise ValueError('Student checkpoint requires the prepared 8-channel layout')
     student.load_state_dict(payload['student'], strict=True)
 
 
@@ -47,7 +48,7 @@ def save_checkpoint(path, student, criterion, optimizer, *, epoch, step, config,
     checkpoint_config['rendering']['profiles'] = {name: config['rendering']['profiles'][name]
         for name in config['training']['profiles']}
     payload = {
-        'format': 'echorender-bhwc16-motion-v4', 'student': student.state_dict(),
+        'format': FORMAT, 'student': student.state_dict(),
         'distillation': criterion.state_dict(), 'optimizer': optimizer.state_dict(),
         'student_config': student.config, 'train_config': checkpoint_config,
         'epoch': epoch, 'global_step': step, 'schedule_controls': controls,

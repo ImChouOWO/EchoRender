@@ -19,7 +19,7 @@ class Model(nn.Module):
         if not isinstance(cfg, dict):
             raise ValueError('Model config must be a mapping')
         self.config = cfg
-        self.input_channels = int(cfg.get('input_channels', 16))
+        self.input_channels = int(cfg['input_channels'])
         self.layout = cfg.get('input_layout', 'BHWC')
         if self.input_channels < 1 or self.layout not in ('BHWC', 'BCHW'):
             raise ValueError('Invalid input channels or layout')

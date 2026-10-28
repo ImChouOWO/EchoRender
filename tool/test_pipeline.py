@@ -116,6 +116,42 @@ class PipelineTests(unittest.TestCase):
         old_waves = sum(max(lengths[i:i + 2]) for i in range(0, len(samples), 2))
         self.assertLessEqual(sum(max(lengths[i] for i in group) for group in groups), old_waves)
 
+    def test_training_uses_actual_augmented_prior_rgb_and_own_detached_history(self):
+        from . import distillation
+        config = deepcopy(self.config)
+        config['rendering']['train_min_frames'] = 2
+        student, criterion = tiny_model('feat'), self.criterion()
+        optimizer = torch.optim.SGD([*student.parameters(), *criterion.parameters()], lr=.001)
+        samples = [sample(frames=2, name=str(i)) for i in range(4)]
+        augmentation = StudentAugmentation(config)
+        requests, stored = [], []
+        def prepare(items, *args):
+            requests.append(items)
+            return prepare_student_frames(items, *args)
+        original = distillation.objective
+        def objective(*args, **kwargs):
+            result = original(*args, **kwargs)
+            stored.append(result[-1])
+            return result
+        controls = TrainingSchedule(config, total_steps=2).values(epoch=1, step=0)
+        with patch.object(augmentation, 'plan', return_value={0: 'brightness'}), \
+             patch.object(distillation, 'prepare_student_frames', side_effect=prepare), \
+             patch.object(distillation, 'objective', side_effect=objective):
+            result = train_batch(FixtureTeacher(), student, criterion, {'sequences': samples}, optimizer,
+                config=config, crop_size=0, controls=controls, augmentation=augmentation,
+                augmentation_ratio=.25, blend_scale=.5, micro_batch_size=4)
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(result['clip_lengths'], [2] * 4)
+        clean = crop_rgb(samples[0]['images'][0], 0)
+        self.assertGreater(float(np.abs(requests[0][0]['rgb'] - clean).mean()), .02)
+        for index in range(4):
+            before = requests[1][index]['previous']
+            torch.testing.assert_close(before, torch.from_numpy(requests[0][index]['rgb']), atol=0, rtol=0)
+            self.assertIs(requests[1][index]['history'], stored[index])
+            self.assertFalse(stored[index].requires_grad)
+        for index in range(1, 4):
+            np.testing.assert_array_equal(requests[0][index]['rgb'], crop_rgb(samples[index]['images'][0], 0))
+
     def test_prefetch_preserves_identity_bounds_and_load_failures(self):
         with tempfile.TemporaryDirectory() as directory:
             cache = TeacherFeatureCache(Path(directory) / 'feats')
