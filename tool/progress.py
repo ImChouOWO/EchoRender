@@ -21,6 +21,19 @@ def progress_row(epoch, epochs, device, monitor, values):
     return ''.join(f'{str(value):>11}' for value in fields)
 
 
+def profile_row(profile, scores):
+    return (f'[Profile]: {profile:<9} | PSNR={scores["psnr"]:>7.3f} | '
+            f'SSIM={scores["ssim"]:>6.4f} | LPIPS={scores["lpips"]:>6.4f}')
+
+
+def highlight_best(message):
+    import os
+    import sys
+    if sys.stdout.isatty() and 'NO_COLOR' not in os.environ:
+        return f'\033[1;93m{message}\033[0m'
+    return message
+
+
 def network_size(image, crop_size, rendering):
     from teacher_infer import network_geometry, render_extent
     h, w = [min(crop_size, size) if crop_size else size for size in image.shape[-2:]]

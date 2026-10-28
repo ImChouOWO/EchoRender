@@ -2,16 +2,18 @@
 import hashlib
 import math
 from collections import defaultdict
+from contextlib import nullcontext
 
 import numpy as np
 import torch
 from torchvision.transforms import functional as TF
 from mlxdlss.temporal import sample_history
 
-from .temporal import (prepare_student_frame, prepare_frame, crop_rgb, frame_guides, reset_history, student_inputs,
+from .temporal import (prepare_student_frame, prepare_student_frames, student_previous, prepare_frame, crop_rgb, frame_guides, reset_history, student_inputs,
                        teacher_target, device_target, compose_tensor)
 from .progress import progress_bar, progress_row
 from .monitoring import measure_forward
+from .teacher_features import TargetPrefetch
 
 
 def augment_rgb(rgb, mode, ratio, *, noise_std, generator, add_noise=False):
@@ -103,12 +105,41 @@ def objective(student, criterion, frame, target, blend_scale, loss_weights, *, h
     if head.shape != target_head.shape:
         raise RuntimeError('Student and Teacher head geometry differs')
     loss, parts = criterion(head, target_head, features, target_features, prediction, target_rgb,
-        image_hw=frame.small.shape[:2], network_hw=frame.inputs.shape[1:3], weights=loss_weights)
+        image_hw=frame.small.shape[:2], network_hw=frame.inputs.shape[1:3], weights=loss_weights, tensor_terms=True)
     if frame.motion_loss is not None:
         weighted = loss_weights['motion'] * frame.motion_loss
         loss = loss + weighted
-        parts.update(motion=frame.motion_loss.detach().item(), weighted_motion=weighted.detach().item(), total=loss.detach().item())
+        parts.update(motion=frame.motion_loss.detach(), weighted_motion=weighted.detach(), total=loss.detach())
     return loss, parts, prediction, target_rgb, history
+
+
+def scalar_parts(rows):
+    """One host transfer for detached per-image diagnostics; loss formulas stay per-image."""
+    if not rows:
+        return []
+    keys = list(rows[0])
+    values = torch.stack([row[key] for row in rows for key in keys]).reshape(len(rows), len(keys)).cpu().tolist()
+    if not all(math.isfinite(value) for row in values for value in row):
+        raise RuntimeError('Non-finite loss component')
+    return [dict(zip(keys, row)) for row in values]
+
+
+def clip_groups(lengths, maximum):
+    order = sorted(range(len(lengths)), key=lambda index: lengths[index], reverse=True)
+    return [order[begin:begin + maximum] for begin in range(0, len(order), maximum)]
+
+
+def batch_augmentation(samples, lengths, plan, augmentation, ratio, crop_size, maximum):
+    # Draw noise in the original sample/time order before regrouping clips.
+    images = {}
+    for begin in range(0, len(samples), maximum):
+        indices = list(range(begin, min(begin + maximum, len(samples))))
+        for position in range(max(lengths[index] for index in indices)):
+            for index in indices:
+                if index in plan and position < lengths[index]:
+                    rgb = crop_rgb(samples[index]['images'][position], crop_size)
+                    images[index, position] = augmentation.apply_rgb(rgb, plan[index], ratio)
+    return images
 
 
 def train_batch(teacher, student, criterion, batch, optimizer, *, config, crop_size, controls,
@@ -120,70 +151,82 @@ def train_batch(teacher, student, criterion, batch, optimizer, *, config, crop_s
     count = len(samples)
     if not count:
         raise ValueError('Empty sequence batch')
-    totals, sizes = defaultdict(float), []
+    totals, names, sizes = None, None, []
     lengths = [torch.randint(min(config['rendering']['train_min_frames'], len(s['images'])),
                len(s['images']) + 1, (), generator=augmentation.generator).item()
                if augmentation else len(s['images']) for s in samples]
     plan = augmentation.plan(count, augmentation_ratio, lengths) if augmentation else {}
+    augmented = batch_augmentation(samples, lengths, plan, augmentation, augmentation_ratio, crop_size, micro_batch_size)
+    groups = clip_groups(lengths, micro_batch_size)
     device = next(student.parameters()).device
-    for begin in range(0, count, micro_batch_size):
-        group = samples[begin:begin + micro_batch_size]
-        histories, teacher_histories, previous = [None] * len(group), [None] * len(group), [None] * len(group)
-        previous_student = [None] * len(group)
-        for position in range(max(lengths[begin:begin + len(group)])):
-            prepared, targets = [], []
-            for offset, sample in enumerate(group):
-                index = begin + offset
-                if position >= lengths[index]:
-                    continue
-                rgb = crop_rgb(sample['images'][position], crop_size)
-                if reset_history(previous[offset], rgb, config):
-                    histories[offset] = teacher_histories[offset] = previous_student[offset] = None
-                clean = make_frame(sample, position, config, teacher_histories[offset], rgb=rgb)
-                target = target_cache.load_payload('train', cache_key(sample, position)) if target_cache else teacher_target(teacher, clean)
-                teacher_histories[offset] = target['history'] if config['rendering']['temporal'] else None
-                student_rgb = augmentation.apply_rgb(rgb, plan[index], augmentation_ratio) if index in plan else rgb
-                motion, confidence = frame_guides(sample, position, crop_size)
-                frame = prepare_student_frame(student_rgb, config, sample['profile'], student,
-                    previous=previous_student[offset], history=histories[offset], motion=motion, confidence=confidence)
-                previous_student[offset] = student_rgb
-                prepared.append((offset, index, frame))
-                targets.append(target)
-                previous[offset] = rgb
-            # Ragged extents are grouped without resizing away source geometry.
-            buckets = defaultdict(list)
-            for i, (_, _, frame) in enumerate(prepared):
-                buckets[tuple(frame.inputs.shape)].append(i)
-            for indices in buckets.values():
-                arguments = [student_inputs(prepared[i][2], device, student.layout) for i in indices]
-                image = torch.cat(arguments)
-                head, features = student(image, return_features=True)
-                if student.layout == 'BCHW':
-                    head = head.permute(0, 2, 3, 1).contiguous()
-                combined = None
-                for row, i in enumerate(indices):
-                    offset, index, frame = prepared[i]
-                    loss, parts, prediction, target_rgb, history = objective(student, criterion, frame, targets[i],
-                        blend_scale, controls['loss_weights'], head=head[row:row + 1],
-                        features={k: v[row:row + 1] for k, v in features.items()})
-                    weight = 1 / (count * lengths[index])
-                    combined = loss * weight if combined is None else combined + loss * weight
-                    for key, value in parts.items():
-                        totals[key] += value * weight
-                    histories[offset] = history if config['rendering']['temporal'] else None
-                    del loss, prediction, target_rgb
-                # Detach RGB history at every frame: activation memory does not grow with clip length.
-                combined.backward()
-                sizes.append(len(indices))
-                del combined, head, features, arguments, image
+    keys = [cache_key(samples[index], position) for group in groups
+            for position in range(max(lengths[index] for index in group)) for index in group if position < lengths[index]]
+    prefetch = TargetPrefetch(target_cache, 'train', keys, device, count=max(2, micro_batch_size * 2)) if target_cache else nullcontext(None)
+    with prefetch as targets_ready:
+        for group in groups:
+            histories, teacher_histories, previous = [None] * len(group), [None] * len(group), [None] * len(group)
+            previous_student = [None] * len(group)
+            for position in range(max(lengths[index] for index in group)):
+                prepared, targets, requests = [], [], []
+                for offset, index in enumerate(group):
+                    sample = samples[index]
+                    if position >= lengths[index]:
+                        continue
+                    rgb = crop_rgb(sample['images'][position], crop_size)
+                    if reset_history(previous[offset], rgb, config):
+                        histories[offset] = teacher_histories[offset] = previous_student[offset] = None
+                    if targets_ready is not None:
+                        target = targets_ready.get(cache_key(sample, position))
+                    else:
+                        clean = make_frame(sample, position, config, teacher_histories[offset], rgb=rgb)
+                        target = teacher_target(teacher, clean)
+                        teacher_histories[offset] = target['history'] if config['rendering']['temporal'] else None
+                    motion, confidence = frame_guides(sample, position, crop_size)
+                    requests.append(dict(rgb=augmented.get((index, position), rgb), profile=sample['profile'],
+                        previous=previous_student[offset], history=histories[offset], motion=motion, confidence=confidence))
+                    prepared.append((offset, index))
+                    targets.append(target)
+                    previous[offset] = rgb
+                frames = prepare_student_frames(requests, config, student)
+                buckets = defaultdict(list)
+                for i, frame in enumerate(frames):
+                    buckets[tuple(frame.inputs.shape)].append(i)
+                    offset, index = prepared[i]
+                    # Training motion previously paired clean prior RGB with the current variant.
+                    previous_student[offset] = (previous[offset] if student.motion_mode == 'raw' else
+                        torch.as_tensor(previous[offset].copy(), device=device) if index in plan else
+                        student_previous(frame, student))
+                for indices in buckets.values():
+                    image = torch.cat([student_inputs(frames[i], device, student.layout) for i in indices])
+                    head, features = student(image, return_features=True)
+                    if student.layout == 'BCHW':
+                        head = head.permute(0, 2, 3, 1).contiguous()
+                    combined = None
+                    for row, i in enumerate(indices):
+                        offset, index = prepared[i]
+                        loss, parts, prediction, target_rgb, history = objective(student, criterion, frames[i], targets[i],
+                            blend_scale, controls['loss_weights'], head=head[row:row + 1],
+                            features={k: v[row:row + 1] for k, v in features.items()})
+                        weight = 1 / (count * lengths[index])
+                        combined = loss * weight if combined is None else combined + loss * weight
+                        names = names or list(parts)
+                        values = torch.stack([parts[name] for name in names]).double() * weight
+                        totals = values if totals is None else totals + values
+                        histories[offset] = history if config['rendering']['temporal'] else None
+                        del loss, prediction, target_rgb
+                    # RGB history is detached per frame; no gradient graph crosses time steps.
+                    combined.backward()
+                    sizes.append(len(indices))
+                    del combined, head, features, image
     parameters = [p for group in optimizer.param_groups for p in group['params'] if p.requires_grad]
     if any(p.grad is None for p in parameters):
         raise RuntimeError('A trainable Student/adapter parameter has no gradient')
     norm = torch.nn.utils.clip_grad_norm_(parameters, controls['grad_clip'] or float('inf'), error_if_nonfinite=True).item()
     optimizer.step()
-    if any(not torch.isfinite(p).all() for p in parameters):
+    if not torch.stack([torch.isfinite(p).all() for p in parameters]).all().item():
         raise RuntimeError('Non-finite optimizer update')
-    return {'loss': totals['total'], 'components': dict(totals), 'gradient_norm': norm,
+    components = scalar_parts([dict(zip(names, totals.unbind()))])[0]
+    return {'loss': components['total'], 'components': components, 'gradient_norm': norm,
         'batch_size': count, 'frames': sum(lengths), 'clip_lengths': lengths, 'micro_batch_sizes': sizes,
         'sample_ids': [s['clip_id'] for s in samples], 'profiles': [s['profile'] for s in samples],
         'augmented_samples': len(plan), 'augmentation_fraction': len(plan) / count,
@@ -215,46 +258,57 @@ def validation_forward(student, criterion, jobs, blend_scale, loss_weights, maxi
 
 def validation_items(teacher, student, criterion, samples, metrics, config, controls, target_cache, blend_scale):
     maximum = config['training']['micro_batch_size']
-    for begin in range(0, len(samples), maximum):
-        group = samples[begin:begin + maximum]
-        states = [dict(history=None, teacher_history=None, previous=None, previous_output=None,
-                       previous_single=None, depth=0) for _ in group]
-        for position in range(max(len(sample['images']) for sample in group)):
-            entries, jobs = [], []
-            for sample, state in zip(group, states):
-                if position >= len(sample['images']):
-                    continue
-                rgb = crop_rgb(sample['images'][position], config['training']['crop_size'])
-                if reset_history(state['previous'], rgb, config):
-                    state.update(history=None, teacher_history=None, previous_output=None, previous_single=None, depth=0)
-                if target_cache is not None:
-                    target = target_cache.load_payload('val', cache_key(sample, position))
-                else:
-                    clean = make_frame(sample, position, config, state['teacher_history'], rgb=rgb)
-                    target = teacher_target(teacher, clean)
-                motion, confidence = frame_guides(sample, position, config['training']['crop_size'])
-                frame = prepare_student_frame(rgb, config, sample['profile'], student, previous=state['previous'],
-                    history=state['history'], motion=motion, confidence=confidence)
-                main = len(jobs)
-                jobs.append((frame, target))
-                single = main
-                if frame.history is not None:
-                    single = len(jobs)
-                    jobs.append((prepare_student_frame(rgb, config, sample['profile'], student), target))
-                entries.append((sample, state, rgb, frame, target, main, single))
-            results = validation_forward(student, criterion, jobs, blend_scale, controls['loss_weights'], maximum)
-            quality, buckets = {}, defaultdict(list)
-            for index, result in enumerate(results):
-                buckets[tuple(result[2].shape)].append(index)
-            for indices in buckets.values():
-                for offset in range(0, len(indices), maximum):
-                    selected = indices[offset:offset + maximum]
-                    predictions = torch.cat([results[i][2] for i in selected])
-                    references = torch.cat([results[i][3] for i in selected])
-                    values = metrics.per_image(predictions, references)
-                    quality.update(zip(selected, values))
-            for sample, state, rgb, frame, target, main, single in entries:
-                yield sample, position, state, rgb, frame, target, results[main], results[single], quality[main], quality[single]
+    groups = [samples[begin:begin + maximum] for begin in range(0, len(samples), maximum)]
+    keys = [cache_key(sample, position) for group in groups
+            for position in range(max(len(item['images']) for item in group)) for sample in group if position < len(sample['images'])]
+    device = next(student.parameters()).device
+    prefetch = TargetPrefetch(target_cache, 'val', keys, device, count=max(2, maximum * 2)) if target_cache else nullcontext(None)
+    with prefetch as targets_ready:
+        for group in groups:
+            states = [dict(history=None, teacher_history=None, previous=None, previous_student=None,
+                           previous_output=None, previous_single=None, depth=0) for _ in group]
+            for position in range(max(len(sample['images']) for sample in group)):
+                entries, jobs, requests = [], [], []
+                for sample, state in zip(group, states):
+                    if position >= len(sample['images']):
+                        continue
+                    rgb = crop_rgb(sample['images'][position], config['training']['crop_size'])
+                    if reset_history(state['previous'], rgb, config):
+                        state.update(history=None, teacher_history=None, previous_student=None,
+                                     previous_output=None, previous_single=None, depth=0)
+                    if targets_ready is not None:
+                        target = targets_ready.get(cache_key(sample, position))
+                    else:
+                        clean = make_frame(sample, position, config, state['teacher_history'], rgb=rgb)
+                        target = teacher_target(teacher, clean)
+                    motion, confidence = frame_guides(sample, position, config['training']['crop_size'])
+                    requests.append(dict(rgb=rgb, profile=sample['profile'], previous=state['previous_student'],
+                        history=state['history'], motion=motion, confidence=confidence))
+                    entries.append((sample, state, rgb, target))
+                frames = prepare_student_frames(requests, config, student)
+                indexed = []
+                for (sample, state, rgb, target), frame in zip(entries, frames):
+                    main = len(jobs)
+                    jobs.append((frame, target))
+                    single = main
+                    if frame.history is not None:
+                        single = len(jobs)
+                        jobs.append((prepare_student_frame(rgb, config, sample['profile'], student), target))
+                    indexed.append((sample, state, rgb, frame, target, main, single))
+                results = validation_forward(student, criterion, jobs, blend_scale, controls['loss_weights'], maximum)
+                diagnostics = scalar_parts([result[1] for result in results])
+                results = [(result[0], parts, *result[2:]) for result, parts in zip(results, diagnostics)]
+                quality, buckets = {}, defaultdict(list)
+                for index, result in enumerate(results):
+                    buckets[tuple(result[2].shape)].append(index)
+                for indices in buckets.values():
+                    for offset in range(0, len(indices), maximum):
+                        selected = indices[offset:offset + maximum]
+                        predictions = torch.cat([results[i][2] for i in selected])
+                        references = torch.cat([results[i][3] for i in selected])
+                        quality.update(zip(selected, metrics.per_image(predictions, references)))
+                for sample, state, rgb, frame, target, main, single in indexed:
+                    yield sample, position, state, rgb, frame, target, results[main], results[single], quality[main], quality[single]
 
 
 @torch.no_grad()
@@ -319,7 +373,8 @@ def evaluate(teacher, student, criterion, loader, metrics, monitor, *, config, e
                 images += 1
                 state.update(history=next_history if config['rendering']['temporal'] else None,
                     teacher_history=target['history'] if config['rendering']['temporal'] else None,
-                    previous=rgb, previous_output=previous_output, previous_single=previous_single,
+                    previous=rgb, previous_student=student_previous(frame, student),
+                    previous_output=previous_output, previous_single=previous_single,
                     depth=depth + 1 if frame.history is not None else 1)
                 del loss, prediction, target_rgb, single_prediction, target
             bar.set_description_str(progress_row(epoch, config['training']['epochs'], next(student.parameters()).device,

@@ -185,6 +185,77 @@ class FeatureRecordingBackend(NeuralRenderingModel):
         return output if index in (0, self.topology.post) or not publish else backend.e4m3_round_trip(output)
 
 
+def teacher_temporal_signature():
+    """Only Teacher preprocessing controls target identity; Student scheduling is independent."""
+    import hashlib, inspect
+    from . import temporal
+    code = '\n'.join(inspect.getsource(getattr(temporal, name)) for name in
+                     ('crop_rgb', 'prepare_frame', 'teacher_target', 'frame_guides', 'reset_history'))
+    signature = hashlib.sha256(code.encode()).hexdigest()
+    # Upgrade provenance for the current, numerically unchanged target pool without recapturing it.
+    previous = ('c0651fd6a8daea8c46aafb77cb558bdcdbf1d9bccea98774cea2288d51fba272'
+                if signature == 'aa88a5a513a76f83d1e33cf293330a4dd1fd664ee9aaaeaafdeb792834a4ebb3' else None)
+    return signature, previous
+
+
+class TargetPrefetch:
+    """Read only a bounded lookahead on CPU; pin/copy requested targets before Student forward."""
+    def __init__(self, cache, split, keys, device, *, count=8, byte_limit=256 * 2**20):
+        from collections import deque
+        from concurrent.futures import ThreadPoolExecutor
+        self.cache, self.split, self.device = cache, split, torch.device(device)
+        self.keys, self.pending = iter(keys), deque()
+        self.following, self.bytes, self.peak_bytes, self.loads = None, 0, 0, 0
+        self.count, self.byte_limit = count, byte_limit
+        self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='teacher-read')
+        try:
+            self.fill()
+        except BaseException:
+            self.close()
+            raise
+
+    def fill(self):
+        while len(self.pending) < self.count:
+            if self.following is None:
+                self.following = next(self.keys, None)
+            if self.following is None:
+                break
+            key = self.following
+            size = self.cache.path(self.split, key).stat().st_size if hasattr(self.cache, 'path') else 0
+            if self.pending and self.bytes + size > self.byte_limit:
+                break
+            self.pending.append((key, self.executor.submit(self.cache.load_payload, self.split, key), size))
+            self.bytes += size
+            self.peak_bytes = max(self.peak_bytes, self.bytes)
+            self.following = None
+
+    def get(self, key):
+        expected, future, size = self.pending.popleft()
+        if expected != key:
+            raise RuntimeError('Target prefetch order differs from the scheduled frame order')
+        payload = future.result()
+        self.bytes -= size
+        self.loads += 1
+        self.fill()
+        if self.device.type == 'cuda':
+            with torch.cuda.device(self.device):
+                def move(value):
+                    return value.pin_memory().to(self.device, non_blocking=True)
+                payload = {**payload, 'head': move(payload['head']), 'rgb': move(payload['rgb']),
+                           'features': {name: move(value) for name, value in payload['features'].items()}}
+        return payload
+
+    def close(self):
+        self.executor.shutdown(wait=True, cancel_futures=True)
+        self.pending.clear()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *error):
+        self.close()
+
+
 class TeacherFeatureCache:
     """Profile/clip/frame targets; exact signatures only, never reuse old image targets."""
     def __init__(self, directory, *, index_name='manifest.json', split_override=None):
@@ -241,18 +312,61 @@ class TeacherFeatureCache:
             'capture': hashlib.sha256(inspect.getsource(FeatureRecordingBackend).encode()).hexdigest()}
         if device.type == 'cuda':
             payload['gpu_uuid'] = str(torch.cuda.get_device_properties(device).uuid)
-        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+        signature, previous = teacher_temporal_signature()
+        payload['source']['tool.temporal'] = signature
+        alternate = {**payload, 'source': {**payload['source'], 'tool.temporal': previous}} if previous else None
+        fingerprint = self.configure_signatures(payload, alternate)
+        self.required = set()
+        for split, loader in (('train', train_loader), ('val', val_loader)):
+            for index in range(len(loader.dataset)):
+                item = loader.dataset.metadata(index)
+                for position, sample_id in enumerate(item['sample_ids'], 1):
+                    key = f"{item['profile']}:{item['clip_id']}:{position}:{sample_id}"
+                    self.required.add(self.path(split, key).relative_to(self.directory).as_posix())
+        return fingerprint
+
+    def configure_signatures(self, payload, alternate=None):
+        import hashlib, json
+        def digest(value):
+            return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+        fingerprint = digest(payload)
+        self.accepted_fingerprints = {fingerprint}
+        if alternate is not None:
+            self.accepted_fingerprints.add(digest(alternate))
+        self.profile_signatures, self.accepted_profiles = {}, {}
+        for profile, settings in payload['rendering']['profiles'].items():
+            rendering = {**payload['rendering'], 'profiles': {profile: settings}}
+            value = digest({**payload, 'rendering': rendering})
+            self.profile_signatures[profile] = value
+            self.accepted_profiles[profile] = {value}
+            if alternate is not None:
+                self.accepted_profiles[profile].add(digest({**alternate, 'rendering': rendering}))
+        return fingerprint
+
+    def compatible_files(self, manifest, fingerprint):
+        files = manifest.get('files', {})
+        if not manifest.get('profile_signatures') and manifest.get('fingerprint') in getattr(self, 'accepted_fingerprints', {fingerprint}):
+            return dict(files)
+        expected = getattr(self, 'profile_signatures', {})
+        recorded = manifest.get('profile_signatures', {})
+        return {name: size for name, size in files.items()
+                if name.split('/')[0] in expected and recorded.get(name.split('/')[0]) in getattr(self, 'accepted_profiles', {}).get(name.split('/')[0], {expected[name.split('/')[0]]})}
 
     def reuse(self, fingerprint):
         manifest = self.read_manifest()
         self.reason = 'new sequence/profile signature or incomplete extraction'
-        if manifest.get('fingerprint') != fingerprint or not manifest.get('complete'):
+        files = self.compatible_files(manifest, fingerprint)
+        required = getattr(self, 'required', set(files))
+        if not required or not required <= files.keys() or any(not self.valid_file(name, files[name]) for name in required):
+            self.reason = 'missing, changed or incomplete selected profile targets'
             return False
-        files = manifest.get('files', {})
-        if not files or any(not self.valid_file(name, size) for name, size in files.items()):
-            self.reason = 'missing or incomplete sequence target'
+        if not hasattr(self, 'required') and not manifest.get('complete'):
             return False
         self.benchmark = manifest.get('benchmark')
+        # Add per-profile signatures to the current target index without rewriting tensors.
+        if hasattr(self, 'profile_signatures'):
+            self.prepare(fingerprint, manifest['blend_scale'])
+            self.seal(fingerprint)
         return True
 
     def valid_file(self, name, size):
@@ -265,10 +379,19 @@ class TeacherFeatureCache:
 
     def prepare(self, fingerprint, blend_scale):
         manifest = self.read_manifest()
-        compatible = manifest.get('fingerprint') == fingerprint
+        files = self.compatible_files(manifest, fingerprint)
+        active_compatible = bool(files)
+        signatures = getattr(self, 'profile_signatures', {})
+        recorded = manifest.get('profile_signatures', {})
+        retained = {name: value for name, value in recorded.items() if name not in signatures}
+        files.update({name: size for name, size in manifest.get('files', {}).items() if name.split('/')[0] in retained})
+        files = {name: size for name, size in files.items() if self.valid_file(name, size)}
+        present = {name.split('/')[0] for name in files}
         self._progress = {'format': 'sequence-targets-v3', 'fingerprint': fingerprint,
-            'blend_scale': blend_scale, 'files': manifest.get('files', {}) if compatible else {}}
-        self.benchmark = manifest.get('benchmark') if compatible else None
+            'blend_scale': blend_scale, 'files': files,
+            'profile_signatures': {**retained, **{name: value for name, value in signatures.items() if name in present}}}
+        self.benchmark = manifest.get('benchmark') if active_compatible else None
+        self.pipeline = manifest.get('pipeline') if files else None
         self.write_manifest(complete=False)
 
     def write_manifest(self, *, complete):
@@ -314,6 +437,8 @@ class TeacherFeatureCache:
         temporary.replace(path)
         with self._mutex:
             self._progress['files'][path.relative_to(self.directory).as_posix()] = path.stat().st_size
+            if profile in getattr(self, 'profile_signatures', {}):
+                self._progress['profile_signatures'][profile] = self.profile_signatures[profile]
             self.write_manifest(complete=False)
 
     def seal(self, fingerprint, *, blend_scale=None):

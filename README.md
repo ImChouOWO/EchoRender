@@ -14,7 +14,7 @@ Same RGB clip -> optional corruption -> raw/feat history alignment -> BHWC16 Stu
 <details>
 <summary><em>Current limitations</em></summary>
 
-The Student is a structural research model, not a numerically equivalent NVIDIA implementation. Its custom SSM uses a sequential PyTorch scan rather than an official fused Mamba/VMamba kernel. Metrics measure agreement with Teacher RGB, not quality against independent ground truth. Full-state training resume is not implemented; `val.py` provides checkpoint validation and comparison-image export.
+The Student is a structural research model, not a numerically equivalent NVIDIA implementation. Its custom SSM uses a sequential PyTorch scan rather than an official fused Mamba/VMamba kernel. Metrics measure agreement with Teacher RGB, not quality against independent ground truth. `--resume` restores epoch-boundary training state; `val.py` provides checkpoint validation and comparison-image export.
 
 </details>
 
@@ -138,7 +138,11 @@ runtime:
   cpu_threads: 4
   output_dir: output/test
 training:
-  epochs: 10
+  epochs: 100
+  profiles: [standard, natural, cinematic, neutral]
+  early_stopping:
+    patience: 15
+    min_delta: 0.001
   gradient_checkpointing: false
   micro_batch_size: 4
   releas: true
@@ -166,6 +170,10 @@ Teacher weights and `runtime.output_dir` resolve from the project root. Teacher 
 ### Training strategy
 
 `loader.batch_size` counts clips with one profile each, not individual frames. `training.micro_batch_size` limits concurrent frames. Each clip contributes its frame-mean loss, then gradients are averaged across the effective batch. RGB history is detached after every frame (one-frame truncated backpropagation), keeping saved activation memory independent of clip length. Longer clips still require more forwards/backwards. Training samples prefix lengths uniformly between `train_min_frames` and the available clip length; evaluation processes the whole clip.
+
+`training.profiles` selects any nonempty subset of the four profiles, for example `[standard, neutral]`. Training, validation, checkpoints and prediction exports use this selection. Keep all four control definitions under `rendering.profiles`; unselected profiles are not processed. Retained matching Teacher targets are reused by profile, so adding a mode only extracts its missing targets. Changing a profile setting invalidates that profile; changing Teacher/data/preprocessing invalidates affected targets.
+
+Early stopping follows `reporting.best_metric` (PSNR by default): `training.early_stopping.patience: 15` stops after 15 epochs without an absolute improvement greater than `min_delta: 0.001`. Set patience to 0 to disable. Early stopping still saves best/last, statistics, predictions and curves. `training_metrics.png` contains train/validation loss, PSNR, SSIM and LPIPS; `profile_metrics.png` compares selected profiles. Both are written to the run report directory under `output/val/`.
 
 Rendering controls live in `rendering.profiles.standard/natural/cinematic/neutral`. Each profile defines `style_index`, `tone`, `structure`, `skin_structure`, `auto_structure`, `intensity`, `detail_strength`, `colour_strength` and `detail_radius`. Defaults use structure 1.8, skin 1.5, auto 1.0, intensity 1.8, detail 1.5, colour 1.0 and radius 0.5. Neutral explicitly selects style 2; the other profiles inherit their own style. `tone: null` follows the named profile. Global settings are render scale 1.0, minimum extent 320 and noise index 1. `rendering.temporal: false` creates single-frame samples; `true` supports up to `max_frames: 10`. Teacher uses Sintel ground-truth guides for training/validation targets. Student motion is selected by `motion: raw` or `motion: feat` in `config/model.yaml`. `raw` estimates backward optical flow with external Farneback from consecutive RGB frames; `feat` uses an independent RGB-pair encoder (6 -> 32 -> 64 channels) and decoder (64 -> 32 -> 3) to predict two displacements and one confidence logit. It has no skip connections to backbone/decoder stages. Flow starts at zero; masked flow supervision and differentiable RGB warping train the branch with `loss.motion: 0.01`. The external source remains RGB; the assembled network tensor has 16 channels. Neither Student mode requires dataset flow during inference; first frames and scene cuts reset history. Test targets without Sintel guides use externally estimated RGB flow, explicitly distinct from ground-truth motion. Artist control masks remain unsupported.
 
@@ -228,8 +236,20 @@ Both temporal RGB branches use the Teacher's fixed learned blend cap; the first 
 
 ```bash
 uv run --locked python train.py --config config/train.yaml
-uv run --locked python -m unittest tool.test_training tool.test_reporting tool.test_val tool.test_teacher_infer tool.test_temporal -v
+uv run --locked python -m unittest tool.test_training tool.test_reporting tool.test_val tool.test_teacher_infer tool.test_temporal tool.test_pipeline -v
 ```
+
+Resume an unfinished run without reserving a new output directory:
+
+```bash
+uv run --locked python train.py --config config/train.yaml --resume output/test/last.pt
+```
+
+Resume starts at the next epoch and restores Student, feature adapters, SGD, global step, cosine horizon, augmentation/loader RNG, metric history, best selection and early stopping. Keep the run's `best.pt` and `metrics.jsonl` beside `last.pt`; core dataset/model/loss/schedule settings must match. `epochs` remains the original total. Older current-format checkpoints restore progress and optimizer but report missing RNG, so subsequent samples are not exactly reproducible. An output lock prevents two trainers from writing the same run. `model.student_weights` remains a separate weights-only start and cannot be combined with `--resume`.
+
+Student neural history and feat RGB pairs remain on the selected device. Feat pairs with matching dimensions are batched without changing the network, warp or per-image loss. Training groups sampled clips by length after drawing their augmentation noise, retaining the same sampled prefixes, images and clip-mean loss weights. Cached targets use two CPU reader threads with a bounded lookahead (up to twice the micro batch, at least two files, 256 MiB; one oversized file may exceed the byte cap), then pinned asynchronous copies to the selected GPU. Teacher targets and distillation taps remain unchanged.
+
+After `best.pt` is successfully saved, the `[Best]` message and metric changes appear in bold bright yellow in a terminal; redirected logs stay plain, and `NO_COLOR` disables styling.
 
 Progress shows epoch, loss, running clip-weighted loss, iteration rate and GPU utilization. NVML matches the configured CUDA device by UUID. Utilization covers the whole device; unavailable readings display `N/A`.
 

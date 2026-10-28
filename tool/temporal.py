@@ -31,6 +31,7 @@ class Frame:
     settings: dict
     rendering: dict
     motion_loss: torch.Tensor | None = None
+    rgb_tensor: torch.Tensor | None = None
 
 
 def crop_rgb(image, size):
@@ -67,38 +68,70 @@ def prepare_frame(rgb, config, profile, *, history=None, motion=None, confidence
                  confidence if aligned is not None else None, controls, profile, settings, rendering)
 
 
+def colour_tensor(frame, device):
+    if frame.rgb_tensor is None:
+        frame.rgb_tensor = torch.as_tensor(frame.rgb.copy(), device=device, dtype=torch.float32)
+    return frame.rgb_tensor
+
+
+def prepare_student_frames(requests, config, student):
+    """Batch identical RGB-pair extents; preserve each image's warp and loss reductions."""
+    from collections import defaultdict
+    from model.motion import raw_motion, warp_history
+    device = next(student.parameters()).device
+    frames, groups = [], defaultdict(list)
+    zero = sum(parameter.sum() * 0 for parameter in student.motion.parameters()) if student.motion is not None else None
+    def tensor(value):
+        if isinstance(value, torch.Tensor):
+            return value.to(device=device, dtype=torch.float32)
+        return torch.as_tensor(np.asarray(value).copy(), device=device, dtype=torch.float32)
+    for index, request in enumerate(requests):
+        frame = prepare_frame(request['rgb'], config, request['profile'])
+        colour_tensor(frame, device)
+        frame.motion_loss = zero
+        frames.append(frame)
+        previous, history = request.get('previous'), request.get('history')
+        if (previous is None or history is None or not config['rendering']['temporal']
+                or config['rendering']['history_strength'] == 0):
+            continue
+        if tuple(previous.shape) != tuple(frame.rgb.shape):
+            raise ValueError('Reset history when frame dimensions change')
+        groups[tuple(frame.rgb.shape)].append(index)
+    for indices in groups.values():
+        if student.motion_mode == 'feat':
+            prior = torch.stack([tensor(requests[i]['previous']).permute(2, 0, 1) for i in indices])
+            current = torch.stack([frames[i].rgb_tensor.permute(2, 0, 1) for i in indices])
+            fields, logits = student.motion(prior, current)
+        for row, index in enumerate(indices):
+            request, frame = requests[index], frames[index]
+            if student.motion_mode == 'raw':
+                field, valid = raw_motion(request['previous'], frame.rgb)
+                field, valid = tensor(field).permute(2, 0, 1)[None], tensor(valid).permute(2, 0, 1)[None]
+            else:
+                field, logit = fields[row:row + 1], logits[row:row + 1]
+                valid = torch.sigmoid(logit)
+                if request.get('motion') is not None and request.get('confidence') is not None:
+                    target = tensor(request['motion']).permute(2, 0, 1)[None]
+                    mask = tensor(request['confidence']).permute(2, 0, 1)[None]
+                    units = field.new_tensor([frame.rgb.shape[1], frame.rgb.shape[0]]).view(1, 2, 1, 1)
+                    error = F.smooth_l1_loss(field * units, target * units, reduction='none')
+                    flow_loss = (error * mask).sum() / (2 * mask.sum()).clamp_min(1)
+                    frame.motion_loss = flow_loss + F.binary_cross_entropy_with_logits(logit, mask)
+            history = tensor(request['history']).permute(2, 0, 1)[None]
+            aligned, valid = warp_history(history, field, valid)
+            frame.history = aligned[0].permute(1, 2, 0)
+            frame.confidence = valid[0].permute(1, 2, 0)
+    return frames
+
+
 def prepare_student_frame(rgb, config, profile, student, *, previous=None, history=None,
                           motion=None, confidence=None):
-    """Student motion sees only RGB; dataset guides supervise feat, never drive its warp."""
-    from model.motion import raw_motion, warp_history
-    frame = prepare_frame(rgb, config, profile)
-    device = next(student.parameters()).device
-    if student.motion is not None:
-        frame.motion_loss = sum(parameter.sum() * 0 for parameter in student.motion.parameters())
-    if (previous is None or history is None or not config['rendering']['temporal']
-            or config['rendering']['history_strength'] == 0):
-        return frame
-    def tensor(value):
-        return torch.as_tensor(np.asarray(value).copy(), device=device, dtype=torch.float32).permute(2, 0, 1)[None]
-    current, prior = tensor(rgb), tensor(previous)
-    if current.shape != prior.shape:
-        raise ValueError('Reset history when frame dimensions change')
-    if student.motion_mode == 'raw':
-        field, valid = raw_motion(previous, rgb)
-        field, valid = tensor(field), tensor(valid)
-    else:
-        field, logits = student.motion(prior, current)
-        valid = torch.sigmoid(logits)
-        if motion is not None and confidence is not None:
-            target, mask = tensor(motion), tensor(confidence)
-            units = field.new_tensor([rgb.shape[1], rgb.shape[0]]).view(1, 2, 1, 1)
-            error = F.smooth_l1_loss(field * units, target * units, reduction='none')
-            flow_loss = (error * mask).sum() / (2 * mask.sum()).clamp_min(1)
-            frame.motion_loss = flow_loss + F.binary_cross_entropy_with_logits(logits, mask)
-    aligned, valid = warp_history(tensor(history), field, valid)
-    frame.history = aligned[0].permute(1, 2, 0)
-    frame.confidence = valid[0].permute(1, 2, 0)
-    return frame
+    return prepare_student_frames([dict(rgb=rgb, profile=profile, previous=previous, history=history,
+                                       motion=motion, confidence=confidence)], config, student)[0]
+
+
+def student_previous(frame, student):
+    return frame.rgb if student.motion_mode == 'raw' else frame.rgb_tensor.detach()
 
 
 def student_inputs(frame, device, layout='BHWC'):
@@ -107,7 +140,7 @@ def student_inputs(frame, device, layout='BHWC'):
     image[..., :3] = 0
     image[..., 15] = 0
     if frame.history is not None:
-        current = torch.as_tensor(frame.rgb.copy(), device=device)
+        current = colour_tensor(frame, device)
         memory = current + torch.as_tensor(frame.confidence, device=device) * (torch.as_tensor(frame.history, device=device) - current)
         memory = F.interpolate(memory.permute(2, 0, 1)[None], frame.small.shape[:2], mode='bilinear', align_corners=False)
         g = frame.geometry
@@ -122,14 +155,21 @@ def half_ste(value):
     return value + (value.half().float() - value).detach()
 
 
+def truncate_tensor(image):
+    value = image.detach()
+    rounded = value.half().contiguous()
+    lower = (rounded.view(torch.int16) - 1).view(torch.float16)
+    return torch.where(rounded.float().abs() > value.abs(), lower, rounded).float()
+
+
 def grade_tensor(image, controls):
     preset = {1: (-.1, -.25, -.1), 2: (0, 0, -.15)}.get(round(controls['normalized_style'] * 128))
     tone = min(1, max(0, controls['local_tone_strength']))
     if preset is None or tone == 0:
         return image
     # Retain the reference's toward-zero history grid with a rounding STE.
-    rounded = truncate_half(image.detach().cpu().numpy())
-    image = image + (torch.from_numpy(rounded).to(image) - image).detach()
+    rounded = truncate_tensor(image)
+    image = image + (rounded - image).detach()
     exposure, contrast, saturation = (v * tone for v in preset)
     image = (image * 2**exposure).clamp(0, 1)
     image = (image + contrast * (image.square() * (3 - 2 * image) - image)).clamp(0, 1)
@@ -149,7 +189,7 @@ def compose_tensor(head, frame, blend_scale):
     H, W = frame.rgb.shape[:2]
     if (h, w) != (H, W):
         raw = F.interpolate(raw.permute(0, 3, 1, 2), (H, W), mode='bilinear', align_corners=False).permute(0, 2, 3, 1)
-    colour = torch.from_numpy(frame.rgb).to(head.device).unsqueeze(0)
+    colour = colour_tensor(frame, head.device).unsqueeze(0)
     neural = (colour + .25 * half_ste(raw[..., :3])).clamp(0, 1)
     if frame.history is not None:
         history = torch.as_tensor(frame.history, device=head.device).unsqueeze(0)
@@ -157,7 +197,7 @@ def compose_tensor(head, frame, blend_scale):
         alpha = torch.sigmoid(half_ste(raw[..., 3:])) * float(np.float16(blend_scale))
         alpha = alpha * frame.rendering['history_strength'] * confidence
         neural = neural + alpha * (history - neural)
-    stored = truncate_half(neural.detach().cpu().numpy()[0])
+    stored = truncate_tensor(neural[0])
     output = grade_tensor(neural, frame.controls)
     output = (colour + frame.settings['intensity'] * (output - colour)).clamp(0, 1)
     detail, colour_strength = frame.settings['detail_strength'], frame.settings['colour_strength']
@@ -198,9 +238,11 @@ def teacher_target(teacher, frame):
 
 
 def device_target(target, device):
-    # Clone outside inference_mode so loss backward can save target tensors safely.
-    return (target['head'].to(device).clone(), {k: v.to(device).clone() for k, v in target['features'].items()},
-            target['rgb'].to(device).clone())
+    def move(value):
+        # Only inference-mode targets need a normal clone for loss backward.
+        value = value.to(device, non_blocking=True)
+        return value.clone() if value.is_inference() and torch.is_grad_enabled() else value
+    return move(target['head']), {k: move(v) for k, v in target['features'].items()}, move(target['rgb'])
 
 
 def frame_guides(sample, index, crop_size):

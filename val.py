@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader, Subset
 from model.student import EchoRenderStudent
 from model.teacher import EchoRenderTeacher, resolve_device
 from model.card.loss import DistillationLoss
-from tool.dataloader import build_dataloader, load_data_config
+from tool.dataloader import build_dataloader
 from tool.distillation import evaluate
 from tool.metrics import ImageMetrics
 from tool.monitoring import GPUMonitor
@@ -21,7 +21,7 @@ from tool.prediction_report import export_predictions
 from tool.reporting import (DIRECTIONS, validation_values, metric_statistics,
                             print_statistics, write_training_report)
 from tool.trainer import json_safe, release_cuda
-from tool.training_config import DEFAULT_TRAIN_CONFIG, PROJECT_ROOT, LOSS_WEIGHTS, load_training_config, reserve_output_dir
+from tool.training_config import DEFAULT_TRAIN_CONFIG, PROJECT_ROOT, LOSS_WEIGHTS, load_training_config, reserve_output_dir, selected_data_config
 
 
 def project_name(value):
@@ -81,7 +81,7 @@ def evaluate_checkpoint(payload, teacher_factory, loaders, config, device):
     criterion = DistillationLoss(config['loss'], student_channels=widths)
     criterion.load_state_dict(payload['distillation'], strict=True)
     teacher = teacher_factory()
-    from tool.teacher_features import TeacherFeatureCache
+    from tool.teacher_features import TeacherFeatureCache, teacher_temporal_signature
     from tool.distillation import cache_key, make_frame
     from tool.temporal import teacher_target, crop_rgb, reset_history
     from tool.trainer import FEATURE_CACHE_DIR
@@ -107,13 +107,14 @@ def evaluate_checkpoint(payload, teacher_factory, loaders, config, device):
                         if item.is_file():
                             stat = item.stat()
                             sources.append((str(item), stat.st_size, stat.st_mtime_ns))
-        from tool import temporal
+        pipeline, previous_pipeline = teacher_temporal_signature()
         signature = {'teacher': module_digest(teacher), 'rendering': config['rendering'],
             'crop': config['training']['crop_size'], 'sources': sources, 'device': str(device), 'torch': torch.__version__,
-            'pipeline': hashlib.sha256(Path(temporal.__file__).read_bytes()).hexdigest(),
+            'pipeline': pipeline,
             'external_motion': hashlib.sha256(inspect.getsource(raw_motion).encode()).hexdigest(),
             'opencv': cv2.__version__}
-        fingerprint = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()
+        alternate = {**signature, 'pipeline': previous_pipeline} if previous_pipeline else None
+        fingerprint = cache.configure_signatures(signature, alternate)
         cache.prepare(fingerprint, payload['teacher_blend_scale'])
         teacher.eval().to(device)
         for split, loader in loaders.items():
@@ -145,7 +146,7 @@ def evaluate_checkpoint(payload, teacher_factory, loaders, config, device):
         controls = {'loss_weights': {name: config['loss'][name] for name in LOSS_WEIGHTS}}
         with torch.inference_mode():
             for split, loader in loaders.items():
-                print(f'[Validate]: {split} | four profiles | paired temporal/reset predictions', flush=True)
+                print(f'[Validate]: {split} | selected profiles | paired temporal/reset predictions', flush=True)
                 results[split] = evaluate(None, student, criterion, loader, metrics, monitor,
                     config=evaluation_config, epoch=payload['epoch'], controls=controls, target_cache=cache,
                     blend_scale=payload['teacher_blend_scale'])
@@ -168,7 +169,7 @@ def main(argv=None):
     parser.add_argument('--config', type=Path, default=DEFAULT_TRAIN_CONFIG, help='Dataset, device and report settings')
     parser.add_argument('--device', help='Override runtime.device: cpu or cuda:N')
     parser.add_argument('--split', choices=('val', 'test', 'both'), default='both')
-    parser.add_argument('--max-clips', type=positive_integer, help='Limit physical clips per split; retain all four profiles')
+    parser.add_argument('--max-clips', type=positive_integer, help='Limit physical clips per split; retain all trained profiles')
     parser.add_argument('--imgsz', type=int, help='Comparison inference longest edge; 0 keeps native inference')
     args = parser.parse_args(argv)
     try:
@@ -184,6 +185,7 @@ def main(argv=None):
             raise ValueError('Expected a complete echorender-bhwc16-motion-v4 training checkpoint')
         # Score with the checkpoint's objective; compare inputs using the current augmentation settings.
         config['rendering'] = deepcopy(payload['train_config']['rendering'])
+        config['training']['profiles'] = list(config['rendering']['profiles'])
         config['loss'] = deepcopy(payload['train_config']['loss'])
         config['training']['crop_size'] = payload['train_config']['training']['crop_size']
         torch.set_num_threads(config['runtime']['cpu_threads'])
@@ -194,7 +196,7 @@ def main(argv=None):
         if not Path(config['model']['teacher_weights']).is_file():
             raise FileNotFoundError(config['model']['teacher_weights'])
         os.environ.setdefault('TORCH_HOME', str(PROJECT_ROOT / '.cache' / 'torch'))
-        data = load_data_config(config)
+        data = selected_data_config(config)
         loaders, missing = {}, {}
         for split in (('val', 'test') if args.split == 'both' else (args.split,)):
             try:

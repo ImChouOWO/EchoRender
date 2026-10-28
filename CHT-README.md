@@ -14,7 +14,7 @@
 <details>
 <summary><em>當前限制</em></summary>
 
-Student 是研究用結構模型，不代表 NVIDIA 的數值等價實作。自訂 SSM 採用純 PyTorch 逐步掃描，並非官方 Mamba／VMamba 融合核心。評估指標衡量與 Teacher RGB 的一致性，不代表相對獨立真實標註的品質提升。目前未實作完整訓練狀態續訓；`val.py` 提供既有權重驗證與比較圖輸出。
+Student 是研究用結構模型，不代表 NVIDIA 的數值等價實作。自訂 SSM 採用純 PyTorch 逐步掃描，並非官方 Mamba／VMamba 融合核心。評估指標衡量與 Teacher RGB 的一致性，不代表相對獨立真實標註的品質提升。`--resume` 可從 epoch 邊界恢復訓練狀態；`val.py` 提供既有權重驗證與比較圖輸出。
 
 </details>
 
@@ -135,7 +135,11 @@ runtime:
   cpu_threads: 4
   output_dir: output/test
 training:
-  epochs: 10
+  epochs: 100
+  profiles: [standard, natural, cinematic, neutral]
+  early_stopping:
+    patience: 15
+    min_delta: 0.001
   gradient_checkpointing: false
   micro_batch_size: 4
   releas: true
@@ -223,6 +227,18 @@ uv run --locked python -m unittest tool.test_training tool.test_reporting tool.t
 ```
 
 進度列顯示 epoch、loss、按影像加權的平均 loss、迭代速度與 GPU 使用率。NVML 透過 UUID 對應指定 CUDA 裝置；使用率涵蓋整張卡，無法取得時顯示 `N/A`。
+
+續訓沿用原輸出目錄：
+
+```bash
+uv run --locked python train.py --config config/train.yaml --resume output/test/last.pt
+```
+
+從下一個 epoch 恢復 Student、蒸餾 adapters、SGD、global step、cosine 總步數、增強與 loader 的隨機狀態、歷史指標、最佳權重選擇與早停計數。請保留同目錄的 `best.pt` 與 `metrics.jsonl`；資料、模型、loss 與排程等核心設定須相同，`epochs` 仍代表原訂總數。既有同格式 checkpoint 可恢復進度與 optimizer，但缺少隨機狀態時會明確提示，後續抽樣無法完全重現。輸出鎖防止兩個程序同時寫入。`model.student_weights` 仍只載入權重，不能與 `--resume` 同用。
+
+Student 歷史與 feat 的 RGB pair 保留在指定設備；相同尺寸的 feat pair 合併運算，網路、warp 與逐張 loss 計算不變。訓練先抽取增強雜訊，再將相近長度 clips 分組，保留原抽樣前綴、影像與逐 clip 平均 loss 權重。快取目標由兩條 CPU 讀取執行緒預取，上限為兩倍 micro batch（至少兩個檔案）及 256 MiB，單一超大檔案可超過容量上限；之後以 pinned memory 非同步傳送至指定 GPU。Teacher 目標與蒸餾層不變。
+
+`best.pt` 成功存檔後，終端會以粗體亮黃色顯示 `[Best]` 與各指標改善比例；重新導向的 log 保持純文字，設定 `NO_COLOR` 可停用顏色。
 
 每個 epoch 驗證完整 validation split，保存 PSNR／SSIM／LPIPS 的影像平均與等權場景平均。無限 PSNR 儲存為 `"Infinity"`。可選 batch-1 FP32 latency benchmark 使用暖機、同步與 eval，排除前處理、特徵擷取、組合與 backward。快取模式沿用產生快取時的 Teacher 參考耗時，每個 epoch 重新量測 Student。
 
@@ -354,6 +370,10 @@ uv run --locked python val.py --weights output/test_12/last.pt --project preview
 ---
 
 ## 四模式與歷史評估
+
+`training.profiles` 選擇要訓練的模式，例如 `[standard, neutral]`；訓練、驗證、權重與預測輸出使用相同選擇。`rendering.profiles` 保留四種模式的控制設定。快取按模式驗證並保留，加入模式時只補足缺少的特徵；變更單一模式設定只重建該模式，Teacher／資料／前處理改變則重建受影響的目標。
+
+早停使用 `reporting.best_metric`（預設 PSNR），`training.early_stopping.patience: 15` 代表連續 15 個 epoch 沒有超過 `min_delta: 0.001` 的絕對改善就停止；patience 設為 0 可關閉。早停仍保存 best／last、統計與預測。結束後在 `output/val/` 的報告資料夾輸出 `training_metrics.png`（訓練／驗證 loss、PSNR、SSIM、LPIPS）與 `profile_metrics.png`（各模式比較）。
 
 `rendering.profiles` 分別設定 standard、natural、cinematic、neutral。預設採用使用者指定的結構／自動控制／強度組合；neutral 明確指定 style 2，其餘模式跟隨本身 style。`tone: null` 跟隨模式預設。`dataset.render_pass` 固定 clean；Teacher 使用 Sintel 光流，Student 在 model.yaml 選擇 raw／feat，不提供 control_mask。`temporal: false` 使用單張，`true` 支援最多 10 幀；資料載入器只打亂片段，不打亂片段內幀序，不跨場景或斷幀。
 

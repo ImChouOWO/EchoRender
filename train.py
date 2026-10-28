@@ -10,10 +10,11 @@ import torch
 from model.student import EchoRenderStudent
 from model.teacher import EchoRenderTeacher, resolve_device
 from model.card.loss import DistillationLoss
-from tool.dataloader import load_data_config, build_dataloader
-from tool.training_config import load_training_config, DEFAULT_TRAIN_CONFIG, reserve_output_dir, PROJECT_ROOT
+from tool.dataloader import build_dataloader
+from tool.training_config import load_training_config, DEFAULT_TRAIN_CONFIG, reserve_output_dir, PROJECT_ROOT, selected_data_config
 from tool.metrics import ImageMetrics
 from tool.trainer import fit, load_student_state
+from tool.resume import read_checkpoint, validate_resume
 from tool.teacher_features import ask_delete_cache
 from tool.prediction_report import export_predictions
 
@@ -21,10 +22,19 @@ from tool.prediction_report import export_predictions
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', type=Path, default=DEFAULT_TRAIN_CONFIG)
+    parser.add_argument('--resume', type=Path, help='Resume an unfinished run from its last.pt checkpoint')
     args = parser.parse_args(argv)
     try:
         config = load_training_config(args.config)
-        data = load_data_config(config)
+        resume = None
+        if args.resume is not None:
+            path = args.resume.expanduser()
+            path = (PROJECT_ROOT / path).resolve()
+            resume = read_checkpoint(path)
+            if config['model']['student_weights']:
+                raise ValueError('Use either --resume or model.student_weights, not both')
+            config['runtime']['output_dir'] = str(path.parent)
+        data = selected_data_config(config)
         output = Path(config['runtime']['output_dir'])
         if output.is_relative_to(data.root):
             raise ValueError('output_dir must be outside the dataset')
@@ -48,6 +58,8 @@ def main(argv=None):
         student_channels = {name: student.channels[index] for name, index in student.FEATURE_LAYERS.items()}
         if config['model']['student_weights']:
             load_student_state(student, config['model']['student_weights'])
+        if resume is not None:
+            validate_resume(resume, config, student)
         criterion = DistillationLoss(config['loss'], student_channels=student_channels)
         optimizer = torch.optim.SGD(list(student.parameters()) + list(criterion.parameters()),
                                     **config['training']['optimizer'])
@@ -55,17 +67,20 @@ def main(argv=None):
         os.environ.setdefault('TORCH_HOME', str(Path(__file__).resolve().parent / '.cache/torch'))
         metrics = ImageMetrics(net=config['validation']['lpips_net'],
                                ssim_window=config['loss']['ssim_window'])
-        output = reserve_output_dir(output)
+        output = output if resume is not None else reserve_output_dir(output)
         config['runtime']['output_dir'] = str(output)
         print(f'Output: {output}', flush=True)
         print(f'Training on {device}; train clips/profiles={len(train_loader.dataset)}, val={len(val_loader.dataset)}', flush=True)
-        print(f'Student motion: {student.motion_mode}', flush=True)
+        print(f'Student motion: {student.motion_mode} | profiles: ' + ', '.join(config['training']['profiles']), flush=True)
         print(f"Batch: effective={config['loader']['batch_size']} clips, micro={config['training']['micro_batch_size']} concurrent frames", flush=True)
         report_dir = None
         on_complete = None
         if config['reporting']['enabled']:
             project_name = config['reporting']['project_name'] or output.name
-            report_dir = reserve_output_dir(Path(config['runtime']['output_dir']).parent / 'val' / project_name)
+            previous_report = (resume.get('resume_state') or {}).get('report_dir') if resume is not None else None
+            report_dir = Path(previous_report) if previous_report else output.parent / 'val' / project_name
+            if resume is None:
+                report_dir = reserve_output_dir(report_dir)
             print(f'Reports: {report_dir}', flush=True)
             def on_complete(summary):
                 loaders, missing = {'val': val_loader}, {}
@@ -77,7 +92,7 @@ def main(argv=None):
                 export_predictions(summary['best_checkpoint'], create_teacher, loaders, config, report_dir,
                                    device, missing_splits=missing)
         fit(create_teacher, student, criterion, train_loader, val_loader, optimizer, metrics, config,
-            device=device, cache_cleanup=ask_delete_cache, report_dir=report_dir, on_complete=on_complete)
+            device=device, cache_cleanup=ask_delete_cache, report_dir=report_dir, on_complete=on_complete, resume=resume)
     except (OSError, ValueError, RuntimeError, ImportError) as exc:
         parser.exit(2, f'Training failed: {exc}\n')
     return 0

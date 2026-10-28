@@ -117,7 +117,7 @@ class DistillationLoss(nn.Module):
         return torch.prod(torch.stack(values) ** weights, dim=0).mean()
 
     def forward(self, student_head, teacher_head, student_features, teacher_features,
-                prediction_rgb, target_rgb, *, image_hw, network_hw, weights=None):
+                prediction_rgb, target_rgb, *, image_hw, network_hw, weights=None, tensor_terms=False):
         c = self.config if weights is None else {**self.config, **weights}
         terms = {}
         for name, stride in TEACHER_STRIDES.items():
@@ -148,6 +148,10 @@ class DistillationLoss(nn.Module):
         terms['weighted_output'] = c['distillation'] * c['output'] * terms['output']
         for name in ('rgb_mse', 'rgb_ssim', 'rgb_ms_ssim'):
             terms[f'weighted_{name}'] = c['reconstruction'] * c[name] * terms[name]
-        if not all(torch.isfinite(value).all().item() for value in terms.values()):
+        detached = {name: value.detach() for name, value in terms.items()}
+        if tensor_terms:
+            return terms['total'], detached
+        values = torch.stack(list(detached.values())).cpu().tolist()
+        if not all(math.isfinite(value) for value in values):
             raise RuntimeError('Non-finite loss component')
-        return terms['total'], {name: value.detach().item() for name, value in terms.items()}
+        return terms['total'], dict(zip(detached, values))

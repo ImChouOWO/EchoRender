@@ -44,7 +44,7 @@ def load_training_config(path=DEFAULT_TRAIN_CONFIG):
     expected = {
         'model': {'student_config', 'student_weights', 'teacher_weights'},
         'runtime': {'device', 'cpu_threads', 'output_dir'},
-        'training': {'epochs', 'releas', 'max_steps', 'crop_size', 'optimizer', 'grad_clip', 'micro_batch_size', 'gradient_checkpointing'},
+        'training': {'epochs', 'profiles', 'early_stopping', 'releas', 'max_steps', 'crop_size', 'optimizer', 'grad_clip', 'micro_batch_size', 'gradient_checkpointing'},
         'loss': LOSS_WEIGHTS | {'projection', 'norm_eps', 'affinity_chunk_size', 'ssim_window', 'ms_ssim_weights'},
         'validation': {'reference', 'lpips_net'}, 'benchmark': {'enabled', 'warmup', 'repeats'},
         'logging': {'progress', 'gpu_poll_seconds'}, 'schedule': {'kind', 'eta_min'},
@@ -59,6 +59,16 @@ def load_training_config(path=DEFAULT_TRAIN_CONFIG):
     for section, keys in expected.items():
         if set(c[section]) != keys:
             raise ValueError(f'{section} must contain exactly: {sorted(keys)}')
+    selected = c['training']['profiles']
+    allowed_profiles = {'standard', 'natural', 'cinematic', 'neutral'}
+    if (not isinstance(selected, list) or not selected or any(not isinstance(p, str) or p not in allowed_profiles for p in selected)
+            or len(selected) != len(set(selected))):
+        raise ValueError('training.profiles must be a nonempty unique list of supported profiles')
+    early = c['training']['early_stopping']
+    if not isinstance(early, dict) or set(early) != {'patience', 'min_delta'}:
+        raise ValueError('early_stopping requires patience and min_delta')
+    _positive(early['patience'], 'early_stopping.patience', integer=True, zero=True)
+    _positive(early['min_delta'], 'early_stopping.min_delta', zero=True)
     if not isinstance(c['training']['optimizer'], dict) or set(c['training']['optimizer']) != {'lr', 'momentum', 'weight_decay'}:
         raise ValueError('optimizer requires lr, momentum, weight_decay')
     for section, key in (('model', 'student_config'), ('model', 'student_weights'),
@@ -178,6 +188,13 @@ def load_training_config(path=DEFAULT_TRAIN_CONFIG):
                 raise ValueError(f'Invalid {name}.{key}')
     c['config_path'] = str(path)
     return c
+
+
+def selected_data_config(config):
+    """Select training/evaluation profiles without changing Teacher rendering signatures."""
+    from dataclasses import replace
+    from .dataloader import load_data_config
+    return replace(load_data_config(config), profiles=tuple(config['training']['profiles']))
 
 
 class TrainingSchedule:

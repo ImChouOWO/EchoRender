@@ -17,7 +17,7 @@ import torch
 from torch import nn
 
 from .reporting import (validation_values, is_better, best_message, metric_statistics,
-                        write_training_report)
+                        write_training_report, EarlyStopping)
 from .prediction_report import (augment_image, export_predictions, prepare_variant,
                                 resize_rgb, sample_modes, VariantInput, MODES)
 from .test_training import tiny_model, FixtureTeacher, identity_prepare
@@ -36,6 +36,41 @@ class ReportingTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         torch.set_num_threads(2)
+
+    def test_best_highlight_is_terminal_only_and_respects_no_color(self):
+        import os
+        from .progress import highlight_best
+        message = best_message(2, {'loss': 3., 'psnr': 22., 'ssim': .6, 'lpips': .3},
+                               {'loss': 4., 'psnr': 20., 'ssim': .5, 'lpips': .4})
+        with patch.dict(os.environ, {}, clear=True), patch('sys.stdout.isatty', return_value=True):
+            self.assertEqual(highlight_best(message), '\033[1;93m' + message + '\033[0m')
+            with patch.dict(os.environ, {'NO_COLOR': '1'}):
+                self.assertEqual(highlight_best(message), message)
+        with patch('sys.stdout.isatty', return_value=False):
+            self.assertEqual(highlight_best(message), message)
+
+    def test_profile_columns_align_for_different_names_and_score_widths(self):
+        from .progress import profile_row
+        rows = [profile_row('standard', {'psnr': 9.5, 'ssim': .9, 'lpips': .1}),
+                profile_row('cinematic', {'psnr': 27.5, 'ssim': .8, 'lpips': .2}),
+                profile_row('natural', {'psnr': float('inf'), 'ssim': 1., 'lpips': 0.})]
+        separators = [[i for i, char in enumerate(row) if char == '|'] for row in rows]
+        self.assertTrue(all(value == separators[0] for value in separators))
+
+    def test_early_stopping_handles_metric_direction_delta_and_disabled_mode(self):
+        for metric, direction in (('psnr', 1), ('ssim', 1), ('loss', -1), ('lpips', -1)):
+            stop = EarlyStopping(metric, patience=2, min_delta=.1)
+            self.assertFalse(stop.update(10., 1))
+            self.assertFalse(stop.update(10. + direction * .05, 2))
+            self.assertFalse(stop.update(10. + direction * .2, 3))
+            self.assertFalse(stop.update(10. + direction * .21, 4))
+            self.assertTrue(stop.update(10. + direction * .22, 5))
+            self.assertEqual(stop.best_epoch, 3)
+        disabled = EarlyStopping('psnr', patience=0, min_delta=0)
+        self.assertFalse(any(disabled.update(20., epoch) for epoch in range(1, 30)))
+        stop = EarlyStopping('psnr', patience=1, min_delta=0)
+        self.assertFalse(stop.update(float('inf'), 1))
+        self.assertTrue(stop.update(float('inf'), 2))
 
     def test_best_metric_directions_and_improvements(self):
         old = {'loss': 4., 'psnr': 20., 'ssim': .5, 'lpips': .4}

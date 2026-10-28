@@ -11,6 +11,23 @@ from tqdm.auto import tqdm
 DIRECTIONS = {'loss': -1, 'psnr': 1, 'ssim': 1, 'lpips': -1}
 
 
+class EarlyStopping:
+    """Stop after patience epochs without an absolute improvement above min_delta."""
+    def __init__(self, metric, patience, min_delta):
+        self.metric, self.patience, self.min_delta = metric, patience, min_delta
+        self.best, self.best_epoch, self.bad_epochs = None, None, 0
+
+    def update(self, value, epoch):
+        if math.isnan(value):
+            raise ValueError('Early stopping metric must not be NaN')
+        improvement = self.best is None or DIRECTIONS[self.metric] * (value - self.best) > self.min_delta
+        if improvement:
+            self.best, self.best_epoch, self.bad_epochs = value, epoch, 0
+        else:
+            self.bad_epochs += 1
+        return self.patience > 0 and self.bad_epochs >= self.patience
+
+
 def validation_values(validation):
     return {'loss': validation['components']['total'], **validation['image_mean']}
 
@@ -61,6 +78,7 @@ def write_training_report(summary, directory):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
+    from matplotlib.ticker import MaxNLocator
     from .trainer import json_safe
 
     directory = Path(directory)
@@ -98,7 +116,21 @@ def write_training_report(summary, directory):
                  xlabel='Epoch')
         axis.grid(alpha=.25)
         axis.legend(fontsize=8)
-        axis.set_xticks(epochs)
+        axis.xaxis.set_major_locator(MaxNLocator(integer=True, nbins=10))
     figure.suptitle('Training performance - Teacher RGB reference', fontweight='bold')
     figure.savefig(directory / 'training_metrics.png', dpi=160)
     plt.close(figure)
+
+    profiles = list(dict.fromkeys(name for row in history for name in row['validation'].get('profiles', {})))
+    if profiles:
+        figure, axes = plt.subplots(2, 2, figsize=(12, 8), constrained_layout=True)
+        for axis, name in zip(axes.flat, DIRECTIONS):
+            for profile in profiles:
+                values = [row['validation'].get('profiles', {}).get(profile, {}).get(name, float('nan')) for row in history]
+                axis.plot(epochs, [value if math.isfinite(value) else float('nan') for value in values], label=profile)
+            axis.set(title={'loss': 'Loss', 'psnr': 'PSNR (dB)', 'ssim': 'SSIM', 'lpips': 'LPIPS'}[name], xlabel='Epoch')
+            axis.grid(alpha=.25)
+            axis.legend(fontsize=8)
+        figure.suptitle('Validation by profile - Teacher RGB reference', fontweight='bold')
+        figure.savefig(directory / 'profile_metrics.png', dpi=160)
+        plt.close(figure)

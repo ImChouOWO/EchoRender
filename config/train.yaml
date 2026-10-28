@@ -8,7 +8,11 @@ runtime:
   cpu_threads: 4
   output_dir: output/test  # existing directories get _2, _3, ...
 training:
-  epochs: 10
+  epochs: 100
+  profiles: [standard, natural, cinematic, neutral]
+  early_stopping:
+    patience: 15  # epochs without sufficient improvement; 0 disables
+    min_delta: 0.001  # absolute improvement in reporting.best_metric
   gradient_checkpointing: false  # recompute SSM activations to trade speed for memory
   micro_batch_size: 4  # simultaneous Student images; gradients accumulate to loader.batch_size
   releas: true  # true: cache once and unload Teacher; false: frozen online Teacher, no cache

@@ -16,6 +16,7 @@ from tqdm.auto import tqdm
 
 from model.student import EchoRenderStudent
 from .distillation import augment_rgb
+from .progress import BAR_FORMAT
 
 MODES = ('original', 'noise', 'brightness', 'contrast', 'sharpness')
 
@@ -162,8 +163,8 @@ def sample_modes(loader, maximum, seed):
 @torch.inference_mode()
 def predict_clip(model, sample, mode, fraction, profile, config, device, blend_scale, is_teacher):
     from .temporal import (crop_rgb, prepare_frame, prepare_student_frame, student_inputs, compose_tensor, teacher_target,
-                           frame_guides, reset_history, resample)
-    history = previous = None
+                           frame_guides, reset_history, resample, student_previous)
+    history = previous = previous_student = None
     total = 0.
     last_prediction = last_variant = None
     geometry = {}
@@ -172,7 +173,7 @@ def predict_clip(model, sample, mode, fraction, profile, config, device, blend_s
         variant = prepare_variant(rgb, mode, fraction, config['augmentation'], seed=config['loader']['seed'],
             sample_id=sample['sample_ids'][position], inference_size=config['reporting']['inference_size'])
         if reset_history(previous, variant.network_rgb, config):
-            history = None
+            history = previous_student = None
         if is_teacher:
             motion, confidence = frame_guides(sample, position, config['reporting']['crop_size'])
             if motion is not None:
@@ -190,7 +191,7 @@ def predict_clip(model, sample, mode, fraction, profile, config, device, blend_s
                 torch.cuda.synchronize(device)
             started = perf_counter()
             frame = prepare_student_frame(variant.network_rgb, config, profile, model,
-                previous=previous, history=history)
+                previous=previous_student, history=history)
             inputs = student_inputs(frame, device, model.layout)
             head = model(inputs)
             if device.type == 'cuda':
@@ -216,6 +217,8 @@ def predict_clip(model, sample, mode, fraction, profile, config, device, blend_s
                              'raw' if is_teacher else model.motion_mode}
         history = next_history if config['rendering']['temporal'] else None
         previous = variant.network_rgb
+        if not is_teacher:
+            previous_student = student_previous(frame, model)
     return last_variant, last_prediction, {**geometry, 'inference_seconds': total,
         'inference_frames': len(sample['images'])}
 
@@ -238,9 +241,17 @@ def export_predictions(checkpoint, teacher_factory, loaders, config, directory, 
         groups, available = sample_modes(loader, config['reporting']['samples_per_mode'], config['loader']['seed'])
         manifest['selection'][split] = {mode: [s['sample_ids'][-1] for s in samples] for mode, samples in groups.items()}
         cases[split] = groups
+    total_variants = 2 * len(config['rendering']['profiles']) * sum(
+        len(samples) * (1 if mode == 'original' else 1 + len(config['reporting']['strengths']))
+        for groups in cases.values() for mode, samples in groups.items())
     model = None
     try:
-        with (directory / 'predictions.jsonl').open('w') as stream, (directory / 'predictions.csv').open('w', newline='') as table:
+        with (
+            tqdm(total=total_variants, desc='Predict', unit='variant', dynamic_ncols=True,
+                 bar_format=BAR_FORMAT, disable=not config['logging']['progress']) as progress,
+            (directory / 'predictions.jsonl').open('w') as stream,
+            (directory / 'predictions.csv').open('w', newline='') as table,
+        ):
             columns = ['model', 'split', 'profile', 'mode', 'sample_id', 'strength', 'sigma', 'factor',
                        'input_delta_mae', 'prediction_change_rmse', 'inference_seconds', 'inference_frames', 'path']
             writer = csv.DictWriter(table, fieldnames=columns)
@@ -257,6 +268,8 @@ def export_predictions(checkpoint, teacher_factory, loaders, config, directory, 
                         for sample in samples:
                             for profile in config['rendering']['profiles']:
                                 levels = [0.] if mode == 'original' else [0., *config['reporting']['strengths']]
+                                progress.set_description_str(
+                                    f'Predict [{split}] {name:<7} | {profile:<9} | {mode:<10}', refresh=False)
                                 variants, predictions, geometries = [], [], []
                                 for level in levels:
                                     variant, prediction, geometry = predict_clip(model, sample,
@@ -265,6 +278,7 @@ def export_predictions(checkpoint, teacher_factory, loaders, config, directory, 
                                     variants.append(variant)
                                     predictions.append(prediction)
                                     geometries.append(geometry)
+                                    progress.update(1)
                                 sample_id = sample['sample_ids'][-1]
                                 filename = output_name(split, sample_id)
                                 if name == 'student' and profile == next(iter(config['rendering']['profiles'])):
@@ -291,7 +305,6 @@ def export_predictions(checkpoint, teacher_factory, loaders, config, directory, 
                                     stream.write(json.dumps({**row, **geometry}) + '\n')
                                 stream.flush()
                                 table.flush()
-                                tqdm.write(f'[Predict]: {name} | {profile} | {mode} | {sample_id}')
                 release_model(model, device)
                 model = None
         for split in cases:

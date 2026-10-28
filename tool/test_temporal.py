@@ -134,6 +134,123 @@ class TemporalTests(unittest.TestCase):
         other.load_state_dict(student.state_dict(), strict=True)
         torch.testing.assert_close(other(student_inputs(frame, 'cpu', 'BCHW')).permute(0, 2, 3, 1), outputs[-1])
 
+    def test_selected_profiles_and_early_stopping_config_are_validated(self):
+        import yaml
+        from .training_config import selected_data_config
+        config = deepcopy(self.config)
+        config['training']['profiles'] = ['neutral', 'standard']
+        self.assertEqual(selected_data_config(config).profiles, ('neutral', 'standard'))
+        for key, value in (('profiles', []), ('profiles', ['bad']), ('profiles', ['neutral', 'neutral']),
+                           ('profiles', 'neutral'), ('early_stopping', {'patience': -1, 'min_delta': 0}),
+                           ('early_stopping', {'patience': True, 'min_delta': 0}),
+                           ('early_stopping', {'patience': 1, 'min_delta': -1})):
+            changed = deepcopy(config)
+            changed.pop('config_path')
+            changed['training'][key] = value
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / 'train.yaml'
+                path.write_text(yaml.safe_dump(changed))
+                with self.assertRaises(ValueError):
+                    load_training_config(path)
+
+    def test_profile_cache_adds_only_missing_modes_and_preserves_existing_targets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = TeacherFeatureCache(Path(directory) / 'feats')
+            cache.open()
+            teacher = FixtureTeacher()
+            digest = module_digest(teacher)
+            config = deepcopy(self.config)
+            try:
+                one = Loader(ClipDataset(directory, profiles=('standard',)))
+                fingerprint = cache.fingerprint(digest, one, one, config, torch.device('cpu'))
+                cache.prepare(fingerprint, .5)
+                cache.build(teacher, one, one, config)
+                cache.seal(fingerprint)
+                original = {p: (p.stat().st_mtime_ns, p.read_bytes()) for p in cache.directory.rglob('targets.pt')}
+                two = Loader(ClipDataset(directory, profiles=('standard', 'neutral')))
+                expanded = cache.fingerprint(digest, two, two, config, torch.device('cpu'))
+                self.assertEqual(expanded, fingerprint)
+                self.assertFalse(cache.reuse(expanded))
+                cache.prepare(expanded, .5)
+                with patch.object(teacher, 'forward', wraps=teacher.forward) as forward:
+                    cache.build(teacher, two, two, config)
+                    self.assertEqual(forward.call_count, 6)
+                cache.seal(expanded)
+                for path, (modified, data) in original.items():
+                    self.assertEqual(path.stat().st_mtime_ns, modified)
+                    self.assertEqual(path.read_bytes(), data)
+                self.assertEqual(len(list(cache.directory.rglob('targets.pt'))), 12)
+                cache.fingerprint(digest, one, one, config, torch.device('cpu'))
+                self.assertTrue(cache.reuse(fingerprint))
+                self.assertEqual(len(cache.read_manifest()['files']), 12)
+                changed = deepcopy(config)
+                changed['rendering']['profiles']['neutral']['intensity'] = 1.
+                new_signature = cache.fingerprint(digest, two, two, changed, torch.device('cpu'))
+                self.assertFalse(cache.reuse(new_signature))
+                cache.prepare(new_signature, .5)
+                with patch.object(teacher, 'forward', wraps=teacher.forward) as forward:
+                    cache.build(teacher, two, two, changed)
+                    self.assertEqual(forward.call_count, 6)
+                cache.seal(new_signature)
+                for path, (modified, data) in original.items():
+                    self.assertEqual(path.stat().st_mtime_ns, modified)
+                    self.assertEqual(path.read_bytes(), data)
+            finally:
+                cache.close(delete=False)
+
+    def test_current_cache_index_gains_profile_signatures_without_reextracting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = TeacherFeatureCache(Path(directory) / 'feats')
+            cache.open()
+            teacher = FixtureTeacher()
+            loader = Loader(ClipDataset(directory))
+            try:
+                signature = cache.fingerprint(module_digest(teacher), loader, loader, self.config, torch.device('cpu'))
+                cache.prepare(signature, .5)
+                cache.build(teacher, loader, loader, self.config)
+                cache.seal(signature)
+                index = cache.directory / 'manifest.json'
+                manifest = json.loads(index.read_text())
+                manifest.pop('profile_signatures')
+                index.write_text(json.dumps(manifest))
+                times = {p: p.stat().st_mtime_ns for p in cache.directory.rglob('targets.pt')}
+                self.assertTrue(cache.reuse(signature))
+                self.assertEqual(set(cache.read_manifest()['profile_signatures']), {'standard', 'neutral'})
+                self.assertTrue(all(p.stat().st_mtime_ns == modified for p, modified in times.items()))
+            finally:
+                cache.close(delete=False)
+
+    def test_early_stop_runs_normal_completion_reports_and_best_last_exports(self):
+        from .trainer import fit
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = deepcopy(self.config)
+            config['runtime']['output_dir'] = str(root / 'run')
+            config['training'].update(epochs=5, profiles=['neutral'], early_stopping={'patience': 1, 'min_delta': 0.})
+            student, criterion = tiny_model(), self.criterion()
+            loader = Loader(ClipDataset(root, profiles=('neutral',)))
+            teacher = FixtureTeacher()
+            fixed = evaluate(teacher, student, criterion, loader, Metrics(), Monitor(), config=config,
+                epoch=1, controls={'loss_weights': config['loss']}, blend_scale=.5)
+            optimizer = torch.optim.SGD([*student.parameters(), *criterion.parameters()], lr=.001)
+            completed, cleanups = [], []
+            with patch('tool.trainer.FEATURE_CACHE_DIR', root / 'feats'), \
+                 patch('tool.trainer.evaluate', return_value=fixed), redirect_stdout(io.StringIO()):
+                result = fit(FixtureTeacher, student, criterion, loader, loader, optimizer, Metrics(), config,
+                    device='cpu', report_dir=root / 'report', on_complete=completed.append,
+                    cache_cleanup=lambda path: cleanups.append(path) or False)
+            self.assertEqual(result['status'], 'early_stopped')
+            self.assertEqual(result['epochs_run'], 2)
+            self.assertEqual(result['best_epoch'], 1)
+            self.assertTrue(result['early_stopping']['triggered'])
+            self.assertEqual(len(completed), 1)
+            self.assertEqual(torch.load(root / 'run/last.pt', weights_only=True)['epoch'], 2)
+            payload = torch.load(root / 'run/best.pt', weights_only=True)
+            self.assertEqual(list(payload['train_config']['rendering']['profiles']), ['neutral'])
+            self.assertTrue((root / 'report/training_metrics.png').is_file())
+            self.assertTrue((root / 'report/profile_metrics.png').is_file())
+            self.assertEqual(set(p.name for p in (root / 'run').glob('*.pt')), {'best.pt', 'last.pt'})
+
     def test_raw_motion_recovers_backward_translation_without_guides(self):
         from model.motion import raw_motion
         rng = np.random.default_rng(45)
@@ -592,6 +709,31 @@ class TemporalTests(unittest.TestCase):
             self.assertEqual(first['val']['image_mean'], second['val']['image_mean'])
             self.assertEqual((cache_root / 'manifest.json').read_bytes(), training_index)
             self.assertTrue((cache_root / 'evaluation.json').is_file())
+
+    def test_evaluation_cache_retains_previous_profiles_when_adding_another(self):
+        import val
+        from . import trainer
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            student, criterion = tiny_model(), self.criterion()
+            payload = {'format': FORMAT, 'epoch': 1, 'student_config': student.config,
+                'student': student.state_dict(), 'distillation': criterion.state_dict(),
+                'teacher_blend_scale': .5, 'train_config': self.config}
+            with patch.object(trainer, 'FEATURE_CACHE_DIR', root / 'feats'), \
+                 patch('val.DistillationLoss', side_effect=lambda config, **kwargs: self.criterion()), \
+                 patch('val.ImageMetrics', return_value=Metrics()), \
+                 patch.object(FixtureTeacher, 'forward', autospec=True, side_effect=FixtureTeacher.forward) as forward:
+                for profiles in (('standard',), ('standard', 'neutral'), ('standard',)):
+                    config = deepcopy(self.config)
+                    config['training']['profiles'] = list(profiles)
+                    config['rendering']['profiles'] = {p: config['rendering']['profiles'][p] for p in profiles}
+                    loader = Loader(ClipDataset(root, profiles=profiles))
+                    before = forward.call_count
+                    val.evaluate_checkpoint(payload, FixtureTeacher, {'val': loader}, config, torch.device('cpu'))
+                    self.assertEqual(forward.call_count - before, 0 if profiles == ('standard',) and before else 3)
+                manifest = json.loads((root / 'feats/evaluation.json').read_text())
+                self.assertEqual(set(manifest['profile_signatures']), {'standard', 'neutral'})
+                self.assertEqual(len(manifest['files']), 6)
 
     def test_validation_limit_retains_all_profiles_of_the_selected_clip(self):
         import val

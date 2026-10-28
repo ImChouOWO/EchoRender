@@ -11,12 +11,13 @@ from model.card.mamba import MambaStage
 from .distillation import train_batch, evaluate, module_digest, StudentAugmentation
 from .training_config import TrainingSchedule, PROJECT_ROOT
 from .teacher_features import TeacherFeatureCache
-from .progress import progress_bar, progress_row, network_size
+from .progress import progress_bar, progress_row, network_size, profile_row, highlight_best
 from .reporting import (validation_values, is_better, best_message, metric_statistics,
-                        print_statistics, write_training_report)
+                        print_statistics, write_training_report, EarlyStopping)
 
 FEATURE_CACHE_DIR = PROJECT_ROOT / "output/feats"
 from .monitoring import GPUMonitor
+from .resume import (capture_rng, restore_rng, restore_progress, validate_resume, training_lock, checkpoint_values)
 
 
 def json_safe(value):
@@ -40,13 +41,17 @@ def load_student_state(student, path):
     student.load_state_dict(payload['student'], strict=True)
 
 
-def save_checkpoint(path, student, criterion, optimizer, *, epoch, step, config, controls, blend_scale):
+def save_checkpoint(path, student, criterion, optimizer, *, epoch, step, config, controls, blend_scale, resume_state=None):
+    from copy import deepcopy
+    checkpoint_config = deepcopy(config)
+    checkpoint_config['rendering']['profiles'] = {name: config['rendering']['profiles'][name]
+        for name in config['training']['profiles']}
     payload = {
         'format': 'echorender-bhwc16-motion-v4', 'student': student.state_dict(),
         'distillation': criterion.state_dict(), 'optimizer': optimizer.state_dict(),
-        'student_config': student.config, 'train_config': config,
+        'student_config': student.config, 'train_config': checkpoint_config,
         'epoch': epoch, 'global_step': step, 'schedule_controls': controls,
-        'teacher_blend_scale': blend_scale,
+        'teacher_blend_scale': blend_scale, 'resume_state': checkpoint_values(resume_state),
     }
     temporary = path.with_suffix('.pt.tmp')
     try:
@@ -72,7 +77,19 @@ def release_cuda(device):
             torch.cuda.empty_cache()
 
 
-def fit(teacher, student, criterion, train_loader, val_loader, optimizer, metrics, config, *, schedule=None, device=None, cache_cleanup=None, report_dir=None, on_complete=None):
+def fit(teacher, student, criterion, train_loader, val_loader, optimizer, metrics, config, *, schedule=None, device=None, cache_cleanup=None, report_dir=None, on_complete=None, resume=None):
+    with training_lock(Path(config['runtime']['output_dir'])):
+        return _fit(teacher, student, criterion, train_loader, val_loader, optimizer, metrics, config,
+                    schedule=schedule, device=device, cache_cleanup=cache_cleanup, report_dir=report_dir,
+                    on_complete=on_complete, resume=resume)
+
+
+def _fit(teacher, student, criterion, train_loader, val_loader, optimizer, metrics, config, *, schedule=None, device=None, cache_cleanup=None, report_dir=None, on_complete=None, resume=None):
+    if resume is not None:
+        validate_resume(resume, config, student)
+        student.load_state_dict(resume['student'], strict=True)
+        criterion.load_state_dict(resume['distillation'], strict=True)
+        optimizer.load_state_dict(resume['optimizer'])
     for module in student.modules():
         if isinstance(module, MambaStage):
             module.gradient_checkpointing = config['training']['gradient_checkpointing']
@@ -89,25 +106,39 @@ def fit(teacher, student, criterion, train_loader, val_loader, optimizer, metric
         raise ValueError('Train and validation loaders must be nonempty')
     output = Path(config['runtime']['output_dir'])
     output.mkdir(parents=True, exist_ok=True)
-    for name in ('metrics.jsonl', 'best.pt', 'last.pt', 'summary.json', 'resolved_train.yaml'):
+    for name in (() if resume is not None else ('metrics.jsonl', 'best.pt', 'last.pt', 'summary.json', 'resolved_train.yaml')):
         if (output / name).exists():
             raise FileExistsError(f'{output / name} exists; choose a fresh output_dir')
     import yaml
-    (output / 'resolved_train.yaml').write_text(yaml.safe_dump(config, sort_keys=False), encoding='utf-8')
+    if resume is None:
+        (output / 'resolved_train.yaml').write_text(yaml.safe_dump(config, sort_keys=False), encoding='utf-8')
     teacher_before = module_digest(teacher)
+    if resume is not None:
+        expected_teacher = (resume.get('resume_state') or {}).get('teacher_digest')
+        if expected_teacher is not None and teacher_before != expected_teacher:
+            raise ValueError('Teacher weights differ from the resumed checkpoint')
     student_before = module_digest(student, parameters_only=True)
     device = torch.device(device) if device is not None else next(student.parameters()).device
     monitor = GPUMonitor(device, config['logging']['gpu_poll_seconds'])
     total_steps = len(train_loader) * config['training']['epochs']
     if config['training']['max_steps'] is not None:
         total_steps = min(total_steps, config['training']['max_steps'])
+    if resume is not None and resume.get('resume_state'):
+        total_steps = resume['resume_state']['total_steps']
     schedule = schedule or TrainingSchedule(config, total_steps=total_steps)
     augmentation = StudentAugmentation(config)
     global_step, images_seen, history = 0, 0, []
     started = perf_counter()
+    previous_seconds = ((resume.get('resume_state') or {}).get('seconds', 0.) if resume else 0.)
     completed = False
     best, best_epoch = None, None
     best_metric = config['reporting']['best_metric']
+    early = EarlyStopping(best_metric, **config['training']['early_stopping'])
+    first_epoch, previous_rows = 1, []
+    if resume is not None:
+        previous_rows, history, best, best_epoch, images_seen = restore_progress(resume, output, early, best_metric)
+        global_step, first_epoch = resume['global_step'], resume['epoch'] + 1
+    stopped_early = False
     cache = TeacherFeatureCache(FEATURE_CACHE_DIR) if config['training']['releas'] else None
     if device.type == 'cuda':
         torch.cuda.reset_peak_memory_stats(device)
@@ -117,7 +148,11 @@ def fit(teacher, student, criterion, train_loader, val_loader, optimizer, metric
         else:
             teacher.to(device)
             move_student(student, criterion, optimizer, device)
-        with (output / 'metrics.jsonl').open('x', encoding='utf-8') as stream:
+        if resume is not None:
+            temporary = output / 'metrics.jsonl.tmp'
+            temporary.write_text(''.join(json.dumps(json_safe(row), allow_nan=False) + '\n' for row in previous_rows), encoding='utf-8')
+            temporary.replace(output / 'metrics.jsonl')
+        with (output / 'metrics.jsonl').open('a' if resume is not None else 'x', encoding='utf-8') as stream:
             def record(row):
                 stream.write(json.dumps(json_safe(row), allow_nan=False) + '\n')
                 stream.flush()
@@ -150,7 +185,16 @@ def fit(teacher, student, criterion, train_loader, val_loader, optimizer, metric
                         'cache_dir': str(cache.directory),
                         'gpu_allocated_mib': torch.cuda.memory_allocated(device) / 2**20 if device.type == 'cuda' else None})
                 move_student(student, criterion, optimizer, device)
-            for epoch in range(1, config['training']['epochs'] + 1):
+            if resume is not None:
+                state = resume.get('resume_state') or {}
+                if state.get('rng'):
+                    restore_rng(state['rng'], augmentation, (train_loader, val_loader), device)
+                    augmentation.applied_count = state.get('augmentation_applied', 0)
+                record({'event': 'resume', 'epoch': resume['epoch'], 'step': global_step,
+                        'rng_restored': bool(state.get('rng'))})
+                tqdm.write(f'[Resume]: epoch={first_epoch} | step={global_step} | RNG=' +
+                           ('restored' if state.get('rng') else 'unavailable in this checkpoint'))
+            for epoch in range(first_epoch, config['training']['epochs'] + 1):
                 epoch_loss, epoch_images, epoch_clips, batches = 0.0, 0, 0, 0
                 augmentation_ratio = augmentation.ratio(epoch)
                 gpu_values = []
@@ -205,7 +249,7 @@ def fit(teacher, student, criterion, train_loader, val_loader, optimizer, metric
                 from .temporal import write_stage_report
                 write_stage_report(validation, report_dir or output, prefix='temporal_latest')
                 for profile, scores in validation['profiles'].items():
-                    tqdm.write(f'[Profile]: {profile} | PSNR={scores["psnr"]:.3f} | SSIM={scores["ssim"]:.4f} | LPIPS={scores["lpips"]:.4f}')
+                    tqdm.write(profile_row(profile, scores))
                 quality = validation['image_mean']
                 tqdm.write(f'Epoch {epoch}: loss={row["train_loss"]:.6f}, '
                            f'PSNR={quality["psnr"]:.3f}, SSIM={quality["ssim"]:.4f}, LPIPS={quality["lpips"]:.4f}')
@@ -214,26 +258,43 @@ def fit(teacher, student, criterion, train_loader, val_loader, optimizer, metric
                     tqdm.write(f'Forward latency: Teacher={timing["teacher_latency_ms"]:.2f} ms/image, '
                                f'Student={timing["student_latency_ms"]:.2f} ms/image')
                 current = validation_values(validation)
-                if is_better(current, best, best_metric):
-                    save_checkpoint(output / 'best.pt', student, criterion, optimizer, epoch=epoch,
-                                    step=global_step, config=config, controls=controls, blend_scale=blend_scale)
+                improved = is_better(current, best, best_metric)
+                if improved:
                     message = best_message(epoch, current, best)
                     best, best_epoch = dict(current), epoch
-                    record({'event': 'best', 'epoch': epoch, 'metric': best_metric, 'values': best})
-                    tqdm.write(message)
-                save_checkpoint(output / 'last.pt', student, criterion, optimizer, epoch=epoch,
-                                step=global_step, config=config, controls=controls, blend_scale=blend_scale)
+                stopped_early = early.update(current[best_metric], epoch)
+                resume_state = {'rng': capture_rng(augmentation, (train_loader, val_loader), device),
+                    'augmentation_applied': augmentation.applied_count, 'history': history,
+                    'early': {key: getattr(early, key) for key in ('best', 'best_epoch', 'bad_epochs')},
+                    'total_steps': schedule.total_steps, 'teacher_digest': teacher_before,
+                    'seconds': previous_seconds + perf_counter() - started, 'report_dir': str(report_dir) if report_dir else None}
+                for name in (('best.pt', 'last.pt') if improved else ('last.pt',)):
+                    save_checkpoint(output / name, student, criterion, optimizer, epoch=epoch,
+                        step=global_step, config=config, controls=controls, blend_scale=blend_scale,
+                        resume_state=resume_state)
+                    if name == 'best.pt':
+                        record({'event': 'best', 'epoch': epoch, 'metric': best_metric, 'values': best})
+                        tqdm.write(highlight_best(message))
+                if stopped_early:
+                    record({'event': 'early_stop', 'epoch': epoch, 'metric': best_metric,
+                            'patience': early.patience, 'min_delta': early.min_delta})
+                    tqdm.write(f'[Early stop]: {best_metric.upper()} | no sufficient improvement for '
+                               f'{early.patience} epochs | best checkpoint epoch={best_epoch}')
+                    break
                 maximum = config['training']['max_steps']
                 if maximum is not None and global_step >= maximum:
                     break
             summary = {
-                'status': 'completed', 'reference': 'matching_profile_temporal_teacher_rgb', 'global_step': global_step,
+                'status': 'early_stopped' if stopped_early else 'completed',
+                'early_stopping': {**config['training']['early_stopping'], 'metric': best_metric,
+                                   'triggered': stopped_early, 'bad_epochs': early.bad_epochs},
+                'profiles': config['training']['profiles'], 'reference': 'matching_profile_temporal_teacher_rgb', 'global_step': global_step,
                 'epochs_run': len(history), 'train_images_seen': images_seen,
                 'student_parameters_updated': module_digest(student, parameters_only=True) != student_before,
                 'teacher_unchanged': True, 'teacher_released': cache is not None,
                 'teacher_blend_scale': blend_scale, 'student_parameter_count': sum(p.numel() for p in student.parameters()),
                 'adapter_parameter_count': sum(p.numel() for p in criterion.parameters()),
-                'seconds': perf_counter() - started, 'history': history,
+                'seconds': previous_seconds + perf_counter() - started, 'history': history,
                 'best_epoch': best_epoch, 'best_metric': best_metric, 'best_values': best,
                 'best_checkpoint': str(output / 'best.pt'), 'last_checkpoint': str(output / 'last.pt'),
                 'statistics': metric_statistics(history, best_epoch),
