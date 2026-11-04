@@ -19,7 +19,7 @@ from torch import nn
 from .reporting import (validation_values, is_better, best_message, metric_statistics,
                         write_training_report, EarlyStopping)
 from .prediction_report import (augment_image, export_predictions, prepare_variant,
-                                resize_rgb, sample_modes, VariantInput, MODES)
+                                sample_modes, VariantInput, MODES)
 from .test_training import tiny_model, FixtureTeacher, identity_prepare
 from model.card.loss import DistillationLoss
 from .training_config import load_training_config

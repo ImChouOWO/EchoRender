@@ -1,8 +1,8 @@
-﻿"""Pure PyTorch Mamba-1 style Selective SSM, including CPU/Windows support.
+"""Pure PyTorch Mamba-1 style Selective SSM, including CPU/Windows support.
 
 Uses input-dependent delta/B/C, negative diagonal A, causal depthwise convolution
-and SiLU output gating. Sequential scan is a correctness/research baseline, not
-an optimized kernel or an official mamba-ssm package. No streaming cache API.
+and SiLU output gating. CUDA uses the official fused mamba-ssm selective scan; the CPU recurrence
+is retained for numerical tests. No streaming cache API.
 """
 import math
 import torch
@@ -19,6 +19,14 @@ def selective_scan(u, delta, A, B, C, D):
 Float32 accumulation for half/bfloat16; retain float64 for numerical tests.
 Recurrence: h[t] = exp(delta[t]*A)*h[t-1] + delta[t]*B[t]*u[t].
 """
+    if u.is_cuda:
+        from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
+        # Keep the original recurrence in FP32; the CUDA kernel fuses its forward/backward scan.
+        values = [v.float() for v in (u, delta, A, B, C, D)]
+        u, delta, A, B, C, D = values
+        result = selective_scan_fn(u.transpose(1, 2).contiguous(), delta.transpose(1, 2).contiguous(),
+            A.contiguous(), B.transpose(1, 2).contiguous(), C.transpose(1, 2).contiguous(), D.contiguous())
+        return result.transpose(1, 2)
     dtype = torch.float64 if u.dtype == torch.float64 else torch.float32
     u, delta, A, B, C, D = (v.to(dtype) for v in (u, delta, A, B, C, D))
     batch, length, channels = u.shape
@@ -96,15 +104,15 @@ class MambaBlock(nn.Module):
             raise ValueError('Expected nonempty BCHW image')
         b, c, h, w = x.shape
         z = self.norm(x.permute(0, 2, 3, 1))
-        outputs = []
+        total = None
         for direction in self.scan_directions:
             horizontal = direction in (0, 2)
             sequence = z.reshape(b * h, w, c) if horizontal else z.permute(0, 2, 1, 3).reshape(b * w, h, c)
             reverse = direction in (2, 3)
             value = self.mixer(sequence.flip(1)).flip(1) if reverse else self.mixer(sequence)
             value = value.reshape(b, h, w, c) if horizontal else value.reshape(b, w, h, c).permute(0, 2, 1, 3)
-            outputs.append(value)
-        y = torch.stack(outputs).mean(0)
+            total = value if total is None else total + value
+        y = total / len(self.scan_directions)
         return x + y.permute(0, 3, 1, 2).contiguous()
 
 

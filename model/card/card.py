@@ -9,12 +9,21 @@ from torch.nn import functional as F
 from .mamba import Mamba, MambaBlock, MambaStage, SSMStage
 
 class InputAdapter(nn.Module):
-    def __init__(self, c1, c2):
+    def __init__(self, c1, c2, heads=None, window=16, ratio=4):
         super().__init__()
+        self.size = None
         self.proj = nn.Conv2d(c1, c2, 1)
+        self.has_attention = heads is not None
+        self.block = SwinBlock(c2, heads, window, ratio=ratio) if self.has_attention else nn.Identity()
+
+    @staticmethod
+    def resize(x, size):
+        return F.interpolate(x, size=(size, size), mode='bilinear', align_corners=False,
+                             antialias=True) if x.shape[-2:] != (size, size) else x
 
     def forward(self, x):
-        return self.proj(x)
+        # Only the root adapter has a size; stage channel projections keep their grid.
+        return self.block(self.proj(self.resize(x, self.size) if self.size else x))
 
 class FeedForward(nn.Module):
     def __init__(self, dim, ratio=4):
@@ -159,7 +168,10 @@ class Add(nn.Module):
     def forward(self, xs):
         if len(xs) < 2 or any(x.shape != xs[0].shape for x in xs):
             raise ValueError('Add needs at least two tensors of equal shape')
-        return torch.stack(xs).sum(0)
+        result = xs[0]
+        for value in xs[1:]:
+            result = result + value
+        return result
 
 
 class Concat(nn.Module):

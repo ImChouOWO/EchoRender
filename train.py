@@ -50,28 +50,35 @@ def main(argv=None):
         if device.type == 'cuda':
             torch.cuda.set_device(device)
         def create_teacher():
-            teacher = EchoRenderTeacher(config['model']['teacher_weights'], device='cpu')
+            teacher = EchoRenderTeacher(config['model']['teacher_weights'], device='cpu',
+                                       stages=config['training']['distillation_layers'])
             if teacher.model.topology.name != 'ht':
                 raise ValueError('This student targets the HT Teacher (71 blocks), not small/custom topology')
             return teacher
-        student = EchoRenderStudent(config['model']['student_config'])
-        student_channels = {name: student.channels[index] for name, index in student.FEATURE_LAYERS.items()}
+        student = EchoRenderStudent(config['model']['student_config'],
+            adapter_size=config['training']['adapter_size'], distillation_layers=config['training']['distillation_layers'],
+            precision=config['training']['precision'])
+        student_channels = {name: student.channels[index] for name, index in student.feature_layers.items()}
         if config['model']['student_weights']:
             load_student_state(student, config['model']['student_weights'])
         if resume is not None:
             validate_resume(resume, config, student)
-        criterion = DistillationLoss(config['loss'], student_channels=student_channels)
-        optimizer = torch.optim.SGD(list(student.parameters()) + list(criterion.parameters()),
-                                    **config['training']['optimizer'])
         # Keep official pretrained LPIPS downloads in an existing ignored cache.
         os.environ.setdefault('TORCH_HOME', str(Path(__file__).resolve().parent / '.cache/torch'))
+        criterion = DistillationLoss(config['loss'], stages=config['training']['distillation_layers'], student_channels=student_channels)
+        parameters = [p for module in (student, criterion) for p in module.parameters() if p.requires_grad]
+        optimizer = torch.optim.SGD(parameters,
+                                    **config['training']['optimizer'])
         metrics = ImageMetrics(net=config['validation']['lpips_net'],
                                ssim_window=config['loss']['ssim_window'])
         output = output if resume is not None else reserve_output_dir(output)
         config['runtime']['output_dir'] = str(output)
         print(f'Output: {output}', flush=True)
         print(f'Training on {device}; train clips/profiles={len(train_loader.dataset)}, val={len(val_loader.dataset)}', flush=True)
+        if data.kind == 'reds':
+            print('[Data]: REDS sharp RGB | targets: Teacher | motion guides: RGB-estimated, no ground-truth flow loss', flush=True)
         print(f'Student motion: {student.motion_mode} | profiles: ' + ', '.join(config['training']['profiles']), flush=True)
+        print(f"Precision: {student.precision} | SSM: fused CUDA scan | targets: " + ', '.join(config['training']['distillation_layers']), flush=True)
         print(f"Batch: effective={config['loader']['batch_size']} clips, micro={config['training']['micro_batch_size']} concurrent frames", flush=True)
         report_dir = None
         on_complete = None

@@ -2,8 +2,9 @@
 # Each row: [from, repeats, module, args]. -1 means previous layer.
 # Stage args: [channels, depth, heads, window, ffn_ratio] (ViT omits window).
 # The recovered teacher owns special sampling, grouped FFN, gates and FP8 rounding.
+stages: {E0: 1, E1: 3, E2: 5, E3: 7, E4: 9, VIT: 11, D1: 14, D2: 17, D3: 20}
 input_channels: 8  # current RGB (0:3), aligned history RGB (3:6), style (6), tone (7)
-motion: raw  # raw: external RGB optical flow; feat: trainable parallel RGB-pair branch
+motion: raw  # external RGB optical flow; raft_small selects trainable RAFT-Small
 output_channels: 4
 input_layout: BHWC
 backbone:
@@ -35,4 +36,5 @@ head:
   - [[-1, 1], 1, Upsample, [32]]     # 24
   - [[-1, 1], 1, Add, []]            # 25
   - [-1, 1, SwinStage, [32, 5, 1, 8, 4]] # 26: blocks 66-70 topology
-  - [-1, 1, OutputHead, [4]]         # 27
+  - [[-1, 0], 1, Add, []]                   # 27: direct InputAdapter residual before the output head
+  - [-1, 1, OutputHead, [4]]         # 28

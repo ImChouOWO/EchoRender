@@ -16,11 +16,11 @@ from torch.nn import functional as F
 
 from .training_config import load_training_config, TrainingSchedule
 from .dataloader import load_data_config, build_dataloader
-from .temporal import (prepare_student_frame, prepare_frame, student_inputs, compose_tensor, teacher_target, crop_rgb,
+from .temporal import (prepare_student_frame, prepare_frame, student_inputs, compose_tensor, teacher_target, image_rgb,
                        compose_output, frame_guides, write_stage_report, FORMAT)
 from .distillation import StudentAugmentation, train_batch, evaluate, cache_key, make_frame, module_digest
 from .teacher_features import TeacherFeatureCache
-from .test_training import tiny_model, FixtureTeacher
+from .test_training import tiny_model, FixtureTeacher, FixtureMotion
 from .test_teacher_infer import write_flow
 from model.card.loss import DistillationLoss
 from mlxdlss.features import NetworkGeometry
@@ -93,30 +93,30 @@ class TemporalTests(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(9)
         self.config = deepcopy(load_training_config())
-        self.config['training'].update(crop_size=0, epochs=4, releas=False)
+        self.config['loss'].update(rgb_lpips=0., appearance=0.)
+        self.config['training']['distillation_layers'] = ['RGB composition', 'OutputHead', 'E2', 'VIT', 'D1', 'D3']
+        self.config['training']['precision'] = 'float32'
+        self.config['training'].update(adapter_size=32, epochs=4, releas=False)
         self.config['logging']['progress'] = False
         self.config['benchmark']['enabled'] = False
         self.config['loss'].update(ssim_window=3, ms_ssim_weights=[1.])
-        self.geometry = patch('tool.temporal.network_geometry', lambda w, h, minimum: NetworkGeometry.identity(w, h))
-        self.geometry.start()
-        self.addCleanup(self.geometry.stop)
 
     def criterion(self):
-        return DistillationLoss(self.config['loss'], channels=dict.fromkeys(('e1', 'e2', 'e3', 'vit'), 4))
+        return DistillationLoss(self.config['loss'], channels=dict.fromkeys(('E2', 'VIT', 'D1', 'D3'), 4))
 
     def test_student_input_keeps_rgb_history_style_tone_and_rejects_teacher_layout(self):
         student = tiny_model().eval()
-        rgb = crop_rgb(sample()['images'][0], 0)
+        rgb = image_rgb(sample()['images'][0])
         outputs, inputs = [], []
         for profile in self.config['rendering']['profiles']:
             teacher_frame = prepare_frame(rgb, self.config, profile)
             with patch('tool.temporal.make_features', side_effect=AssertionError('Teacher preprocessing used by Student')):
                 frame = prepare_student_frame(rgb, self.config, profile, student)
             x = student_inputs(frame, 'cpu')
-            self.assertEqual(x.shape[-1], 8)
+            self.assertEqual(x.shape[-1], 16)
             self.assertEqual(teacher_frame.inputs.shape[-1], 16)
-            torch.testing.assert_close(x, teacher_frame.inputs[..., 4:12], atol=0, rtol=0)
-            with self.assertRaisesRegex(ValueError, 'Student frame'):
+            torch.testing.assert_close(x[..., :8], teacher_frame.inputs[..., 4:12], atol=0, rtol=0)
+            with self.assertRaisesRegex(ValueError, 'Student frames'):
                 student_inputs(teacher_frame, 'cpu')
             outputs.append(student(x))
             inputs.append(x)
@@ -136,26 +136,23 @@ class TemporalTests(unittest.TestCase):
         other.load_state_dict(student.state_dict(), strict=True)
         torch.testing.assert_close(other(student_inputs(frame, 'cpu', 'BCHW')).permute(0, 2, 3, 1), outputs[-1])
 
-    def test_student_retained_channels_match_teacher_with_real_padding(self):
-        from teacher_infer import network_geometry
-        student = tiny_model('feat')
+    def test_full_image_adapter_matches_teacher_geometry_and_controls(self):
+        from model.card.card import InputAdapter
+        student = tiny_model('raft_small')
         rgb = np.random.default_rng(3).random((37, 53, 3), dtype=np.float32)
-        with patch('tool.temporal.network_geometry', network_geometry):
-            for profile in self.config['rendering']['profiles']:
-                teacher = prepare_frame(rgb, self.config, profile)
-                frame = prepare_student_frame(rgb, self.config, profile, student)
-                x = student_inputs(frame, 'cpu')
-                self.assertEqual(tuple(x.shape), (1, 320, 320, 8))
-                torch.testing.assert_close(x, teacher.inputs[..., 4:12], atol=0, rtol=0)
-        cinematic = prepare_student_frame(rgb, self.config, 'cinematic', student)
-        neutral = prepare_student_frame(rgb, self.config, 'neutral', student)
-        torch.testing.assert_close(cinematic.inputs[..., :7], neutral.inputs[..., :7], atol=0, rtol=0)
-        self.assertTrue(torch.all(cinematic.inputs[..., 7] == 1))
-        self.assertTrue(torch.all(neutral.inputs[..., 7] == 0))
+        for profile in self.config['rendering']['profiles']:
+            teacher = prepare_frame(rgb, self.config, profile)
+            frame = prepare_student_frame(rgb, self.config, profile, student)
+            x = student_inputs(frame, 'cpu')
+            self.assertEqual(tuple(x.shape), (1, 37, 53, 16))
+            resized = InputAdapter.resize(x.permute(0, 3, 1, 2), student.adapter_size).permute(0, 2, 3, 1)
+            self.assertEqual(teacher.inputs.shape[1:3], resized.shape[1:3])
+            torch.testing.assert_close(resized[..., :6], teacher.inputs[..., 4:10], atol=6e-5, rtol=0)
+            torch.testing.assert_close(resized[..., 6:8], teacher.inputs[..., 10:12], atol=3e-7, rtol=0)
 
     def test_predicted_flow_aligns_history_before_input_and_rejects_invalid_pixels(self):
         from mlxdlss.features import scaled_color
-        student = tiny_model('feat')
+        student = tiny_model('raft_small')
         rgb = np.full((32, 32, 3), .2, np.float32)
         history = np.broadcast_to(np.arange(32, dtype=np.float32)[None, :, None] / 32, rgb.shape).copy()
         field = torch.zeros(1, 2, 32, 32)
@@ -234,7 +231,7 @@ class TemporalTests(unittest.TestCase):
             finally:
                 cache.close(delete=False)
 
-    def test_current_cache_index_gains_profile_signatures_without_reextracting(self):
+    def test_cache_index_without_profile_signatures_is_rejected_without_touching_targets(self):
         with tempfile.TemporaryDirectory() as directory:
             cache = TeacherFeatureCache(Path(directory) / 'feats')
             cache.open()
@@ -250,8 +247,8 @@ class TemporalTests(unittest.TestCase):
                 manifest.pop('profile_signatures')
                 index.write_text(json.dumps(manifest))
                 times = {p: p.stat().st_mtime_ns for p in cache.directory.rglob('targets.pt')}
-                self.assertTrue(cache.reuse(signature))
-                self.assertEqual(set(cache.read_manifest()['profile_signatures']), {'standard', 'neutral'})
+                self.assertFalse(cache.reuse(signature))
+                self.assertNotIn('profile_signatures', cache.read_manifest())
                 self.assertTrue(all(p.stat().st_mtime_ns == modified for p, modified in times.items()))
             finally:
                 cache.close(delete=False)
@@ -310,10 +307,10 @@ class TemporalTests(unittest.TestCase):
         self.assertGreater(float(field.grad[:, 0].abs().sum()), 0)
 
     def test_feature_motion_is_independent_trainable_and_not_ground_truth_driven(self):
-        student = tiny_model('feat')
+        student = tiny_model('raft_small')
         self.assertEqual(set(dict(student.motion.named_children())), {'encoder', 'decoder'})
         self.assertEqual(student.motion.encoder[2].out_channels, 64)
-        prior = crop_rgb(sample()['images'][0], 0)
+        prior = image_rgb(sample()['images'][0])
         current = np.roll(prior, 2, axis=1)
         target = np.zeros((*prior.shape[:2], 2), np.float32)
         target[..., 0] = -2 / prior.shape[1]
@@ -348,7 +345,7 @@ class TemporalTests(unittest.TestCase):
     def test_feature_mode_updates_and_single_frame_has_no_missing_gradients(self):
         config = deepcopy(self.config)
         config['rendering']['train_min_frames'] = 2
-        student, criterion = tiny_model('feat'), self.criterion()
+        student, criterion = tiny_model('raft_small'), self.criterion()
         teacher = FixtureTeacher()
         before = module_digest(teacher)
         optimizer = torch.optim.SGD([*student.parameters(), *criterion.parameters()], lr=.01)
@@ -356,19 +353,19 @@ class TemporalTests(unittest.TestCase):
         for frames in (1, 2):
             batch = {'sequences': [sample(frames=frames, name=str(i)) for i in range(2)]}
             result = train_batch(teacher, student, criterion, batch, optimizer, config=config,
-                crop_size=0, controls=controls, blend_scale=.5, micro_batch_size=2)
+                controls=controls, blend_scale=.5, micro_batch_size=2)
             self.assertGreaterEqual(result['components']['motion'], 0)
             self.assertTrue(all(p.grad is not None for p in student.motion.parameters()))
         self.assertEqual(module_digest(teacher), before)
         self.assertGreater(float(student.motion.decoder[-1].weight.detach().abs().sum()), 0)
-        frame = prepare_student_frame(crop_rgb(sample()['images'][0], 0), config, 'neutral', student)
+        frame = prepare_student_frame(image_rgb(sample()['images'][0]), config, 'neutral', student)
         self.assertIsNone(frame.history)
 
     def test_feature_checkpoint_reloads_exactly_and_rejects_retired_formats(self):
         from .trainer import save_checkpoint, load_student_state
-        student, criterion = tiny_model('feat').eval(), self.criterion()
+        student, criterion = tiny_model('raft_small').eval(), self.criterion()
         optimizer = torch.optim.SGD([*student.parameters(), *criterion.parameters()], lr=.001)
-        rgb = crop_rgb(sample()['images'][0], 0)
+        rgb = image_rgb(sample()['images'][0])
         frame = prepare_student_frame(rgb, self.config, 'neutral', student, previous=rgb, history=rgb)
         inputs = student_inputs(frame, 'cpu')
         expected = student(inputs).detach()
@@ -377,28 +374,28 @@ class TemporalTests(unittest.TestCase):
             save_checkpoint(path, student, criterion, optimizer, epoch=1, step=1, config=self.config,
                 controls={'loss_weights': self.config['loss']}, blend_scale=.5)
             payload = torch.load(path, weights_only=True)
-            restored = type(student)(payload['student_config']).eval()
+            restored = tiny_model('raft_small').eval()
             load_student_state(restored, path)
-            self.assertEqual(restored.motion_mode, 'feat')
-            self.assertEqual(restored.input_channels, 8)
+            self.assertEqual(restored.motion_mode, 'raft_small')
+            self.assertEqual(restored.input_channels, 16)
             torch.testing.assert_close(restored(inputs), expected, atol=0, rtol=0)
             payload['format'] = 'echorender-bhwc16-motion-v4'
             torch.save(payload, path)
             with self.assertRaises(ValueError):
                 load_student_state(restored, path)
         retired = deepcopy(student.config)
-        retired['input_channels'] = 16
+        retired['input_channels'] = 8
         with self.assertRaises(ValueError):
             type(student)(retired)
 
     def test_rgb_only_prediction_has_no_dependency_on_dataset_flow_in_either_mode(self):
         from .prediction_report import predict_clip
         config = deepcopy(self.config)
-        config['reporting'].update(crop_size=0, inference_size=0)
+        config['reporting'].update(samples_per_mode=2)
         rgb_only = sample(frames=2)
         rgb_only['motions'] = [None, None]
         rgb_only['confidences'] = [None, None]
-        for mode in ('raw', 'feat'):
+        for mode in ('raw', 'raft_small'):
             student = tiny_model(mode).eval()
             with patch('tool.temporal.frame_guides', side_effect=AssertionError('Student must not read flow')):
                 _, prediction, info = predict_clip(student, rgb_only, 'original', 0, 'neutral', config,
@@ -423,7 +420,7 @@ class TemporalTests(unittest.TestCase):
             self.assertEqual(item['motions'][1].shape, (32, 32, 2))
 
     def test_composition_matches_teacher_host_for_all_profiles_and_history(self):
-        rgb = crop_rgb(sample()['images'][0], 0)
+        rgb = image_rgb(sample()['images'][0])
         for profile in self.config['rendering']['profiles']:
             for temporal in (False, True):
                 motion = np.zeros((*rgb.shape[:2], 2), np.float32)
@@ -484,7 +481,7 @@ class TemporalTests(unittest.TestCase):
         for student, loss, cached, micro in ((a, criterion, None, 1), (b, other_criterion, cache, 2)):
             optimizer = torch.optim.SGD([*student.parameters(), *loss.parameters()], lr=.001)
             values.append(train_batch(teacher if cached is None else None, student, loss, batch, optimizer,
-                config=config, crop_size=0, controls=controls, augmentation=StudentAugmentation(config),
+                config=config, controls=controls, augmentation=StudentAugmentation(config),
                 augmentation_ratio=0, target_cache=cached, blend_scale=.5, micro_batch_size=micro))
         self.assertAlmostEqual(values[0]['loss'], values[1]['loss'], places=5)
         for actual, expected in zip(a.parameters(), b.parameters()):
@@ -575,7 +572,7 @@ class TemporalTests(unittest.TestCase):
             controls={'loss_weights': self.config['loss']}, blend_scale=.5)
         self.assertGreater(result['benchmark']['teacher_latency_ms'], 0)
         self.assertGreater(result['benchmark']['student_latency_ms'], 0)
-        self.assertEqual(result['benchmark']['student_input_shape'][-1], 8)
+        self.assertEqual(result['benchmark']['student_input_shape'][-1], 16)
 
     def test_cache_groups_frame_payloads_and_rejects_old_signature(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -613,8 +610,8 @@ class TemporalTests(unittest.TestCase):
         disabled = deepcopy(self.config)
         disabled['rendering']['history_strength'] = 0
         self.assertIsNone(make_frame(s, 1, disabled, target['history']).history)
-        student = tiny_model('feat')
-        current = crop_rgb(s['images'][1], 0)
+        student = tiny_model('raft_small')
+        current = image_rgb(s['images'][1])
         frame = prepare_student_frame(current, self.config, 'neutral', student,
             previous=current, history=target['history'])
         frame.confidence = torch.zeros_like(frame.confidence)
@@ -789,12 +786,12 @@ class TemporalTests(unittest.TestCase):
         from .prediction_report import export_predictions
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            student = tiny_model('feat')
+            student = tiny_model('raft_small')
             weights = root / 'best.pt'
             torch.save({'format': FORMAT, 'epoch': 1, 'student_config': student.config,
                 'student': student.state_dict(), 'teacher_blend_scale': .5, 'train_config': self.config}, weights)
             config = deepcopy(self.config)
-            config['reporting'].update(samples_per_mode=1, strengths=[.25, 1.], inference_size=0)
+            config['reporting'].update(samples_per_mode=1, strengths=[.25, 1.])
             dataset = ClipDataset(root, profiles=tuple(config['rendering']['profiles']))
             # One-frame reports exercise the legitimate temporal first-frame path.
             original = sample
@@ -802,7 +799,7 @@ class TemporalTests(unittest.TestCase):
                 def __getitem__(self, index):
                     return original(profile=self.items[index][1], frames=1)
             dataset = OneFrame(root, profiles=dataset.profiles)
-            with redirect_stdout(io.StringIO()):
+            with redirect_stdout(io.StringIO()), patch('model.student.RaftSmallMotion', return_value=FixtureMotion()):
                 manifest = export_predictions(weights, FixtureTeacher, {'val': Loader(dataset)}, config,
                                               root / 'report', 'cpu')
             self.assertEqual(manifest['status'], 'completed')
@@ -815,7 +812,7 @@ class TemporalTests(unittest.TestCase):
                 self.assertIn('avg infer', grid['title'])
                 self.assertTrue((root / 'report' / grid['path']).is_file())
             rows = [json.loads(line) for line in (root / 'report/predictions.jsonl').read_text().splitlines()]
-            self.assertTrue(all(r['model_input_shape'][-1] == (8 if r['model'] == 'student' else 16) for r in rows))
+            self.assertTrue(all(r['model_input_shape'][-1] == 16 for r in rows))
 
 
 if __name__ == '__main__':

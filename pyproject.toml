@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "lpips>=0.1.4",
+    "mamba-ssm==2.2.6.post3; sys_platform == 'linux'",
     "matplotlib>=3.10",
     "mlxdlss",
     "numpy>=1.26",
@@ -17,6 +18,7 @@ dependencies = [
     "safetensors>=0.4",
     "torch>=2.7",
     "torchvision>=0.22",
+    "transformers==4.44.2; sys_platform == 'linux'",
     "tqdm>=4.67",
 ]
 
@@ -36,3 +38,6 @@ torchvision = [
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
+
+[tool.uv.extra-build-dependencies]
+mamba-ssm = [{ requirement = "torch", match-runtime = true }, "packaging", "ninja", "wheel", "einops"]

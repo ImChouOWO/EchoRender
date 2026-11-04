@@ -33,18 +33,22 @@ def read_checkpoint(path):
 
 
 def validate_resume(payload, config, student):
+    state = payload.get('resume_state')
+    required = {'rng', 'history', 'early', 'teacher_digest', 'total_steps', 'seconds', 'augmentation_applied'}
+    if not isinstance(state, dict) or not required <= state.keys():
+        raise ValueError('Resume requires a complete checkpoint including RNG and training progress')
     if payload['student_config'] != student.config:
         raise ValueError('Resume requires the checkpoint Student architecture and motion mode')
     saved = payload['train_config']
     for section in ('dataset', 'loader', 'loss', 'augmentation', 'schedule', 'validation'):
         if saved[section] != config[section]:
             raise ValueError(f'Resume requires the original {section} settings')
-    profiles = saved['training'].get('profiles', list(saved['rendering']['profiles']))
+    profiles = saved['training']['profiles']
     rendering = {**config['rendering'], 'profiles': {name: config['rendering']['profiles'][name]
                                                   for name in config['training']['profiles']}}
     if profiles != config['training']['profiles'] or saved['rendering'] != rendering:
         raise ValueError('Resume requires the original profiles and rendering settings')
-    for key in ('epochs', 'max_steps', 'crop_size', 'optimizer', 'grad_clip', 'micro_batch_size'):
+    for key in ('epochs', 'max_steps', 'adapter_size', 'distillation_layers', 'optimizer', 'grad_clip', 'micro_batch_size', 'precision'):
         if saved['training'][key] != config['training'][key]:
             raise ValueError(f'Resume requires the original training.{key}')
     if saved['model']['teacher_weights'] != config['model']['teacher_weights']:
@@ -111,8 +115,8 @@ def load_log(output, epoch):
 
 def restore_progress(payload, output, early, metric):
     rows = load_log(output, payload['epoch'])
-    state = payload.get('resume_state') or {}
-    history = state.get('history', [row for row in rows if row.get('event') == 'epoch'])
+    state = payload['resume_state']
+    history = state['history']
     if not history or history[-1]['epoch'] != payload['epoch']:
         raise ValueError('Epoch history is missing; keep metrics.jsonl alongside this checkpoint')
     best, best_epoch = None, None

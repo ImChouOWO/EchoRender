@@ -1,7 +1,8 @@
-"""Capture stages from the pinned functional Teacher, without copying its graph.
+"""Capture selected input/encoder/global/decoder stages from the unchanged Teacher graph.
 
-E1/E2/E3: last window output before fused pooling/projection; ViT: last global
-block. The existing backend performs every operation. Captures are detached BCHW.
+InputAdapter captures the quantized full-resolution block-0 skip before pooling.
+E1/E2/E3 precede pooling; ViT ends the global stack; D1/D2/D3 end decoder
+stacks 47/55/61. Captures are detached BCHW; only selected stages are retained.
 """
 import torch
 import mlxdlss.model as backend
@@ -9,19 +10,34 @@ from mlxdlss.model import NeuralRenderingModel
 
 
 class FeatureRecordingBackend(NeuralRenderingModel):
-    def __init__(self, weights):
+    def __init__(self, weights, *, stages=None):
         super().__init__(weights)
+        from model.student import DEFAULT_STAGES, STAGES, HEAD, COMPOSITION
+        selected = tuple(DEFAULT_STAGES if stages is None else stages)
+        if not selected or len(set(selected)) != len(selected) or any(n not in (*STAGES, HEAD, COMPOSITION) for n in selected):
+            raise ValueError("Invalid Teacher distillation stages")
+        self.stages = tuple(name for name in selected if name in STAGES)
         self._captures = None
         self._graph_enabled = False
         self._graph = None
         self._graph_biases = None
         self._window_names = {
-            self.topology.encoder_stage(stage)[-1]: f'e{stage}'
-            for stage in (1, 2, 3)
+            self.topology.encoder_stage(stage)[-1]: f'E{stage}'
+            for stage in (0, 1, 2, 3)
         }
+        self._window_names.update({self.topology.decoder_stage(stage)[-1]: name
+                                   for stage, name in ((3, 'D2'), (2, 'D3'))})
+
+    def _split_window(self, value, index):
+        result = super()._split_window(value, index)
+        if index == self.topology.split_encoder[-1]:
+            self._capture('E4', result)
+        if index == self.topology.split_decoder[-1]:
+            self._capture('D1', result)
+        return result
 
     def _capture(self, name, value):
-        if self._captures is not None:
+        if self._captures is not None and name in self.stages:
             self._captures[name] = value.detach().permute(0, 3, 1, 2).contiguous()
 
     def _window(self, value, index, *, head_count, publish=True):
@@ -29,6 +45,8 @@ class FeatureRecordingBackend(NeuralRenderingModel):
             result = super()._window(value, index, head_count=head_count, publish=publish)
         else:
             result = self._window_cached(value, index, head_count=head_count, publish=publish)
+        if index == 0 and self._captures is not None and 'InputAdapter' in self.stages:
+            self._capture('InputAdapter', backend.e4m3_round_trip(result))
         if index in self._window_names:
             self._capture(self._window_names[index], result)
         return result
@@ -36,7 +54,7 @@ class FeatureRecordingBackend(NeuralRenderingModel):
     def _global(self, value, index):
         result = super()._global(value, index)
         if index == self.topology.global_stage[-1]:
-            self._capture('vit', result)
+            self._capture('VIT', result)
         return result
 
     def _eager_with_features(self, value):
@@ -45,7 +63,7 @@ class FeatureRecordingBackend(NeuralRenderingModel):
         self._captures = {}
         try:
             head = self(value)
-            if set(self._captures) != {'e1', 'e2', 'e3', 'vit'}:
+            if set(self._captures) != set(self.stages):
                 raise RuntimeError('Teacher did not execute all selected stages')
             return head, self._captures
         finally:
@@ -190,12 +208,12 @@ def teacher_temporal_signature():
     import hashlib, inspect
     from . import temporal
     code = '\n'.join(inspect.getsource(getattr(temporal, name)) for name in
-                     ('crop_rgb', 'prepare_frame', 'teacher_target', 'frame_guides', 'reset_history'))
+                     ('image_rgb', 'adapter_rgb', 'prepare_frame', 'teacher_target', 'frame_guides', 'reset_history'))
+    from model.card.card import InputAdapter
+    code += inspect.getsource(InputAdapter.resize)
     signature = hashlib.sha256(code.encode()).hexdigest()
-    # Upgrade provenance for the current, numerically unchanged target pool without recapturing it.
-    previous = ('c0651fd6a8daea8c46aafb77cb558bdcdbf1d9bccea98774cea2288d51fba272'
-                if signature == 'aa88a5a513a76f83d1e33cf293330a4dd1fd664ee9aaaeaafdeb792834a4ebb3' else None)
-    return signature, previous
+    return signature
+
 
 
 class TargetPrefetch:
@@ -242,6 +260,7 @@ class TargetPrefetch:
                 def move(value):
                     return value.pin_memory().to(self.device, non_blocking=True)
                 payload = {**payload, 'head': move(payload['head']), 'rgb': move(payload['rgb']),
+                           'source_rgb': move(payload['source_rgb']),
                            'features': {name: move(value) for name, value in payload['features'].items()}}
         return payload
 
@@ -294,6 +313,8 @@ class TeacherFeatureCache:
         from mlxdlss import model as backend, features
         from model import teacher as wrapper
         import teacher_infer
+        from model.motion import raw_motion
+        import cv2
         files = []
         for split, loader in (('train', train_loader), ('val', val_loader)):
             for scene, paths in loader.dataset.clips:
@@ -303,8 +324,8 @@ class TeacherFeatureCache:
                         if item.is_file():
                             stat = item.stat()
                             files.append((split, str(item), stat.st_size, stat.st_mtime_ns))
-        payload = {'format': 'sequence-targets-v3', 'teacher': teacher_digest,
-            'rendering': config['rendering'], 'crop': config['training']['crop_size'],
+        payload = {'format': 'sequence-targets-v6', 'teacher': teacher_digest,
+            'rendering': config['rendering'], 'adapter_size': config['training']['adapter_size'], 'stages': config['training']['distillation_layers'],
             'data': files, 'dataset': config['dataset'], 'device': str(device), 'torch': torch.__version__,
             'benchmark': config['benchmark'],
             'source': {m.__name__: hashlib.sha256(Path(m.__file__).read_bytes()).hexdigest()
@@ -312,10 +333,11 @@ class TeacherFeatureCache:
             'capture': hashlib.sha256(inspect.getsource(FeatureRecordingBackend).encode()).hexdigest()}
         if device.type == 'cuda':
             payload['gpu_uuid'] = str(torch.cuda.get_device_properties(device).uuid)
-        signature, previous = teacher_temporal_signature()
-        payload['source']['tool.temporal'] = signature
-        alternate = {**payload, 'source': {**payload['source'], 'tool.temporal': previous}} if previous else None
-        fingerprint = self.configure_signatures(payload, alternate)
+        if config['dataset'].get('type') == 'reds':
+            payload['external_motion'] = hashlib.sha256(inspect.getsource(raw_motion).encode()).hexdigest()
+            payload['opencv'] = cv2.__version__
+        payload['source']['tool.temporal'] = teacher_temporal_signature()
+        fingerprint = self.configure_signatures(payload)
         self.required = set()
         for split, loader in (('train', train_loader), ('val', val_loader)):
             for index in range(len(loader.dataset)):
@@ -325,28 +347,26 @@ class TeacherFeatureCache:
                     self.required.add(self.path(split, key).relative_to(self.directory).as_posix())
         return fingerprint
 
-    def configure_signatures(self, payload, alternate=None):
+    def configure_signatures(self, payload):
         import hashlib, json
         def digest(value):
             return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
         fingerprint = digest(payload)
         self.accepted_fingerprints = {fingerprint}
-        if alternate is not None:
-            self.accepted_fingerprints.add(digest(alternate))
         self.profile_signatures, self.accepted_profiles = {}, {}
         for profile, settings in payload['rendering']['profiles'].items():
             rendering = {**payload['rendering'], 'profiles': {profile: settings}}
             value = digest({**payload, 'rendering': rendering})
             self.profile_signatures[profile] = value
             self.accepted_profiles[profile] = {value}
-            if alternate is not None:
-                self.accepted_profiles[profile].add(digest({**alternate, 'rendering': rendering}))
         return fingerprint
 
     def compatible_files(self, manifest, fingerprint):
+        if manifest.get('format') != 'sequence-targets-v6':
+            return {}
+        if not getattr(self, 'profile_signatures', {}) and manifest.get('fingerprint') == fingerprint:
+            return dict(manifest.get('files', {}))
         files = manifest.get('files', {})
-        if not manifest.get('profile_signatures') and manifest.get('fingerprint') in getattr(self, 'accepted_fingerprints', {fingerprint}):
-            return dict(files)
         expected = getattr(self, 'profile_signatures', {})
         recorded = manifest.get('profile_signatures', {})
         return {name: size for name, size in files.items()
@@ -387,7 +407,7 @@ class TeacherFeatureCache:
         files.update({name: size for name, size in manifest.get('files', {}).items() if name.split('/')[0] in retained})
         files = {name: size for name, size in files.items() if self.valid_file(name, size)}
         present = {name.split('/')[0] for name in files}
-        self._progress = {'format': 'sequence-targets-v3', 'fingerprint': fingerprint,
+        self._progress = {'format': 'sequence-targets-v6', 'fingerprint': fingerprint,
             'blend_scale': blend_scale, 'files': files,
             'profile_signatures': {**retained, **{name: value for name, value in signatures.items() if name in present}}}
         self.benchmark = manifest.get('benchmark') if active_compatible else None
@@ -406,7 +426,7 @@ class TeacherFeatureCache:
         from .temporal import PROFILES
         profile, clip_id, position, frame_id = sample_id.split(':')
         source, render_pass, scene, frame = frame_id.split('/')
-        if profile not in PROFILES or split not in ('train', 'val') or render_pass != 'clean':
+        if profile not in PROFILES or split not in ('train', 'val') or render_pass not in ('clean', 'sharp'):
             raise ValueError('Invalid cache target identity')
         if any(part in ('', '.', '..') or '\\' in part for part in (scene, frame)):
             raise ValueError('Invalid cache path')
@@ -450,7 +470,7 @@ class TeacherFeatureCache:
         from itertools import islice
         from time import perf_counter
         from tqdm.auto import tqdm
-        from .temporal import crop_rgb, reset_history, teacher_target
+        from .temporal import image_rgb, reset_history, teacher_target
         from .distillation import make_frame, cache_key
         from .monitoring import measure_forward
         if teacher.device.type == 'cuda' and hasattr(getattr(teacher, 'model', None), 'enable_cuda_graph'):
@@ -472,7 +492,7 @@ class TeacherFeatureCache:
                 nonlocal plan
                 history = previous = None
                 for position, image in enumerate(sample['images']):
-                    rgb = crop_rgb(image, config['training']['crop_size'])
+                    rgb = image_rgb(image)
                     if reset_history(previous, rgb, config):
                         history = None
                     key = cache_key(sample, position)

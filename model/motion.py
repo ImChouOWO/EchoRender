@@ -34,27 +34,35 @@ def raw_motion(previous, current):
     return motion, confidence[..., None]
 
 
-class FeatureMotion(nn.Module):
-    """RGB pair -> 32/64-channel features -> two offsets and one validity logit; no skips."""
-    def __init__(self):
+class RaftSmallMotion(nn.Module):
+    """Pretrained backward RAFT-Small flow plus a trainable Sintel-validity head."""
+    def __init__(self, size=320):
         super().__init__()
-        self.encoder = nn.Sequential(nn.Conv2d(6, 32, 5, stride=2, padding=2), nn.GELU(),
-            nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.GELU(),
-            nn.Conv2d(64, 64, 3, padding=1), nn.GELU())
-        self.decoder = nn.Sequential(nn.Conv2d(64, 32, 3, padding=1), nn.GELU(),
-                                     nn.Conv2d(32, 3, 3, padding=1))
-        # Zero initial displacement; RGB supervision and flow loss train the entire branch.
-        nn.init.zeros_(self.decoder[-1].weight)
-        nn.init.zeros_(self.decoder[-1].bias)
+        import os
+        from pathlib import Path
+        from torchvision.models.optical_flow import raft_small, Raft_Small_Weights
+        os.environ.setdefault('TORCH_HOME', str(Path(__file__).resolve().parents[1] / '.cache/torch'))
+        self.raft = raft_small(weights=Raft_Small_Weights.C_T_V2, progress=False)
+        self.size = max(128, ((size + 7) // 8) * 8)
+        self.confidence = nn.Sequential(nn.Conv2d(8, 32, 3, padding=1), nn.GELU(),
+                                        nn.Conv2d(32, 1, 1))
 
     def forward(self, previous, current):
         if previous.shape != current.shape or current.ndim != 4 or current.shape[1] != 3:
-            raise ValueError('Feature motion requires matching BCHW RGB frames')
-        field = self.decoder(self.encoder(torch.cat((previous, current), dim=1)))
-        height, width = field.shape[-2:]
-        field = F.interpolate(field, current.shape[-2:], mode='bilinear', align_corners=False)
-        units = field.new_tensor([width, height]).view(1, 2, 1, 1)
-        return field[:, :2] / units, field[:, 2:3]
+            raise ValueError('RAFT-Small requires matching BCHW RGB frames')
+        extent = current.shape[-2:]
+        previous = F.interpolate(previous.float(), (self.size, self.size), mode='bilinear',
+                                 align_corners=False, antialias=True)
+        current = F.interpolate(current.float(), (self.size, self.size), mode='bilinear',
+                                align_corners=False, antialias=True)
+        # Current -> previous is the backward field required to sample history.
+        predictions = self.raft(current * 2 - 1, previous * 2 - 1, num_flow_updates=12)
+        field = predictions[-1].float() / self.size
+        logits = self.confidence(torch.cat((current, previous, field), dim=1)).float()
+        # Torchvision retains its latest correlation pyramid as module state.
+        self.raft.corr_block.corr_pyramid = []
+        return (F.interpolate(field, extent, mode='bilinear', align_corners=False),
+                F.interpolate(logits, extent, mode='bilinear', align_corners=False))
 
 
 def warp_history(history, motion, confidence):

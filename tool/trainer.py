@@ -3,6 +3,7 @@ import json
 import gc
 from pathlib import Path
 from time import perf_counter
+from collections import defaultdict
 
 import torch
 from tqdm.auto import tqdm
@@ -21,6 +22,10 @@ from .monitoring import GPUMonitor
 from .resume import (capture_rng, restore_rng, restore_progress, validate_resume, training_lock, checkpoint_values)
 
 
+def feature_cache_dir(config):
+    return FEATURE_CACHE_DIR.with_name(FEATURE_CACHE_DIR.name + '_reds') if config['dataset'].get('type') == 'reds' else FEATURE_CACHE_DIR
+
+
 def json_safe(value):
     """Represent infinite perfect-match PSNR as a JSON string, not invalid JSON."""
     import math
@@ -37,8 +42,8 @@ def load_student_state(student, path):
     payload = torch.load(path, map_location='cpu', weights_only=True)
     if not isinstance(payload, dict) or payload.get('format') != FORMAT:
         raise ValueError(f'Expected a {FORMAT} checkpoint; retraining is required')
-    if payload['student_config']['input_channels'] != 8:
-        raise ValueError('Student checkpoint requires the prepared 8-channel layout')
+    if payload['student_config']['input_channels'] != 16:
+        raise ValueError('Student checkpoint requires the prepared 16-channel layout')
     student.load_state_dict(payload['student'], strict=True)
 
 
@@ -115,7 +120,7 @@ def _fit(teacher, student, criterion, train_loader, val_loader, optimizer, metri
         (output / 'resolved_train.yaml').write_text(yaml.safe_dump(config, sort_keys=False), encoding='utf-8')
     teacher_before = module_digest(teacher)
     if resume is not None:
-        expected_teacher = (resume.get('resume_state') or {}).get('teacher_digest')
+        expected_teacher = resume['resume_state']['teacher_digest']
         if expected_teacher is not None and teacher_before != expected_teacher:
             raise ValueError('Teacher weights differ from the resumed checkpoint')
     student_before = module_digest(student, parameters_only=True)
@@ -124,13 +129,13 @@ def _fit(teacher, student, criterion, train_loader, val_loader, optimizer, metri
     total_steps = len(train_loader) * config['training']['epochs']
     if config['training']['max_steps'] is not None:
         total_steps = min(total_steps, config['training']['max_steps'])
-    if resume is not None and resume.get('resume_state'):
+    if resume is not None:
         total_steps = resume['resume_state']['total_steps']
     schedule = schedule or TrainingSchedule(config, total_steps=total_steps)
     augmentation = StudentAugmentation(config)
     global_step, images_seen, history = 0, 0, []
     started = perf_counter()
-    previous_seconds = ((resume.get('resume_state') or {}).get('seconds', 0.) if resume else 0.)
+    previous_seconds = (resume['resume_state']['seconds'] if resume else 0.)
     completed = False
     best, best_epoch = None, None
     best_metric = config['reporting']['best_metric']
@@ -140,7 +145,7 @@ def _fit(teacher, student, criterion, train_loader, val_loader, optimizer, metri
         previous_rows, history, best, best_epoch, images_seen = restore_progress(resume, output, early, best_metric)
         global_step, first_epoch = resume['global_step'], resume['epoch'] + 1
     stopped_early = False
-    cache = TeacherFeatureCache(FEATURE_CACHE_DIR) if config['training']['releas'] else None
+    cache = TeacherFeatureCache(feature_cache_dir(config)) if config['training']['releas'] else None
     if device.type == 'cuda':
         torch.cuda.reset_peak_memory_stats(device)
     try:
@@ -187,16 +192,14 @@ def _fit(teacher, student, criterion, train_loader, val_loader, optimizer, metri
                         'gpu_allocated_mib': torch.cuda.memory_allocated(device) / 2**20 if device.type == 'cuda' else None})
                 move_student(student, criterion, optimizer, device)
             if resume is not None:
-                state = resume.get('resume_state') or {}
-                if state.get('rng'):
-                    restore_rng(state['rng'], augmentation, (train_loader, val_loader), device)
-                    augmentation.applied_count = state.get('augmentation_applied', 0)
-                record({'event': 'resume', 'epoch': resume['epoch'], 'step': global_step,
-                        'rng_restored': bool(state.get('rng'))})
-                tqdm.write(f'[Resume]: epoch={first_epoch} | step={global_step} | RNG=' +
-                           ('restored' if state.get('rng') else 'unavailable in this checkpoint'))
+                state = resume['resume_state']
+                restore_rng(state['rng'], augmentation, (train_loader, val_loader), device)
+                augmentation.applied_count = state['augmentation_applied']
+                record({'event': 'resume', 'epoch': resume['epoch'], 'step': global_step, 'rng_restored': True})
+                tqdm.write(f'[Resume]: epoch={first_epoch} | step={global_step} | RNG=restored')
             for epoch in range(first_epoch, config['training']['epochs'] + 1):
                 epoch_loss, epoch_images, epoch_clips, batches = 0.0, 0, 0, 0
+                epoch_components = defaultdict(float)
                 augmentation_ratio = augmentation.ratio(epoch)
                 gpu_values = []
                 bar = progress_bar(train_loader, enabled=config['logging']['progress'])
@@ -207,7 +210,7 @@ def _fit(teacher, student, criterion, train_loader, val_loader, optimizer, metri
                         for group in optimizer.param_groups:
                             group['lr'] = controls['lr']
                         result = train_batch(teacher, student, criterion, batch, optimizer,
-                                             config=config, crop_size=config['training']['crop_size'], controls=controls,
+                                             config=config, controls=controls,
                                              augmentation=augmentation,
                                              augmentation_ratio=augmentation_ratio, target_cache=cache,
                                              blend_scale=blend_scale, micro_batch_size=config['training']['micro_batch_size'])
@@ -217,6 +220,8 @@ def _fit(teacher, student, criterion, train_loader, val_loader, optimizer, metri
                         epoch_images += result['frames']
                         images_seen += result['frames']
                         epoch_loss += result['loss'] * result['batch_size']
+                        for name, value in result['components'].items():
+                            epoch_components[name] += value * result['batch_size']
                         gpu = monitor.sample()
                         if gpu is not None:
                             gpu_values.append(gpu)
@@ -227,7 +232,7 @@ def _fit(teacher, student, criterion, train_loader, val_loader, optimizer, metri
                                 'gpu_utilization_percent': gpu})
                         bar.set_description_str(progress_row(epoch, config['training']['epochs'], device, monitor, [
                             f'{result["loss"]:.5f}', f'{epoch_loss / epoch_clips:.5f}', f'{controls["lr"]:.2e}',
-                            epoch_images, network_size(batch['sequences'][0]['images'][0], config['training']['crop_size'], config['rendering'])]), refresh=False)
+                            epoch_images, network_size(config['training']['adapter_size'])]), refresh=False)
                         maximum = config['training']['max_steps']
                         if maximum is not None and global_step >= maximum:
                             break
@@ -243,6 +248,7 @@ def _fit(teacher, student, criterion, train_loader, val_loader, optimizer, metri
                     raise RuntimeError('Teacher parameters/buffers changed')
                 row = {'event': 'epoch', 'epoch': epoch, 'step': global_step,
                        'train_loss': epoch_loss / epoch_clips, 'train_images': epoch_images, 'train_clips': epoch_clips,
+                       'train_components': {name: value / epoch_clips for name, value in epoch_components.items()},
                        'train_partial': batches < len(train_loader), 'validation': validation,
                        'gpu_utilization_percent': sum(gpu_values) / len(gpu_values) if gpu_values else None}
                 history.append(row)

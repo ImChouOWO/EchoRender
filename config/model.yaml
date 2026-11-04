@@ -2,25 +2,27 @@
 # Each row: [from, repeats, module, args]. -1 means the previous layer.
 # Comment indices identify DAG layers, not individual blocks.
 # Swin: [channels, depth, heads, window, ffn_ratio].
-# ViT: [channels, depth, heads, ffn_ratio].
+# VIT: [channels, depth, heads, ffn_ratio].
 # SSM: [channels, depth, state_dim, d_conv, expand].
 # Upsample output channels must match the skip connection used by Add.
-input_channels: 8  # current RGB (0:3), aligned history RGB (3:6), style (6), tone (7)
-motion: feat  # raw: external RGB optical flow; feat: trainable parallel RGB-pair branch
+# Named DAG taps; training.distillation_layers selects supervision only.
+stages: {InputAdapter: 0, OutputHead: 28, E0: 1, E1: 3, E2: 5, E3: 7, E4: 9, VIT: 11, D1: 14, D2: 17, D3: 20}
+input_channels: 16  # RGB 0:3, history 3:6, style 6, tone 7, low RGB 8:11, high RGB 11:14, gray XY 14:16
+motion: raft_small  # pretrained RAFT-Small; fine-tuned with Sintel flow and validity
 output_channels: 4
 input_layout: BHWC
 ssm:
   rotation: clockwise  # clockwise or counterclockwise
   directions: 2       # 1-4 directions per block; each stage starts scanning right
 backbone:
-  - [-1, 1, InputAdapter, [32]]             # 0: input projection, prepared 8 -> 32
+  - [-1, 1, InputAdapter, [32, 1, 16, 4]]  # 0: full-field resize, 16 -> 32, one Swin block (heads=1, window=16, FFN=4)
   - [-1, 1, SwinStage, [32, 2, 1, 8, 4]]   # 1: E0, 2 blocks, skip -> 25
   - [-1, 1, Downsample, [32]]               # 2: downsample to E1
-  - [-1, 1, SSMStage, [32, 2, 16, 4, 2]]   # 3: E1, 2 blocks, distillation features, skip -> 22
+  - [-1, 1, SSMStage, [32, 2, 16, 4, 2]]   # 3: E1, 2 blocks, skip -> 22
   - [-1, 1, Downsample, [64]]               # 4: downsample to E2
   - [-1, 1, SSMStage, [64, 4, 16, 4, 2]]   # 5: E2, 4 blocks, distillation features, skip -> 19
   - [-1, 1, Downsample, [128]]              # 6: downsample to E3
-  - [-1, 1, SSMStage, [128, 6, 16, 4, 2]]  # 7: E3, 6 blocks, distillation features, skip -> 16
+  - [-1, 1, SSMStage, [128, 6, 16, 4, 2]]  # 7: E3, 6 blocks, skip -> 16
   - [-1, 1, Downsample, [256]]              # 8: downsample, output 256 channels
   - [-1, 1, SwinStage, [512, 8, 16, 8, 4]] # 9: E4, projection 256 -> 512, 8 blocks, skip -> 13
   - [-1, 1, Downsample, [1024]]             # 10: downsample to bottleneck
@@ -28,17 +30,18 @@ backbone:
 head:
   - [[-1, 9], 1, Upsample, [512]]           # 12: resize to E4, output 512 channels to match skip
   - [[-1, 9], 1, Add, []]                  # 13: fuse E4, 512 + 512
-  - [-1, 1, SwinStage, [256, 8, 16, 8, 4]] # 14: decoder E4, projection 512 -> 256, 8 blocks
+  - [-1, 1, SwinStage, [256, 8, 16, 8, 4]] # 14: D1 / decoder E4, projection 512 -> 256, 8 blocks
   - [[-1, 7], 1, Upsample, [128]]           # 15: resize to E3
   - [[-1, 7], 1, Add, []]                  # 16: fuse E3, 128 + 128
-  - [-1, 1, SwinStage, [128, 8, 8, 8, 4]]  # 17: decoder E3, 8 blocks
+  - [-1, 1, SwinStage, [128, 8, 8, 8, 4]]  # 17: D2 / decoder E3, 8 blocks
   - [[-1, 5], 1, Upsample, [64]]            # 18: resize to E2
   - [[-1, 5], 1, Add, []]                  # 19: fuse E2, 64 + 64
-  - [-1, 1, SwinStage, [64, 6, 4, 8, 4]]   # 20: decoder E2, 6 blocks
+  - [-1, 1, SwinStage, [64, 6, 4, 8, 4]]   # 20: D3 / decoder E2, 6 blocks
   - [[-1, 3], 1, Upsample, [32]]            # 21: resize to E1
   - [[-1, 3], 1, Add, []]                  # 22: fuse E1, 32 + 32
   - [-1, 1, SwinStage, [32, 4, 2, 8, 4]]   # 23: decoder E1, 4 blocks
   - [[-1, 1], 1, Upsample, [32]]            # 24: resize to E0
   - [[-1, 1], 1, Add, []]                  # 25: fuse E0, 32 + 32
   - [-1, 1, SwinStage, [32, 5, 1, 8, 4]]   # 26: decoder E0, 5 blocks
-  - [-1, 1, OutputHead, [4]]                # 27: raw RGB residual (3 channels) + gate logit (1 channel)
+  - [[-1, 0], 1, Add, []]                   # 27: direct InputAdapter residual before the output head
+  - [-1, 1, OutputHead, [4]]                # 28: raw RGB residual (3 channels) + gate logit (1 channel)

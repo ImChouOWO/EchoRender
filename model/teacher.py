@@ -24,7 +24,7 @@ def resolve_device(device="auto"):
 
 
 class EchoRenderTeacher(nn.Module):
-    def __init__(self, weights, device="auto"):
+    def __init__(self, weights, device="auto", *, stages=None):
         super().__init__()
         self.weights_path = Path(weights).expanduser().resolve()
         if not self.weights_path.is_file():
@@ -44,7 +44,7 @@ class EchoRenderTeacher(nn.Module):
         except ImportError as exc:
             raise ImportError("Teacher backend is missing; run 'uv sync --locked'") from exc
         # Validate the complete tensor names/shapes and checkpoint format.
-        self.model = FeatureRecordingBackend(load_weights(self.weights_path))
+        self.model = FeatureRecordingBackend(load_weights(self.weights_path), stages=stages)
         self.model.to(device=target_device, dtype=torch.float32)
         self.model.requires_grad_(False)
         self.eval()

@@ -207,7 +207,8 @@ class TeacherInferenceTests(unittest.TestCase):
         with patch('teacher_infer.run_inference', return_value={'done': True}) as run:
             self.assertEqual(infer.demo(), {'done': True})
         self.assertEqual(run.call_count, 1)
-        self.assertEqual(run.call_args.kwargs['scene'], 'alley_1')
+        options = run.call_args.kwargs
+        self.assertTrue(bool(options.get('input_image')) != bool(options.get('scene')))
         self.assertEqual(run.call_args.kwargs['device'], 'cuda:1')
         self.assertEqual(run.call_args.kwargs['motion_mode'], 'sintel')
         self.assertFalse(hasattr(infer, 'parser'))

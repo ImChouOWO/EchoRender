@@ -4,16 +4,21 @@ from torch import nn
 from pytorch_msssim import ssim
 
 
+def pretrained_lpips(net):
+    """One pretrained/frozen model contract for differentiable loss and evaluation."""
+    import lpips
+    try:
+        return lpips.LPIPS(net=net, verbose=False).eval().requires_grad_(False)
+    except Exception as exc:
+        raise RuntimeError('Pretrained LPIPS could not load. Set TORCH_HOME to a writable '
+                           'cache and allow the official PyTorch model download; '
+                           'random-backbone LPIPS is not a valid substitute.') from exc
+
+
 class ImageMetrics(nn.Module):
     def __init__(self, *, net='alex', ssim_window=11):
         super().__init__()
-        import lpips
-        try:
-            self.perceptual = lpips.LPIPS(net=net, verbose=False).eval().requires_grad_(False)
-        except Exception as exc:
-            raise RuntimeError('Pretrained LPIPS could not load. Set TORCH_HOME to a writable '
-                               'cache and allow the official PyTorch model download; '
-                               'random-backbone LPIPS is not a valid substitute.') from exc
+        self.perceptual = pretrained_lpips(net)
         self.ssim_window = ssim_window
 
     @torch.no_grad()

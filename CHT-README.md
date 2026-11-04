@@ -8,13 +8,13 @@
 
 ```text
 乾淨影像 -> 凍結 Teacher -> 快取 head／中間特徵／RGB 目標
-同一 RGB 裁切 -> 可選增強 -> raw／feat 歷史對齊 -> 16 通道 Student -> 蒸餾 loss＋RGB loss
+完整 RGB -> 可選增強 -> raw／raft_small 歷史對齊 -> 8 通道 Student -> InputAdapter 縮放 -> 蒸餾 loss＋RGB loss
 ```
 
 <details>
 <summary><em>當前限制</em></summary>
 
-Student 是研究用結構模型，不代表 NVIDIA 的數值等價實作。自訂 SSM 採用純 PyTorch 逐步掃描，並非官方 Mamba／VMamba 融合核心。評估指標衡量與 Teacher RGB 的一致性，不代表相對獨立真實標註的品質提升。`--resume` 可從 epoch 邊界恢復訓練狀態；`val.py` 提供既有權重驗證與比較圖輸出。
+Student 是研究用結構模型，不代表 NVIDIA 的數值等價實作。自訂 CUDA SSM 使用官方融合 Mamba selective-scan 核心，遞迴維持 FP32；training.precision 為 bf16 時，Student 線性層、卷積及注意力使用 BF16，RGB 合成與 loss 維持 FP32。評估指標衡量與 Teacher RGB 的一致性，不代表相對獨立真實標註的品質提升。`--resume` 可從 epoch 邊界恢復訓練狀態；`val.py` 提供既有權重驗證與比較圖輸出。
 
 </details>
 
@@ -26,7 +26,7 @@ Teacher 使用已解包、`fully_logical=true` 的 logical safetensors，透過�
 
 ### 模型結構
 
-由 [config/model.yaml](config/model.yaml) 定義。外部提供 `[0,1]` RGB；前處理直接建立 `input_channels: 8`：0～2 為當前 RGB、3～5 為依可信度混合的對齊 Student 歷史 RGB、6 為正規化 style、7 為解析後的 tone。首幀兩組 RGB 都使用當前影像。Student 移除固定噪聲、常數與 structure 控制通道；structure／skin／auto 保留為固定 Teacher 目標設定，改變時須重新產生目標並訓練。`tone: null` 在 standard／natural／cinematic 解析為 1，neutral 為 0，因此能區分同為 style 2 的 cinematic 與 neutral。`motion: raw` 從前後 RGB 以外部 Farneback 估計光流；`motion: feat` 保留獨立的 6→32→64 編碼器及 64→32→3 解碼器，預測位移與可信度，輸出層零初始化，不與主幹跳接。兩種模式均在輸入層前對齊 Student 自己的歷史，部署不需要資料集光流。Teacher 維持 16 通道、四通道 head 與 E1／E2／E3／ViT 蒸餾層，符合設定的既有時序快取可繼續使用。目前 checkpoint 格式為 `echorender-bhwc8-motion-v5`；不支援舊 16 通道 Student 權重，須重新訓練。以下為目前 Student 的通道與深度，不是 Teacher block 編號。
+由 [config/model.yaml](config/model.yaml) 定義。外部提供 `[0,1]` RGB；前處理直接建立 `input_channels: 8`：0～2 為當前 RGB、3～5 為依可信度混合的對齊 Student 歷史 RGB、6 為正規化 style、7 為解析後的 tone。首幀兩組 RGB 都使用當前影像。Student 移除固定噪聲、常數與 structure 控制通道；structure／skin／auto 保留為固定 Teacher 目標設定，改變時須重新產生目標並訓練。`tone: null` 在 standard／natural／cinematic 解析為 1，neutral 為 0，因此能區分同為 style 2 的 cinematic 與 neutral。`motion: raw` 從前後 RGB 以外部 Farneback 估計光流；`motion: raft_small` 使用預訓練 torchvision RAFT-Small C_T_V2，在 adapter 尺寸以 12 次更新估計當前到前幀的反向光流，另以可學習 head 預測有效區域，不與主幹跳接。兩種模式均在輸入層前對齊 Student 自己的歷史，部署不需要資料集光流。Teacher 維持 16 通道與四通道 head；預設特徵蒸餾層為 E0／E1／E2／E3／E4／VIT；RGB composition 控制最終影像監督。Layer 27 將 InputAdapter 特徵直接加入輸出頭前，OutputHead 為 layer 28。完整八通道輸入由最前方 InputAdapter 縮放至 `training.adapter_size`。Checkpoint 格式為 `echorender-bhwc8-raft-small-encoder-bf16-v8`；舊權重與裁切快取須重新訓練／擷取。以下為目前 Student 的通道與深度，不是 Teacher block 編號。
 
 | Stage | 模組 | 通道 | Blocks |
 |---|---|---:|---:|
@@ -40,7 +40,7 @@ Teacher 使用已解包、`fully_logical=true` 的 logical safetensors，透過�
 
 E4 將輸入的 256 通道投影至 512。decoder 第一個 Upsample 也輸出 512 通道以進行 skip 相加，下一個 Swin stage 再投影至 256。所有 `Add` 輸入形狀必須相同。
 
-E1／E2／E3 與 bottleneck 提供蒸餾特徵。可訓練的 1×1 projection 將 Student 通道對齊 Teacher 的 64／128／256／1024；共用通道初始化為 identity，額外輸出通道初始化為零。通道不同時必須設定 `loss.projection: true`。
+model YAML 的 `stages` 明確對應 DAG 層；`training.distillation_layers: [RGB composition, E0, E1, E2, E3, E4, VIT]` 選擇最終 RGB 與編碼／全域特徵監督；解碼器仍保留。可訓練的 1×1 projection 將選定 Student 通道對齊 Teacher 的 32／64／128／256／512／1024；共用通道初始化為 identity，額外輸出通道初始化為零。通道不同時必須設定 `loss.projection: true`。
 
 ---
 
@@ -92,7 +92,7 @@ MPI-Sintel-complete/
 
 目前使用 `clean` pass：19 個訓練場景與 4 個驗證場景（`alley_1`、`alley_2`、`temple_2`、`temple_3`），目前本機資料分別為 864／200 張。訓練與驗證場景不得重疊；官方 test 資料獨立保留。`clean`／`final` 是渲染版本，不會自動視為輸入與 GT 配對。
 
-共用中心裁切為 **192×192**。Teacher 相容前處理會補齊至最小 320 且為 64 倍數，因此目前實際網路輸入為 **320×320**。Head／RGB loss 排除 padding。目前五尺度 MS-SSIM 要求真實影像尺寸大於 160；LPIPS 至少需要 64×64。
+訓練、驗證與預測都保留全圖。`training.adapter_size: 320` 取代裁切設定；最前方 InputAdapter 將組合後的完整八通道輸入縮放至 320×320，再投影通道。Stage 內的通道 adapter 不縮放。Teacher 的乾淨 RGB 與歷史使用相同全圖目標尺寸，凍結網路不變；光流與遮罩維持全圖正規化座標，輸出映射回原始尺寸。五尺度 MS-SSIM 要求實際輸出尺寸大於 160，LPIPS 至少需要 64×64。
 
 ---
 
@@ -103,9 +103,9 @@ MPI-Sintel-complete/
 | `true` | 建立或重用目標，記錄固定 `blend_scale`，完整釋放 Teacher，再由 Student 使用快取訓練。 |
 | `false` | 凍結 Teacher 並保持 eval，與 Student 同時位於指定 GPU，使用即時蒸餾；不讀寫快取或顯示刪除提示。 |
 
-`releas` 為既有設定鍵名。快取固定放在專案根目錄 `output/feats/`，包含乾淨影像的 E1／E2／E3／ViT、raw 四通道 head 與組合 RGB。以 profile、split、序列與幀識別配對，路徑為 `output/feats/<profile>/<split>/<source>/<scene>/<frame>/targets.pt`；同檔保存 head、中間特徵、RGB 目標、歷史及識別資料。它們是 loss 目標，不會拿 Teacher 歷史餵給 Student。
+`releas` 為既有設定鍵名。快取固定放在專案根目錄 `output/feats/`，包含乾淨影像的選定特徵（預設 E0／E1／E2／E3／E4／VIT）、raw 四通道 head、未增強原圖與組合 RGB。以 profile、split、序列與幀識別配對，路徑為 `output/feats/<profile>/<split>/<source>/<scene>/<frame>/targets.pt`；同檔保存 head、中間特徵、RGB 目標、歷史及識別資料。它們是 loss 目標，不會拿 Teacher 歷史餵給 Student。
 
-完整快取跨 epoch、跨次訓練重用；相容的部分快取逐張續接，只重建缺少或截斷的項目。每個檔案原子寫入後即更新索引，程序鎖保護快取至刪除提示結束。有效性包含 Teacher 權重、資料身分、裁切、前處理、capture／後端程式、裝置與 benchmark 設定。Student 結構、batch、增強或 optimizer 變更不會使乾淨目標失效。
+完整快取跨 epoch、跨次訓練重用；相容的部分快取逐張續接，只重建缺少或截斷的項目。每個檔案原子寫入後即更新索引，程序鎖保護快取至刪除提示結束。有效性包含 Teacher 權重、資料身分、adapter 尺寸、蒸餾層選擇、前處理、capture／後端程式、裝置與 benchmark 設定。Student 結構、batch、增強或 optimizer 變更不會使乾淨目標失效。
 
 產生快取時使用 `torch.inference_mode()`，重疊 CPU 讀圖／前處理、單一 Teacher GPU 推論與背景寫入。讀寫 worker 依首筆耗時估算，並受 CPU／cgroup／RAM 與佇列上限限制；它與 `loader.num_workers` 分開設定。
 
@@ -140,11 +140,13 @@ training:
   early_stopping:
     patience: 15
     min_delta: 0.001
+  precision: bf16
   gradient_checkpointing: false
   micro_batch_size: 4
   releas: true
   max_steps: null
-  crop_size: 192
+  adapter_size: 320
+  distillation_layers: [RGB composition, E0, E1, E2, E3, E4, VIT]
   optimizer:
     lr: 0.001
     momentum: 0.0
@@ -204,14 +206,30 @@ Teacher 目標保持乾淨且凍結；Student 前處理與 RGB 合成使用增�
 定義於 [model/card/loss.py](model/card/loss.py)：
 
 ```text
-E1, E2, E3 = 通道 L2 正規化特徵 MSE
-ViT        = 0.5 * feature MSE + 排除對角線的 cosine token-affinity MSE
-Lmid       = (E1 + E2 + E3 + ViT) / 4
-Lout       = raw 四通道 head MSE
+E2, D1, D3 = 通道 L2 正規化特徵 MSE
+VIT        = 0.5 * feature MSE + 排除對角線的 cosine token-affinity MSE
+Lmid       = mean(feature_weights[stage] * loss[stage] for selected stages)
+Lout       = 0.75 * raw RGB-head MSE + 0.05 * raw gate-logit MSE
 Ld         = 0.5 * Lmid + 0.5 * Lout
-Lrgb       = 0.5 * RGB MSE + 0.2 * (1 - SSIM) + 0.3 * (1 - MS-SSIM)
-Ltotal     = 3 * Ld + Lrgb + motion_weight * Lmotion  # feat only; motion_weight = 0.01
+Lrgb       = 1.0 * weighted RGB MSE + 0.5 * (1 - weighted SSIM) + 0.8 * (1 - weighted MS-SSIM) + 0.05 * LPIPS
+Ltotal     = 3 * Ld + 2 * Lrgb + motion_weight * Lmotion  # raft_small only; motion_weight = 0.1
 ```
+
+
+Raw head 的 RGB 與 gate 使用獨立直接權重，不做權重總和正規化。LPIPS 比較兩模型合成後的最終 RGB，將 [0,1] 轉成 [-1,1]；預訓練網路保持 frozen／eval，但梯度會傳回 Student RGB。Teacher 與 LPIPS 參數不更新。`rgb_lpips` 屬於 reconstruction 群組，目前有效係數為 `2.0 × 0.05 = 0.1`。LPIPS 採標準整圖平均；Teacher 改變量空間加權仍作用於 MSE／SSIM／MS-SSIM。原始分項與實際加權貢獻都會記錄。
+
+```yaml
+loss:
+  reconstruction: 2.0
+  output_rgb: 0.75
+  output_gate: 0.05
+  rgb_lpips: 0.05
+  lpips_net: alex
+```
+
+`rgb_lpips: 0` 可停用這項訓練並避免載入其網路；`validation.lpips_net` 獨立設定評估用 LPIPS。訓練用原始 RGB 至少須為 64×64。新 loss 在下次訓練套用；續訓要求原 loss 與 checkpoint 格式一致。這次變更不影響 Teacher 目標生成，既有相容快取可保留重用。
+
+Teacher 連續改變量權重以未增強原圖計算：`delta = mean(abs(Teacher - clean_RGB), channels)`，`w = 1 + alpha * clamp(delta / tau, 0, 1)`。`loss.teacher_change` 目前為 `alpha: 2.0`、`tau: 0.1`，權重範圍 1～3。權重 detach，各圖依權重總和正規化；SSIM／MS-SSIM 加權各尺度的局部分數圖，不遮罩 RGB。alpha 設為 0 可停用加權；評估用 PSNR／SSIM／LPIPS 仍為一般未加權指標。
 
 特徵對齊排除純 padding 區域，維持實際空間網格對應，詳見 [特徵擷取與對齊](tool/TEACHER_FEATURES.md)。Token affinity 以精確 row chunks 計算，不抽樣 tokens。Teacher 目標 detach，optimizer 僅包含 Student 與特徵 adapters。
 
@@ -234,13 +252,13 @@ uv run --locked python -m unittest tool.test_training tool.test_reporting tool.t
 uv run --locked python train.py --config config/train.yaml --resume output/test/last.pt
 ```
 
-從下一個 epoch 恢復 Student、蒸餾 adapters、SGD、global step、cosine 總步數、增強與 loader 的隨機狀態、歷史指標、最佳權重選擇與早停計數。請保留同目錄的 `best.pt` 與 `metrics.jsonl`；資料、模型、loss 與排程等核心設定須相同，`epochs` 仍代表原訂總數。既有同格式 checkpoint 可恢復進度與 optimizer，但缺少隨機狀態時會明確提示，後續抽樣無法完全重現。輸出鎖防止兩個程序同時寫入。`model.student_weights` 仍只載入權重，不能與 `--resume` 同用。
+從下一個 epoch 恢復 Student、蒸餾 adapters、SGD、global step、cosine 總步數、增強與 loader 的隨機狀態、歷史指標、最佳權重選擇與早停計數。請保留同目錄的 `best.pt` 與 `metrics.jsonl`；資料、模型、loss 與排程等核心設定須相同，`epochs` 仍代表原訂總數。續訓須有完整 RNG 與進度資料；不接受缺漏狀態或舊格式 checkpoint。輸出鎖防止兩個程序同時寫入。`model.student_weights` 仍只載入權重，不能與 `--resume` 同用。
 
-Student 歷史與 feat 的 RGB pair 保留在指定設備；光流配對使用實際送入 Student 的前後 RGB，包含已套用的增強，對齊的歷史則為 Student 自己經 detach 的後處理前預測。相同尺寸的 feat pair 合併運算，網路、warp 與逐張 loss 計算不變。訓練先抽取增強雜訊，再將相近長度 clips 分組，保留原抽樣前綴、影像與逐 clip 平均 loss 權重。快取目標由兩條 CPU 讀取執行緒預取，上限為兩倍 micro batch（至少兩個檔案）及 256 MiB，單一超大檔案可超過容量上限；之後以 pinned memory 非同步傳送至指定 GPU。Teacher 目標與蒸餾層不變。
+Student 歷史與 raft_small 的 RGB pair 保留在指定設備；光流配對使用實際送入 Student 的前後 RGB，包含已套用的增強，對齊的歷史則為 Student 自己經 detach 的後處理前預測。相同尺寸的 raft_small pair 合併運算，網路、warp 與逐張 loss 計算不變。訓練先抽取增強雜訊，再將相近長度 clips 分組，保留原抽樣前綴、影像與逐 clip 平均 loss 權重。快取目標由兩條 CPU 讀取執行緒預取，上限為兩倍 micro batch（至少兩個檔案）及 256 MiB，單一超大檔案可超過容量上限；之後以 pinned memory 非同步傳送至指定 GPU。快取讀取保留設定的蒸餾層與未增強原圖參考。
 
 `best.pt` 成功存檔後，終端會以粗體亮黃色顯示 `[Best]` 與各指標改善比例；重新導向的 log 保持純文字，設定 `NO_COLOR` 可停用顏色。
 
-每個 epoch 驗證完整 validation split，保存 PSNR／SSIM／LPIPS 的影像平均與等權場景平均。無限 PSNR 儲存為 `"Infinity"`。可選 batch-1 FP32 latency benchmark 使用暖機、同步與 eval，排除前處理、特徵擷取、組合與 backward。快取模式沿用產生快取時的 Teacher 參考耗時，每個 epoch 重新量測 Student。
+每個 epoch 驗證完整 validation split，保存 PSNR／SSIM／LPIPS 的影像平均與等權場景平均。無限 PSNR 儲存為 `"Infinity"`。可選 batch-1 latency benchmark（Teacher FP32、Student 依 precision 設定） 使用暖機、同步與 eval，排除前處理、特徵擷取、組合與 backward。快取模式沿用產生快取時的 Teacher 參考耗時，每個 epoch 重新量測 Student。
 
 | 輸出 | 內容 |
 |---|---|
@@ -252,7 +270,7 @@ Student 歷史與 feat 的 RGB pair 保留在指定設備；光流配對使用�
 
 `max_steps` 限制更新次數，但仍執行驗證與 checkpoint 保存。`model.student_weights` 僅載入 Student 權重，以新的 optimizer／adapters 開始新 run。測試涵蓋梯度、projection 通道、掃描方向、batch、快取生命週期與排程；合成測試不代表真實資料品質。
 
-改為 RGB 輸入前的 16 通道 E4-512 Student 以 crop 192、micro-batch 4、有效 batch 16、checkpointing 關閉，在 GPU 1（RTX 5000 Ada）的兩次短測更新中，配置峰值約 **29.14 GiB**、保留顯存約 **29.81 GiB**，每次更新約 **8～9 秒**。這不是完整 epoch benchmark，也不保證未來顯存需求。
+全圖 GPU 1 短測（RTX 5000 Ada、adapter 320、有效 batch 16、micro batch 4、每片段兩幀、25% 增強、checkpointing 關閉）峰值約 **13.91 GiB allocated／14.21 GiB reserved**。這是單次 optimizer 更新驗證，不代表完整 epoch 吞吐量或所有片段長度／影像尺寸的顯存上限。
 
 權重、checkpoints、Teacher 快取與輸出目錄由 `.gitignore` 排除；`uv.lock` 保留版本控制以利重現。
 
@@ -286,8 +304,6 @@ reporting:
   enabled: true
   project_name: null
   best_metric: psnr
-  crop_size: 0
-  inference_size: 320
   samples_per_mode: 2
   strengths: [0.25, 0.50, 0.75, 1.00]
 ```
@@ -319,15 +335,10 @@ output/val/<project_name>/
 
 preview 為一列輸入；pred 第一列為各強度輸入，第二列為對應預測。
 粗體英文標題包含 `| total infer 1.234 s | avg infer 0.247 s |`。
-時間單位為秒，GPU 會前後同步；計算純模型 forward，排除每種輸入形狀的首次暖機、
-前處理、RGB 合成與存檔。總時間與平均時間均以該圖實際顯示的欄位計算。
+時間單位為秒，GPU 前後同步。Student 包含光流分支、輸入前處理與主幹；Teacher 計算神經網路 forward，均排除 RGB 合成與存檔。總時間包含各版本的歷史幀，平均時間除以所有實際 frame forward 數。
 各欄維持長寬比，顯示寬度最多 384 像素。
 
-`reporting.crop_size: 0` 保留完整來源。`reporting.inference_size: 320` 限制推論長邊，
-不放大小圖；增強在 resize 後、特徵前處理前執行，避免縮圖稀釋噪聲。
-相同的輸入增強差值會映射回原始尺寸供顯示。推論尺寸先完成 RGB 合成，
-再將 RGB 預測差值映射至原始尺寸的增強輸入。inference_size 設為 0 可使用原尺寸推論，
-正值 crop_size 則在此流程前先中心裁切。
+比較圖使用原始尺寸全圖，各增強模式／強度獨立且可重現。Student 的根 InputAdapter 與 Teacher 前處理共同使用 checkpoint 的 adapter 尺寸；raw head 映射回原始尺寸後進行 RGB 合成。顯示的輸入即實際送入流程的增強原圖；縮圖可能降低高頻噪聲。比較圖不再有獨立 crop／resize 設定。
 
 推論索引記錄抽樣名單、增強參數、排列尺寸、輸入／特徵／預測雜湊及時間。
 `predictions.csv` 保存各版本推論秒數，以及相對同一來源原圖預測的 RGB RMSE。
@@ -344,13 +355,13 @@ preview 為一列輸入；pred 第一列為各強度輸入，第二列為對應�
 `val.py` 與 `train.py` 位於同級，可直接驗證既有 checkpoint 並重新輸出比較圖：
 
 ```bash
-uv run --locked python val.py --weights output/test_12/last.pt --project my_validation --imgsz 320
+uv run --locked python val.py --weights output/test_12/last.pt --project my_validation
 # 只選驗證集一張影像試跑：
 uv run --locked python val.py --weights output/test_12/last.pt --project preview --split val --max-clips 1
 ```
 
 以 `best.pt` 載入選定的最佳模型，或以 `last.pt` 載入最後一個模型。
-模型結構、特徵 adapters、驗證 crop 與 loss 取自 checkpoint；
+模型結構、選定特徵 adapters、adapter 尺寸與 loss 取自 checkpoint；
 資料路徑、裝置、增強與比較圖設定取自 `--config config/train.yaml`。
 可用 `--device cuda:1` 覆蓋設定的裝置。
 
@@ -363,8 +374,7 @@ uv run --locked python val.py --weights output/test_12/last.pt --project preview
 與所選權重 epoch。若 checkpoint 同目錄有 `summary.json`，會額外重建訓練歷史曲線
 及統計，其最佳 epoch 與手動選取的 `last.pt` 分開記錄。
 缺少歷史資料時仍可驗證與輸出圖片，不會產生虛構曲線。
-驗證使用 checkpoint 的訓練 crop；比較圖由 `reporting.crop_size` 控制裁切，
-由 `reporting.inference_size` 或 `--imgsz 320` 控制縮放推論尺寸；
+驗證與比較圖共同使用 checkpoint 的全圖 adapter 尺寸；
 獨立驗證使用同一快取根目錄下的 `evaluate` 分類與 `evaluation.json` 索引，不覆寫訓練目標；Teacher 先完成擷取並卸載，才開始 Student 評分。
 
 ---
@@ -375,7 +385,7 @@ uv run --locked python val.py --weights output/test_12/last.pt --project preview
 
 早停使用 `reporting.best_metric`（預設 PSNR），`training.early_stopping.patience: 15` 代表連續 15 個 epoch 沒有超過 `min_delta: 0.001` 的絕對改善就停止；patience 設為 0 可關閉。早停仍保存 best／last、統計與預測。結束後在 `output/val/` 的報告資料夾輸出 `training_metrics.png`（訓練／驗證 loss、PSNR、SSIM、LPIPS）與 `profile_metrics.png`（各模式比較）。
 
-`rendering.profiles` 分別設定 standard、natural、cinematic、neutral。預設採用使用者指定的結構／自動控制／強度組合；neutral 明確指定 style 2，其餘模式跟隨本身 style。`tone: null` 跟隨模式預設。`dataset.render_pass` 固定 clean；Teacher 使用 Sintel 光流，Student 在 model.yaml 選擇 raw／feat，不提供 control_mask。`temporal: false` 使用單張，`true` 支援最多 10 幀；資料載入器只打亂片段，不打亂片段內幀序，不跨場景或斷幀。
+`rendering.profiles` 分別設定 standard、natural、cinematic、neutral。預設採用使用者指定的結構／自動控制／強度組合；neutral 明確指定 style 2，其餘模式跟隨本身 style。`tone: null` 跟隨模式預設。`dataset.render_pass` 固定 clean；Teacher 使用 Sintel 光流，Student 在 model.yaml 選擇 raw／raft_small，不提供 control_mask。`temporal: false` 使用單張，`true` 支援最多 10 幀；資料載入器只打亂片段，不打亂片段內幀序，不跨場景或斷幀。
 
 增強保留「噪聲＋隨機一種亮度／對比／銳利度」。每個有效 batch 同時限制片段與幀的增強比例，不超過排程比例；其餘保持原圖。強度從 10% 升至 25%，50% epoch 達最高，75% 起關閉。片段內維持相同模式與強度；Teacher 始終使用未增強影像。
 

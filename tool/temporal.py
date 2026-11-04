@@ -1,5 +1,6 @@
 """Shared controlled RGB sequence rendering, Teacher targets and history metrics."""
 from dataclasses import dataclass
+from functools import lru_cache
 import csv
 import json
 from time import perf_counter
@@ -8,14 +9,14 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.nn import functional as F
-from mlxdlss.features import make_features, scaled_color, half
+from mlxdlss.features import make_features, scaled_color, half, NetworkGeometry
 from mlxdlss.temporal import sample_history
 from mlxdlss.composition import gaussian_kernel
-from teacher_infer import (network_controls, network_geometry, render_extent, resample,
+from teacher_infer import (network_controls, resample,
                            truncate_half, compose_output, dataset_motion)
 
 PROFILES = ('standard', 'natural', 'cinematic', 'neutral')
-FORMAT = 'echorender-bhwc8-motion-v5'
+FORMAT = 'echorender-bhwc16-swin-input-raft-small-bf16-v9'
 
 
 @dataclass
@@ -32,22 +33,27 @@ class Frame:
     rendering: dict
     motion_loss: torch.Tensor | None = None
     rgb_tensor: torch.Tensor | None = None
+    spatial_features: torch.Tensor | None = None
 
 
-def crop_rgb(image, size):
+def image_rgb(image):
     rgb = image.permute(1, 2, 0).contiguous().numpy() if isinstance(image, torch.Tensor) else image
-    h, w = rgb.shape[:2]
-    top, left = max(0, (h - size) // 2), max(0, (w - size) // 2)
-    return (rgb[top:top + size, left:left + size] if size else rgb).copy()
+    return rgb.copy()
+
+
+def adapter_rgb(rgb, size):
+    from model.card.card import InputAdapter
+    image = torch.from_numpy(rgb.copy()).permute(2, 0, 1)[None]
+    return InputAdapter.resize(image, size)[0].permute(1, 2, 0).contiguous().numpy()
 
 
 def prepare_frame(rgb, config, profile, *, history=None, motion=None, confidence=None):
     rendering, settings = config['rendering'], config['rendering']['profiles'][profile]
     controls, automatic = network_controls(profile, **{key: settings[key] for key in
         ('style_index', 'tone', 'structure', 'skin_structure', 'auto_structure')})
-    width, height = render_extent(rgb.shape[1], rgb.shape[0], rendering['render_scale'], rendering['min_extent'])
-    small = resample(rgb, width, height)
-    geometry = network_geometry(width, height, rendering['min_extent'])
+    width = height = config['training']['adapter_size']
+    small = adapter_rgb(rgb, width)
+    geometry = NetworkGeometry.identity(width, height)
     aligned = None
     if history is not None:
         history = np.asarray(history, dtype=np.float32)
@@ -61,7 +67,7 @@ def prepare_frame(rgb, config, profile, *, history=None, motion=None, confidence
                            automatic_mask=automatic, **controls)
     if aligned is not None:
         condition = rgb + confidence * (aligned - rgb)
-        condition = resample(condition, width, height)
+        condition = adapter_rgb(condition, width)
         network[..., 7:10] = scaled_color(condition[geometry.source_rows()[:, None],
                                                    geometry.source_columns()[None, :]])
     return Frame(rgb, small, geometry, torch.from_numpy(network).unsqueeze(0), aligned,
@@ -90,11 +96,11 @@ def prepare_student_frames(requests, config, student):
         rendering, settings = config['rendering'], config['rendering']['profiles'][profile]
         controls, _ = network_controls(profile, **{key: settings[key] for key in
             ('style_index', 'tone', 'structure', 'skin_structure', 'auto_structure')})
-        width, height = render_extent(rgb.shape[1], rgb.shape[0], rendering['render_scale'], rendering['min_extent'])
-        small = resample(rgb, width, height)
-        geometry = network_geometry(width, height, rendering['min_extent'])
-        extended = small[geometry.source_rows()[:, None], geometry.source_columns()[None, :]]
-        network = np.empty((geometry.network_height, geometry.network_width, 8), dtype=np.float32)
+        width = height = student.adapter_size
+        small = adapter_rgb(rgb, width)
+        geometry = NetworkGeometry.identity(width, height)
+        extended = rgb
+        network = np.empty((*rgb.shape[:2], 8), dtype=np.float32)
         network[..., :3] = network[..., 3:6] = scaled_color(extended)
         network[..., 6] = half(controls['normalized_style'])
         network[..., 7] = half(controls['local_tone_strength'])
@@ -111,10 +117,11 @@ def prepare_student_frames(requests, config, student):
             raise ValueError('Reset history when frame dimensions change')
         groups[tuple(frame.rgb.shape)].append(index)
     for indices in groups.values():
-        if student.motion_mode == 'feat':
+        if student.motion_mode == 'raft_small':
             prior = torch.stack([tensor(requests[i]['previous']).permute(2, 0, 1) for i in indices])
             current = torch.stack([frames[i].rgb_tensor.permute(2, 0, 1) for i in indices])
-            fields, logits = student.motion(prior, current)
+            with student.autocast():
+                fields, logits = student.motion(prior, current)
         for row, index in enumerate(indices):
             request, frame = requests[index], frames[index]
             if student.motion_mode == 'raw':
@@ -148,20 +155,43 @@ def student_previous(frame, student):
 
 
 def student_inputs(frame, device, layout='BHWC'):
-    """Eight channels: current RGB, confidence-mixed aligned history RGB, style and tone."""
+    """Base RGB/history/controls plus fixed low/high-frequency RGB and XY gradients."""
     if frame.inputs.shape[-1] != 8:
-        raise ValueError('Student inputs require an 8-channel Student frame')
+        raise ValueError('Student frames require eight base RGB/history/control channels')
     image = frame.inputs.to(device).clone()
     if frame.history is not None:
         current = colour_tensor(frame, device)
         memory = current + torch.as_tensor(frame.confidence, device=device) * (torch.as_tensor(frame.history, device=device) - current)
-        memory = F.interpolate(memory.permute(2, 0, 1)[None], frame.small.shape[:2], mode='bilinear', align_corners=False)
-        g = frame.geometry
-        rows = torch.as_tensor(g.source_rows(), device=device, dtype=torch.long)
-        columns = torch.as_tensor(g.source_columns(), device=device, dtype=torch.long)
-        sampled = memory[:, :, rows[:, None], columns[None, :]].permute(0, 2, 3, 1)
+        sampled = memory.unsqueeze(0)
         image[..., 3:6] = half_ste(half_ste(half_ste(sampled) - .5) * .125)
+    if frame.spatial_features is None:
+        rgb = colour_tensor(frame, device).permute(2, 0, 1).unsqueeze(0)
+        frame.spatial_features = rgb_feature_maps(rgb).permute(0, 2, 3, 1)
+    image = torch.cat((image, frame.spatial_features), dim=-1)
     return image if layout == 'BHWC' else image.permute(0, 3, 1, 2).contiguous()
+
+
+@lru_cache(maxsize=8)
+def feature_kernels(device, dtype):
+    positions = torch.arange(-2, 3, device=device, dtype=dtype)
+    gaussian = torch.exp(-positions.square() / 2)
+    gaussian = gaussian / gaussian.sum()
+    sobel = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], device=device, dtype=dtype) / 8
+    return (gaussian.view(1, 1, 1, 5).expand(3, 1, 1, 5).contiguous(),
+            gaussian.view(1, 1, 5, 1).expand(3, 1, 5, 1).contiguous(),
+            torch.stack((sobel, sobel.T)).unsqueeze(1))
+
+
+def rgb_feature_maps(rgb):
+    """Gaussian 5x5 sigma=1, signed residual and Sobel XY; RGB is raw [0,1]."""
+    horizontal, vertical, sobel = feature_kernels(rgb.device, rgb.dtype)
+    low = F.conv2d(F.pad(rgb, (2, 2, 0, 0), mode='replicate'), horizontal, groups=3)
+    low = F.conv2d(F.pad(low, (0, 0, 2, 2), mode='replicate'), vertical, groups=3)
+    gray = (rgb * rgb.new_tensor([.299, .587, .114]).view(1, 3, 1, 1)).sum(1, keepdim=True)
+    gradient = F.conv2d(F.pad(gray, (1, 1, 1, 1), mode='replicate'), sobel)
+    # Match RGB input units; signed detail and gradients must not be centered or clipped.
+    return torch.cat((half_ste(half_ste(half_ste(low) - .5) * .125),
+                      (rgb - low) * .125, gradient * .125), dim=1)
 
 
 def half_ste(value):
@@ -246,6 +276,7 @@ def teacher_target(teacher, frame):
         ('intensity', 'detail_strength', 'colour_strength', 'detail_radius')})
     return {'head': head.detach().cpu().clone(),
             'features': {k: v.detach().cpu().clone() for k, v in features.items()},
+            'source_rgb': torch.from_numpy(frame.rgb.copy()).permute(2, 0, 1).unsqueeze(0),
             'rgb': torch.from_numpy(output).permute(2, 0, 1).unsqueeze(0), 'history': history,
             'inference_seconds': seconds}
 
@@ -258,19 +289,12 @@ def device_target(target, device):
     return move(target['head']), {k: move(v) for k, v in target['features'].items()}, move(target['rgb'])
 
 
-def frame_guides(sample, index, crop_size):
+def frame_guides(sample, index):
     if index == 0:
         return None, None
     motion, confidence = sample['motions'][index], sample['confidences'][index]
     if motion is None:
         raise ValueError('Missing Sintel flow for a consecutive frame')
-    H, W = motion.shape[:2]
-    if crop_size:
-        top, left = max(0, (H - crop_size) // 2), max(0, (W - crop_size) // 2)
-        motion = motion[top:top + crop_size, left:left + crop_size].copy()
-        confidence = confidence[top:top + crop_size, left:left + crop_size].copy()
-        h, w = motion.shape[:2]
-        motion *= np.array([W / w, H / h], np.float32)
     h, w = motion.shape[:2]
     yy, xx = np.indices((h, w), dtype=np.float32)
     valid = ((xx + motion[..., 0] * w >= 0) & (xx + motion[..., 0] * w <= w - 1)

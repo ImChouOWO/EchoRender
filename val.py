@@ -78,15 +78,15 @@ def evaluate_checkpoint(payload, teacher_factory, loaders, config, device):
     """Cache isolated evaluation targets, unload Teacher, then score RGB clips."""
     student = EchoRenderStudent(payload['student_config'])
     student.load_state_dict(payload['student'], strict=True)
-    widths = {name: student.channels[index] for name, index in student.FEATURE_LAYERS.items()}
-    criterion = DistillationLoss(config['loss'], student_channels=widths)
+    widths = {name: student.channels[index] for name, index in student.feature_layers.items()}
+    criterion = DistillationLoss(config['loss'], stages=config['training']['distillation_layers'], student_channels=widths)
     criterion.load_state_dict(payload['distillation'], strict=True)
     teacher = teacher_factory()
     from tool.teacher_features import TeacherFeatureCache, teacher_temporal_signature
     from tool.distillation import cache_key, make_frame
-    from tool.temporal import teacher_target, crop_rgb, reset_history
-    from tool.trainer import FEATURE_CACHE_DIR
-    cache = TeacherFeatureCache(FEATURE_CACHE_DIR, index_name='evaluation.json', split_override='evaluate')
+    from tool.temporal import teacher_target, image_rgb, reset_history
+    from tool.trainer import feature_cache_dir
+    cache = TeacherFeatureCache(feature_cache_dir(config), index_name='evaluation.json', split_override='evaluate')
     metrics = ImageMetrics(net=config['validation']['lpips_net'], ssim_window=config['loss']['ssim_window'])
     monitor = GPUMonitor(device, config['logging']['gpu_poll_seconds'])
     results = {}
@@ -108,14 +108,13 @@ def evaluate_checkpoint(payload, teacher_factory, loaders, config, device):
                         if item.is_file():
                             stat = item.stat()
                             sources.append((str(item), stat.st_size, stat.st_mtime_ns))
-        pipeline, previous_pipeline = teacher_temporal_signature()
+        pipeline = teacher_temporal_signature()
         signature = {'teacher': module_digest(teacher), 'rendering': config['rendering'],
-            'crop': config['training']['crop_size'], 'sources': sources, 'device': str(device), 'torch': torch.__version__,
+            'adapter_size': config['training']['adapter_size'], 'stages': config['training']['distillation_layers'], 'sources': sources, 'device': str(device), 'torch': torch.__version__,
             'pipeline': pipeline,
             'external_motion': hashlib.sha256(inspect.getsource(raw_motion).encode()).hexdigest(),
             'opencv': cv2.__version__}
-        alternate = {**signature, 'pipeline': previous_pipeline} if previous_pipeline else None
-        fingerprint = cache.configure_signatures(signature, alternate)
+        fingerprint = cache.configure_signatures(signature)
         cache.prepare(fingerprint, payload['teacher_blend_scale'])
         teacher.eval().to(device)
         for split, loader in loaders.items():
@@ -123,7 +122,7 @@ def evaluate_checkpoint(payload, teacher_factory, loaders, config, device):
                 for sample in batch['sequences']:
                     history = previous = None
                     for position, image in enumerate(sample['images']):
-                        rgb = crop_rgb(image, config['training']['crop_size'])
+                        rgb = image_rgb(image)
                         if reset_history(previous, rgb, config):
                             history = None
                         key = cache_key(sample, position)
@@ -171,24 +170,19 @@ def main(argv=None):
     parser.add_argument('--device', help='Override runtime.device: cpu or cuda:N')
     parser.add_argument('--split', choices=('val', 'test', 'both'), default='both')
     parser.add_argument('--max-clips', type=positive_integer, help='Limit physical clips per split; retain all trained profiles')
-    parser.add_argument('--imgsz', type=int, help='Comparison inference longest edge; 0 keeps native inference')
     args = parser.parse_args(argv)
     try:
         config = load_training_config(args.config)
-        if args.imgsz is not None:
-            if args.imgsz < 0:
-                raise ValueError('imgsz must be nonnegative')
-            config['reporting']['inference_size'] = args.imgsz
         weights = args.weights.expanduser().resolve()
         payload = torch.load(weights, map_location='cpu', weights_only=True)
         required = {'student', 'student_config', 'distillation', 'train_config', 'epoch', 'teacher_blend_scale'}
         if not isinstance(payload, dict) or payload.get('format') != FORMAT or not required <= payload.keys():
             raise ValueError(f'Expected a complete {FORMAT} training checkpoint; retraining is required')
-        # Score with the checkpoint's objective; compare inputs using the current augmentation settings.
+        # Saved rendering fixes the reference; --config selects the evaluation loss, including appearance.
         config['rendering'] = deepcopy(payload['train_config']['rendering'])
         config['training']['profiles'] = list(config['rendering']['profiles'])
-        config['loss'] = deepcopy(payload['train_config']['loss'])
-        config['training']['crop_size'] = payload['train_config']['training']['crop_size']
+        for key in ('adapter_size', 'distillation_layers'):
+            config['training'][key] = deepcopy(payload['train_config']['training'][key])
         torch.set_num_threads(config['runtime']['cpu_threads'])
         device = resolve_device(args.device or config['runtime']['device'])
         if device.type == 'cuda':
@@ -213,14 +207,15 @@ def main(argv=None):
         print(f'Output: {directory}', flush=True)
         print(f'Checkpoint: {weights} | epoch={payload["epoch"]} | device={device}', flush=True)
         def create_teacher():
-            return EchoRenderTeacher(config['model']['teacher_weights'], device='cpu')
+            return EchoRenderTeacher(config['model']['teacher_weights'], device='cpu',
+                                       stages=config['training']['distillation_layers'])
         history = export_history(weights, directory, config)
         validation = evaluate_checkpoint(payload, create_teacher, loaders, config, device)
         result = {'checkpoint': str(weights), 'checkpoint_epoch': payload['epoch'], 'history_source': history,
+                  'evaluation_loss': config['loss'],
                   'device': str(device), 'max_clips_per_split': args.max_clips, 'missing_splits': missing,
-                  'validation_crop_size': config['training']['crop_size'],
-                  'comparison_crop_size': config['reporting']['crop_size'],
-                  'comparison_inference_size': config['reporting']['inference_size'],
+                  'adapter_size': config['training']['adapter_size'],
+                  'distillation_layers': config['training']['distillation_layers'],
                   'comparison_samples_per_mode': config['reporting']['samples_per_mode'],
                   'scoring_input': 'original (no augmentation)', 'results': validation}
         from tool.temporal import write_stage_report

@@ -28,11 +28,11 @@ REFERENCE_URL = 'https://github.com/uzbekunknown/dlss-nr-on-intel/tree/' + REFER
 def demo():
     """Preview Teacher enhancement on the current Sintel dataset."""
     return run_inference(
-        input_image=None,
-        scene="alley_1",
+        input_image="/home/soic/Desktop/REDS/val/val_sharp_bicubic/X4/000/00000065.png",
+        scene=None,
         render_pass="clean",
         max_frames=10,
-        project="teacher_sintel_clean",
+        project="REDS",
         device="cuda:1",
 
         # Preserve native detail for inspecting Teacher targets.
@@ -42,18 +42,18 @@ def demo():
         profile="neutral",
         style_index=2,
         tone=None,
-        structure=1.8,
+        structure=2,
         skin_structure=1.5,
-        auto_structure=1,
+        auto_structure=2,
         noise_index=1,
 
         intensity=1.8,
         detail_strength=1.5,
         colour_strength=1,
-        detail_radius=0.5,
+        detail_radius=0.1,
 
         # Reproject previous neural predictions with Sintel flow.
-        temporal=True,
+        temporal=False,
         motion_mode="sintel",
         inspect_data=True,
     )

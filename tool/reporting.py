@@ -121,6 +121,33 @@ def write_training_report(summary, directory):
     figure.savefig(directory / 'training_metrics.png', dpi=160)
     plt.close(figure)
 
+    appearance_names = list(dict.fromkeys(name for row in history for name in row['validation']['components']
+                                         if name == 'appearance' or name.startswith(('appearance_', 'weighted_appearance_'))))
+    if appearance_names:
+        with (directory / 'appearance.csv').open('w', newline='') as stream:
+            writer = csv.writer(stream)
+            writer.writerow(['epoch', 'split', *appearance_names])
+            for row in history:
+                for split, parts in (('train', row.get('train_components', {})), ('val', row['validation']['components'])):
+                    writer.writerow([row['epoch'], split, *[parts.get(name) for name in appearance_names]])
+        from model.card.appearance import APPEARANCE_TERMS
+        names = ['appearance', *[f'appearance_{name}' for name in APPEARANCE_TERMS],
+                 'appearance_roi_l_score', 'appearance_roi_c_score', 'appearance_roi_s_score',
+                 'appearance_lab_l_dark_mae', 'appearance_lab_l_bright_mae', 'appearance_lab_l_dark_fraction']
+        figure, axes = plt.subplots(5, 3, figsize=(15, 16), constrained_layout=True)
+        for axis, name in zip(axes.flat, names):
+            for split in ('train', 'val'):
+                values = [(row.get('train_components', {}) if split == 'train' else row['validation']['components']).get(name, float('nan'))
+                          for row in history]
+                axis.plot(epochs, values, label=split.capitalize())
+            axis.axvline(summary['best_epoch'], color='gray', linestyle='--')
+            axis.set(title=name.removeprefix('appearance_').replace('_', ' ').title(), xlabel='Epoch')
+            axis.grid(alpha=.25)
+            axis.legend(fontsize=8)
+        figure.suptitle('Local appearance supervision - Teacher RGB reference', fontweight='bold')
+        figure.savefig(directory / 'appearance_metrics.png', dpi=140)
+        plt.close(figure)
+
     profiles = list(dict.fromkeys(name for row in history for name in row['validation'].get('profiles', {})))
     if profiles:
         figure, axes = plt.subplots(2, 2, figsize=(12, 8), constrained_layout=True)

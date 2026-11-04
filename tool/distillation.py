@@ -9,7 +9,7 @@ import torch
 from torchvision.transforms import functional as TF
 from mlxdlss.temporal import sample_history
 
-from .temporal import (prepare_student_frame, prepare_student_frames, student_previous, prepare_frame, crop_rgb, frame_guides, reset_history, student_inputs,
+from .temporal import (prepare_student_frame, prepare_student_frames, student_previous, prepare_frame, image_rgb, frame_guides, reset_history, student_inputs,
                        teacher_target, device_target, compose_tensor)
 from .progress import progress_bar, progress_row
 from .monitoring import measure_forward
@@ -86,10 +86,16 @@ def cache_key(sample, position):
     return f"{sample['profile']}:{sample['clip_id']}:{position + 1}:{sample['sample_ids'][position]}"
 
 
-def make_frame(sample, position, config, history=None, *, rgb=None, crop_size=None):
-    crop_size = config['training']['crop_size'] if crop_size is None else crop_size
-    rgb = crop_rgb(sample['images'][position], crop_size) if rgb is None else rgb
-    motion, confidence = frame_guides(sample, position, crop_size)
+def supervised_motion(sample, motion, confidence):
+    """RGB-estimated Teacher guides are not ground-truth Student motion labels."""
+    if sample.get('motion_reference') == 'estimated_from_rgb':
+        return None, None
+    return motion, confidence
+
+
+def make_frame(sample, position, config, history=None, *, rgb=None):
+    rgb = image_rgb(sample['images'][position]) if rgb is None else rgb
+    motion, confidence = frame_guides(sample, position)
     return prepare_frame(rgb, config, sample['profile'], history=history, motion=motion, confidence=confidence)
 
 
@@ -105,7 +111,8 @@ def objective(student, criterion, frame, target, blend_scale, loss_weights, *, h
     if head.shape != target_head.shape:
         raise RuntimeError('Student and Teacher head geometry differs')
     loss, parts = criterion(head, target_head, features, target_features, prediction, target_rgb,
-        image_hw=frame.small.shape[:2], network_hw=frame.inputs.shape[1:3], weights=loss_weights, tensor_terms=True)
+        image_hw=frame.small.shape[:2], network_hw=(frame.geometry.network_height, frame.geometry.network_width),
+        clean_source=target['source_rgb'].to(device, non_blocking=True), weights=loss_weights, tensor_terms=True)
     if frame.motion_loss is not None:
         weighted = loss_weights['motion'] * frame.motion_loss
         loss = loss + weighted
@@ -129,7 +136,7 @@ def clip_groups(lengths, maximum):
     return [order[begin:begin + maximum] for begin in range(0, len(order), maximum)]
 
 
-def batch_augmentation(samples, lengths, plan, augmentation, ratio, crop_size, maximum):
+def batch_augmentation(samples, lengths, plan, augmentation, ratio, maximum):
     # Draw noise in the original sample/time order before regrouping clips.
     images = {}
     for begin in range(0, len(samples), maximum):
@@ -137,12 +144,12 @@ def batch_augmentation(samples, lengths, plan, augmentation, ratio, crop_size, m
         for position in range(max(lengths[index] for index in indices)):
             for index in indices:
                 if index in plan and position < lengths[index]:
-                    rgb = crop_rgb(samples[index]['images'][position], crop_size)
+                    rgb = image_rgb(samples[index]['images'][position])
                     images[index, position] = augmentation.apply_rgb(rgb, plan[index], ratio)
     return images
 
 
-def train_batch(teacher, student, criterion, batch, optimizer, *, config, crop_size, controls,
+def train_batch(teacher, student, criterion, batch, optimizer, *, config, controls,
                 augmentation=None, augmentation_ratio=0., target_cache=None, blend_scale=None, micro_batch_size=1):
     student.train()
     criterion.train()
@@ -156,7 +163,7 @@ def train_batch(teacher, student, criterion, batch, optimizer, *, config, crop_s
                len(s['images']) + 1, (), generator=augmentation.generator).item()
                if augmentation else len(s['images']) for s in samples]
     plan = augmentation.plan(count, augmentation_ratio, lengths) if augmentation else {}
-    augmented = batch_augmentation(samples, lengths, plan, augmentation, augmentation_ratio, crop_size, micro_batch_size)
+    augmented = batch_augmentation(samples, lengths, plan, augmentation, augmentation_ratio, micro_batch_size)
     groups = clip_groups(lengths, micro_batch_size)
     device = next(student.parameters()).device
     keys = [cache_key(samples[index], position) for group in groups
@@ -172,7 +179,7 @@ def train_batch(teacher, student, criterion, batch, optimizer, *, config, crop_s
                     sample = samples[index]
                     if position >= lengths[index]:
                         continue
-                    rgb = crop_rgb(sample['images'][position], crop_size)
+                    rgb = image_rgb(sample['images'][position])
                     if reset_history(previous[offset], rgb, config):
                         histories[offset] = teacher_histories[offset] = previous_student[offset] = None
                     if targets_ready is not None:
@@ -181,7 +188,8 @@ def train_batch(teacher, student, criterion, batch, optimizer, *, config, crop_s
                         clean = make_frame(sample, position, config, teacher_histories[offset], rgb=rgb)
                         target = teacher_target(teacher, clean)
                         teacher_histories[offset] = target['history'] if config['rendering']['temporal'] else None
-                    motion, confidence = frame_guides(sample, position, crop_size)
+                    motion, confidence = frame_guides(sample, position)
+                    motion, confidence = supervised_motion(sample, motion, confidence)
                     requests.append(dict(rgb=augmented.get((index, position), rgb), profile=sample['profile'],
                         previous=previous_student[offset], history=histories[offset], motion=motion, confidence=confidence))
                     prepared.append((offset, index))
@@ -269,7 +277,7 @@ def validation_items(teacher, student, criterion, samples, metrics, config, cont
                 for sample, state in zip(group, states):
                     if position >= len(sample['images']):
                         continue
-                    rgb = crop_rgb(sample['images'][position], config['training']['crop_size'])
+                    rgb = image_rgb(sample['images'][position])
                     if reset_history(state['previous'], rgb, config):
                         state.update(history=None, teacher_history=None, previous_student=None,
                                      previous_output=None, previous_single=None, depth=0)
@@ -278,7 +286,8 @@ def validation_items(teacher, student, criterion, samples, metrics, config, cont
                     else:
                         clean = make_frame(sample, position, config, state['teacher_history'], rgb=rgb)
                         target = teacher_target(teacher, clean)
-                    motion, confidence = frame_guides(sample, position, config['training']['crop_size'])
+                    motion, confidence = frame_guides(sample, position)
+                    motion, confidence = supervised_motion(sample, motion, confidence)
                     requests.append(dict(rgb=rgb, profile=sample['profile'], previous=state['previous_student'],
                         history=state['history'], motion=motion, confidence=confidence))
                     entries.append((sample, state, rgb, target))
@@ -351,7 +360,7 @@ def evaluate(teacher, student, criterion, loader, metrics, monitor, *, config, e
                     record['single_' + name] += baseline[name]
                     record['delta_' + name] += row[name] - baseline[name]
                 if frame.history is not None and previous_output is not None:
-                    motion, confidence = frame_guides(sample, position, config['training']['crop_size'])
+                    motion, confidence = frame_guides(sample, position)
                     yy, xx = np.indices(rgb.shape[:2], dtype=np.float32)
                     u, v = (xx + .5) / rgb.shape[1] + motion[..., 0], (yy + .5) / rgb.shape[0] + motion[..., 1]
                     now = prediction[0].permute(1, 2, 0).cpu().numpy()

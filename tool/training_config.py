@@ -7,8 +7,8 @@ import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TRAIN_CONFIG = PROJECT_ROOT / 'config/train.yaml'
-LOSS_WEIGHTS = {'distillation', 'reconstruction', 'mid', 'output', 'e1', 'e2', 'e3',
-                'motion', 'vit', 'vit_feature', 'vit_affinity', 'rgb_mse', 'rgb_ssim', 'rgb_ms_ssim'}
+LOSS_WEIGHTS = {'distillation', 'reconstruction', 'mid', 'output', 'output_rgb', 'output_gate',
+                'motion', 'vit_feature', 'vit_affinity', 'rgb_mse', 'rgb_ssim', 'rgb_ms_ssim', 'rgb_lpips', 'appearance'}
 
 
 def reserve_output_dir(path):
@@ -44,20 +44,21 @@ def load_training_config(path=DEFAULT_TRAIN_CONFIG):
     expected = {
         'model': {'student_config', 'student_weights', 'teacher_weights'},
         'runtime': {'device', 'cpu_threads', 'output_dir'},
-        'training': {'epochs', 'profiles', 'early_stopping', 'releas', 'max_steps', 'crop_size', 'optimizer', 'grad_clip', 'micro_batch_size', 'gradient_checkpointing'},
-        'loss': LOSS_WEIGHTS | {'projection', 'norm_eps', 'affinity_chunk_size', 'ssim_window', 'ms_ssim_weights'},
+        'training': {'epochs', 'profiles', 'early_stopping', 'releas', 'max_steps', 'adapter_size', 'distillation_layers', 'optimizer', 'grad_clip', 'micro_batch_size', 'gradient_checkpointing', 'precision'},
+        'loss': LOSS_WEIGHTS | {'appearance_config', 'feature_weights', 'teacher_change', 'lpips_net', 'projection', 'norm_eps', 'affinity_chunk_size', 'ssim_window', 'ms_ssim_weights'},
         'validation': {'reference', 'lpips_net'}, 'benchmark': {'enabled', 'warmup', 'repeats'},
         'logging': {'progress', 'gpu_poll_seconds'}, 'schedule': {'kind', 'eta_min'},
         'augmentation': {'enabled', 'start_ratio', 'max_ratio', 'peak_fraction',
                          'stop_fraction', 'noise_std'},
-        'reporting': {'enabled', 'project_name', 'best_metric', 'crop_size', 'inference_size', 'samples_per_mode', 'strengths'},
+        'reporting': {'enabled', 'project_name', 'best_metric', 'samples_per_mode', 'strengths'},
         'dataset': {'root', 'render_pass', 'splits'},
         'loader': {'batch_size', 'num_workers', 'seed', 'train_shuffle'},
-        'rendering': {'render_scale', 'min_extent', 'noise_index', 'temporal', 'max_frames',
+        'rendering': {'noise_index', 'temporal', 'max_frames',
                       'train_min_frames', 'history_strength', 'scene_cut_threshold', 'profiles'},
     }
     for section, keys in expected.items():
-        if set(c[section]) != keys:
+        actual = set(c[section]) - ({'type'} if section == 'dataset' else set())
+        if actual != keys:
             raise ValueError(f'{section} must contain exactly: {sorted(keys)}')
     selected = c['training']['profiles']
     allowed_profiles = {'standard', 'natural', 'cinematic', 'neutral'}
@@ -86,7 +87,7 @@ def load_training_config(path=DEFAULT_TRAIN_CONFIG):
         c[section][key] = str(resolved)
     for section, key, zero in (('runtime', 'cpu_threads', False), ('training', 'epochs', False),
                                ('training', 'micro_batch_size', False),
-                               ('training', 'crop_size', True), ('benchmark', 'warmup', True),
+                               ('training', 'adapter_size', False), ('benchmark', 'warmup', True),
                                ('benchmark', 'repeats', False), ('loss', 'affinity_chunk_size', False),
                                ('loss', 'ssim_window', False)):
         _positive(c[section][key], f'{section}.{key}', integer=True, zero=zero)
@@ -97,6 +98,25 @@ def load_training_config(path=DEFAULT_TRAIN_CONFIG):
         _positive(value, f'optimizer.{key}', zero=key != 'lr')
     for key in LOSS_WEIGHTS:
         _positive(c['loss'][key], f'loss.{key}', zero=True)
+    from model.card.appearance import APPEARANCE_TERMS
+    appearance = c['loss']['appearance_config']
+    keys = {'weights', 'roi_size', 'roi_stride', 'gaussian_size', 'gaussian_sigma', 'brightness_split'}
+    if not isinstance(appearance, dict) or set(appearance) != keys:
+        raise ValueError(f'appearance_config requires exactly {sorted(keys)}')
+    if not isinstance(appearance['weights'], dict) or set(appearance['weights']) != set(APPEARANCE_TERMS):
+        raise ValueError('appearance_config.weights must define every appearance term')
+    for key, value in appearance['weights'].items():
+        _positive(value, f'appearance_config.weights.{key}', zero=True)
+    for key in ('roi_size', 'roi_stride', 'gaussian_size'):
+        _positive(appearance[key], f'appearance_config.{key}', integer=True)
+    if appearance['roi_size'] < 2 or appearance['roi_stride'] > appearance['roi_size']:
+        raise ValueError('Appearance ROI size must be >= 2 and stride must not exceed size')
+    if appearance['gaussian_size'] < 3 or appearance['gaussian_size'] % 2 == 0:
+        raise ValueError('Appearance Gaussian size must be odd and >= 3')
+    _positive(appearance['gaussian_sigma'], 'appearance_config.gaussian_sigma')
+    _positive(appearance['brightness_split'], 'appearance_config.brightness_split')
+    if appearance['brightness_split'] >= 100:
+        raise ValueError('Appearance brightness_split must be within (0,100) L*')
     _positive(c['loss']['norm_eps'], 'norm_eps')
     _positive(c['logging']['gpu_poll_seconds'], 'gpu_poll_seconds')
     for section, key in (('training', 'gradient_checkpointing'), ('training', 'releas'), ('loss', 'projection'), ('logging', 'progress'), ('benchmark', 'enabled')):
@@ -111,12 +131,31 @@ def load_training_config(path=DEFAULT_TRAIN_CONFIG):
     if window < 3 or window % 2 == 0:
         raise ValueError('ssim_window must be odd and >= 3')
     minimum = (window - 1) * 2 ** (len(weights) - 1)
-    if c['training']['crop_size'] and c['training']['crop_size'] <= minimum:
-        raise ValueError(f'crop_size must exceed {minimum} for configured MS-SSIM')
+    size = c['training']['adapter_size']
+    if size < 320 or size > 4096 or size % 64 or size <= minimum:
+        raise ValueError('adapter_size must be a multiple of 64 within [320,4096] and exceed the MS-SSIM minimum')
+    from model.student import STAGES, HEAD, COMPOSITION
+    if c['training']['precision'] not in ('float32', 'bf16'):
+        raise ValueError('training.precision must be float32 or bf16')
+    layers = c['training']['distillation_layers']
+    if (not isinstance(layers, list) or not layers or any(not isinstance(n, str) or n not in (*STAGES, HEAD, COMPOSITION) for n in layers)
+            or len(layers) != len(set(layers))):
+        raise ValueError('distillation_layers must contain unique model stage names')
+    features = c['loss']['feature_weights']
+    if not isinstance(features, dict) or set(features) != set(STAGES):
+        raise ValueError('loss.feature_weights must define every model stage')
+    for name, value in features.items():
+        _positive(value, f'feature_weights.{name}', zero=True)
+    change = c['loss']['teacher_change']
+    if not isinstance(change, dict) or set(change) != {'alpha', 'tau'}:
+        raise ValueError('teacher_change requires alpha and tau')
+    _positive(change['alpha'], 'teacher_change.alpha', zero=True)
+    _positive(change['tau'], 'teacher_change.tau')
     if c['validation']['reference'] != 'teacher':
         raise ValueError('Only the agreed Teacher RGB reference is implemented')
-    if c['validation']['lpips_net'] not in ('alex', 'vgg', 'squeeze'):
-        raise ValueError('lpips_net must be alex, vgg or squeeze')
+    for section in ('loss', 'validation'):
+        if c[section]['lpips_net'] not in ('alex', 'vgg', 'squeeze'):
+            raise ValueError(f'{section}.lpips_net must be alex, vgg or squeeze')
     if c['schedule']['kind'] not in ('constant', 'cosine'):
         raise ValueError('schedule.kind must be constant or cosine')
     _positive(c['schedule']['eta_min'], 'schedule.eta_min', zero=True)
@@ -142,8 +181,6 @@ def load_training_config(path=DEFAULT_TRAIN_CONFIG):
         raise ValueError('reporting.project_name must be null or a directory name using letters, digits, _ and -')
     if reporting['best_metric'] not in ('loss', 'psnr', 'ssim', 'lpips'):
         raise ValueError('reporting.best_metric must be loss, psnr, ssim or lpips')
-    _positive(reporting['crop_size'], 'reporting.crop_size', integer=True, zero=True)
-    _positive(reporting['inference_size'], 'reporting.inference_size', integer=True, zero=True)
     _positive(reporting['samples_per_mode'], 'reporting.samples_per_mode', integer=True)
     strengths = reporting['strengths']
     if not isinstance(strengths, list) or not strengths:
@@ -155,17 +192,16 @@ def load_training_config(path=DEFAULT_TRAIN_CONFIG):
     if strengths != sorted(set(strengths)):
         raise ValueError('reporting.strengths must be sorted and unique')
     rendering = c['rendering']
-    if c['dataset']['render_pass'] != 'clean':
-        raise ValueError('dataset.render_pass is fixed to clean')
+    kind = c['dataset'].get('type', 'sintel')
+    if kind not in ('sintel', 'reds') or c['dataset']['render_pass'] != ('clean' if kind == 'sintel' else 'sharp'):
+        raise ValueError('Use dataset.type sintel with clean, or reds with sharp')
     if type(rendering['temporal']) is not bool:
         raise ValueError('rendering.temporal must be boolean')
-    for key in ('max_frames', 'train_min_frames', 'min_extent', 'noise_index'):
+    for key in ('max_frames', 'train_min_frames', 'noise_index'):
         _positive(rendering[key], f'rendering.{key}', integer=True, zero=key == 'noise_index')
     if not 1 <= rendering['train_min_frames'] <= rendering['max_frames'] <= 10:
         raise ValueError('Frame limits must satisfy 1 <= train_min_frames <= max_frames <= 10')
-    if not 320 <= rendering['min_extent'] <= 4096 or rendering['min_extent'] % 64:
-        raise ValueError('rendering.min_extent must be a multiple of 64 within [320,4096]')
-    for key, low, high in (('render_scale', .05, 1), ('history_strength', 0, 1), ('scene_cut_threshold', 0, 1)):
+    for key, low, high in (('history_strength', 0, 1), ('scene_cut_threshold', 0, 1)):
         _positive(rendering[key], f'rendering.{key}', zero=True)
         if not low <= rendering[key] <= high:
             raise ValueError(f'rendering.{key} must be within [{low},{high}]')

@@ -1,4 +1,4 @@
-"""Scene-disjoint clean RGB clips; shuffle clips, never frames within a clip."""
+"""Ordered Sintel/REDS RGB clips; shuffle clips, never frames within a clip."""
 from dataclasses import dataclass
 from pathlib import Path
 import random
@@ -32,6 +32,7 @@ class DataConfig:
     max_frames: int
     temporal: bool
     profiles: tuple[str, ...]
+    kind: str = 'sintel'
 
 
 def _integer(value, name, minimum=0):
@@ -72,14 +73,21 @@ def load_data_config(path=DEFAULT_DATA_CONFIG):
         raise ValueError('dataset.root must be a path string')
     root = Path(root).expanduser()
     root = (root if root.is_absolute() else path.parent / root).resolve()
+    kind = dataset.get('type', 'sintel')
+    if kind not in ('sintel', 'reds'):
+        raise ValueError('dataset.type must be sintel or reds')
     render_pass = dataset.get('render_pass', 'clean')
-    if render_pass != 'clean':
-        raise ValueError('dataset.render_pass is fixed to clean')
+    expected_pass = 'clean' if kind == 'sintel' else 'sharp'
+    if render_pass != expected_pass:
+        raise ValueError(f'{kind} dataset.render_pass must be {expected_pass}')
     raw_splits = dataset.get('splits')
     if not isinstance(raw_splits, dict) or set(raw_splits) != {'train', 'val', 'test'}:
         raise ValueError('dataset.splits must define train, val and test')
     splits = {}
-    for name, expected_source in (('train', 'training'), ('val', 'training'), ('test', 'test')):
+    sources = (('train', 'training'), ('val', 'training'), ('test', 'test'))
+    if kind == 'reds':
+        sources = tuple((name, name) for name in ('train', 'val', 'test'))
+    for name, expected_source in sources:
         spec = raw_splits[name]
         if not isinstance(spec, dict) or spec.get('source') != expected_source:
             raise ValueError(f'{name}.source must be {expected_source!r}')
@@ -87,9 +95,10 @@ def load_data_config(path=DEFAULT_DATA_CONFIG):
         splits[name] = SplitSpec(expected_source, scenes)
     # Train and validation may never silently select the same training images.
     train, val = splits['train'].scenes, splits['val'].scenes
-    if train is None or val is None:
+    if kind == 'sintel' and (train is None or val is None):
         raise ValueError('train/val require explicit disjoint scene lists; null is allowed for test')
-    overlap = set(train) & set(val)
+    same_source = splits['train'].source == splits['val'].source
+    overlap = set(train or ()) & set(val or ()) if same_source else set()
     if overlap:
         raise ValueError(f'train/val scenes overlap: {sorted(overlap)}')
     shuffle = loader.get('train_shuffle', True)
@@ -101,26 +110,32 @@ def load_data_config(path=DEFAULT_DATA_CONFIG):
         _integer(loader.get('num_workers', 0), 'loader.num_workers'),
         _integer(loader.get('seed', 42), 'loader.seed'), shuffle,
         config['rendering']['max_frames'], config['rendering']['temporal'],
-        tuple(config['rendering']['profiles']),
+        tuple(config['rendering']['profiles']), kind,
     )
 
 
-class SintelSequenceDataset(Dataset):
+class RGBSequenceDataset(Dataset):
     def __init__(self, config, split):
         self.root = config.root
         spec = config.splits[split]
-        self.source, self.render_pass = spec.source, 'clean'
+        self.kind = config.kind
+        self.source, self.render_pass = spec.source, config.render_pass
         self.profiles, self.temporal = config.profiles, config.temporal
-        base = self.root / self.source / 'clean'
+        base = self.root / self.source / ('clean' if self.kind == 'sintel' else f'{self.source}_sharp')
         if not base.is_dir():
-            raise FileNotFoundError(f'Sintel clean images not found: {base}')
+            raise FileNotFoundError(f'{self.kind} {self.render_pass} images not found: {base}')
         self.scenes = tuple(sorted(spec.scenes or (p.name for p in base.iterdir() if p.is_dir())))
         self.clips = []
         size = config.max_frames if self.temporal else 1
         for scene in self.scenes:
-            paths = sorted((base / scene).glob('frame_*.png'))
+            pattern = 'frame_*.png' if self.kind == 'sintel' else '[0-9]*.png'
+            paths = sorted((base / scene).glob(pattern))
             if not paths:
-                raise ValueError(f'No clean frames found for {scene}')
+                raise ValueError(f'No {self.render_pass} frames found for {scene}')
+            if self.kind == 'reds':
+                paired = base.parent / f'{self.source}_sharp_bicubic/X4' / scene
+                if {p.name for p in paths} != {p.name for p in paired.glob('*.png')}:
+                    raise ValueError(f'REDS sharp/X4 frame names do not match: {scene}')
             group = []
             for path in paths:
                 number = int(path.stem.split('_')[-1])
@@ -132,7 +147,7 @@ class SintelSequenceDataset(Dataset):
                 self.clips.append((scene, tuple(group)))
         self.items = [(index, profile) for index in range(len(self.clips)) for profile in self.profiles]
         # Fail before model loading when multi-frame ground truth is unavailable.
-        if self.temporal and self.source == 'training':
+        if self.temporal and self.kind == 'sintel' and self.source == 'training':
             for scene, paths in self.clips:
                 for previous, current in zip(paths, paths[1:]):
                     for name, frame, suffix in (('flow', previous, '.flo'), ('occlusions', previous, '.png'),
@@ -147,12 +162,17 @@ class SintelSequenceDataset(Dataset):
     def metadata(self, index):
         clip_index, profile = self.items[index]
         scene, paths = self.clips[clip_index]
-        return {
-            'sample_ids': [f'{self.source}/clean/{scene}/{path.stem}' for path in paths],
-            'clip_id': f'{self.source}/clean/{scene}/{paths[0].stem}',
+        prefix = f'{self.source}/{self.render_pass}/{scene}'
+        meta = {
+            'sample_ids': [f'{prefix}/{path.stem}' for path in paths],
+            'clip_id': f'{prefix}/{paths[0].stem}',
             'scene': scene, 'profile': profile, 'paths': list(map(str, paths)),
-            'motion_reference': 'sintel_ground_truth' if self.source == 'training' else 'estimated_from_rgb',
+            'motion_reference': 'sintel_ground_truth' if self.kind == 'sintel' and self.source == 'training' else 'estimated_from_rgb',
         }
+        if self.kind == 'reds':
+            low = self.root / self.source / f'{self.source}_sharp_bicubic/X4' / scene
+            meta['paired_lr_paths'] = [str(low / path.name) for path in paths]
+        return meta
 
     def __getitem__(self, index):
         from .temporal import dataset_motion
@@ -162,16 +182,24 @@ class SintelSequenceDataset(Dataset):
         if any(rgb.shape != rgbs[0].shape for rgb in rgbs):
             raise ValueError('Frame dimensions must remain constant within a clip')
         motions, confidences = [None], [None]
-        for i, (previous, current) in enumerate(zip(paths, paths[1:])):
-            if self.source == 'training':
+        for i, (previous, current) in enumerate(zip(paths, paths[1:])) if self.temporal else ():
+            if meta['motion_reference'] == 'sintel_ground_truth':
                 motion, confidence, _ = dataset_motion(self.root, self.source, meta['scene'], previous, current, rgbs[0].shape[:2])
             else:
                 from model.motion import raw_motion
                 motion, confidence = raw_motion(rgbs[i], rgbs[i + 1])
             motions.append(motion)
             confidences.append(confidence)
-        return {**meta, 'images': [torch.from_numpy(rgb).permute(2, 0, 1).contiguous() for rgb in rgbs],
-                'motions': motions, 'confidences': confidences}
+        def tensors(images):
+            return [torch.from_numpy(rgb).permute(2, 0, 1).contiguous() for rgb in images]
+        result = {**meta, 'images': tensors(rgbs), 'motions': motions, 'confidences': confidences}
+        if self.kind == 'reds':
+            # Keep Teacher supervision on sharp RGB; expose paired LR without changing the loss target.
+            low = [load_rgb(Path(path)) for path in meta['paired_lr_paths']]
+            if any((image.shape[0] * 4, image.shape[1] * 4) != rgb.shape[:2] for image, rgb in zip(low, rgbs)):
+                raise ValueError('REDS sharp/X4 dimensions must have an exact 4x ratio')
+            result['paired_lr_images'] = tensors(low)
+        return result
 
 
 def collate_sequences(samples):
@@ -188,7 +216,7 @@ def build_dataloader(config=DEFAULT_DATA_CONFIG, *, split='train'):
     config = config if isinstance(config, DataConfig) else load_data_config(config)
     if split not in config.splits:
         raise ValueError('split must be train, val or test')
-    dataset = SintelSequenceDataset(config, split)
+    dataset = RGBSequenceDataset(config, split)
     return DataLoader(dataset, batch_size=config.batch_size, num_workers=config.num_workers,
         shuffle=split == 'train' and config.train_shuffle,
         generator=torch.Generator().manual_seed(config.seed), worker_init_fn=_seed_worker,

@@ -30,9 +30,9 @@ from torchvision.transforms import functional as TF
 
 
 
-def tiny_model(motion='raw'):
+def tiny_model(motion='raw', **options):
     rows = [
-        [-1, 1, 'InputAdapter', [4]], [-1, 1, 'SwinStage', [4, 1, 1, 2, 1]],
+        [-1, 1, 'InputAdapter', [4, 1, 2, 1]], [-1, 1, 'SwinStage', [4, 1, 1, 2, 1]],
         [-1, 1, 'Downsample', [4]], [-1, 1, 'SSMStage', [4, 1, 2, 2, 1]],
         [-1, 1, 'Downsample', [4]], [-1, 1, 'SSMStage', [4, 1, 2, 2, 1]],
         [-1, 1, 'Downsample', [4]], [-1, 1, 'SSMStage', [4, 1, 2, 2, 1]],
@@ -43,9 +43,32 @@ def tiny_model(motion='raw'):
         rows.extend([[[ -1, skip], 1, 'Upsample', [4]],
                      [[-1, skip], 1, 'Add', []],
                      [-1, 1, 'SwinStage', [4, 1, 1, 2, 1]]])
-    rows.append([-1, 1, 'OutputHead', [4]])
-    return EchoRenderStudent({'motion': motion, 'input_channels': 8, 'output_channels': 4,
-                              'input_layout': 'BHWC', 'backbone': rows, 'head': []})
+    rows.extend([[[ -1, 0], 1, 'Add', []], [-1, 1, 'OutputHead', [4]]])
+    def create():
+        return EchoRenderStudent({'motion': motion, 'input_channels': 16, 'output_channels': 4,
+                              'input_layout': 'BHWC', 'adapter_size': 32,
+                              'stages': {'InputAdapter': 0, 'OutputHead': 28, 'E0': 1, 'E1': 3, 'E2': 5, 'E3': 7, 'E4': 9, 'VIT': 11, 'D1': 14, 'D2': 17, 'D3': 20}, 'backbone': rows, 'head': []}, **options)
+
+    if motion == 'raft_small':
+        with patch('model.student.RaftSmallMotion', return_value=FixtureMotion()):
+            return create()
+    return create()
+
+
+class FixtureMotion(nn.Module):
+    """Cheap synthetic flow/confidence for batching tests, never used by production models."""
+    def __init__(self):
+        super().__init__()
+        self.encoder = nn.Sequential(nn.Conv2d(6, 32, 5, stride=2, padding=2), nn.GELU(),
+            nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.GELU(), nn.Conv2d(64, 64, 3, padding=1), nn.GELU())
+        self.decoder = nn.Sequential(nn.Conv2d(64, 32, 3, padding=1), nn.GELU(), nn.Conv2d(32, 3, 3, padding=1))
+        nn.init.zeros_(self.decoder[-1].weight)
+        nn.init.zeros_(self.decoder[-1].bias)
+
+    def forward(self, previous, current):
+        value = self.decoder(self.encoder(torch.cat((previous, current), 1)))
+        value = F.interpolate(value, current.shape[-2:], mode='bilinear', align_corners=False)
+        return value[:, :2], value[:, 2:]
 
 
 class FixtureTeacher(nn.Module):
@@ -66,7 +89,7 @@ class FixtureTeacher(nn.Module):
         if not return_features:
             return head
         features = {}
-        for name, stride in {'e1': 4, 'e2': 8, 'e3': 16, 'vit': 64}.items():
+        for name, stride in {'E2': 8, 'VIT': 64, 'D1': 32, 'D3': 8}.items():
             value = F.adaptive_avg_pool2d(x[..., :4].permute(0, 3, 1, 2),
                                          tuple(math.ceil(size / stride) for size in x.shape[1:3]))
             features[name] = value
@@ -94,11 +117,14 @@ class TrainingTests(unittest.TestCase):
         cache_patch.start()
         self.addCleanup(cache_patch.stop)
         self.config = load_training_config()
+        self.config['loss'].update(rgb_lpips=0., appearance=0.)
+        self.config['training']['distillation_layers'] = ['RGB composition', 'OutputHead', 'E2', 'VIT', 'D1', 'D3']
+        self.config['training']['precision'] = 'float32'
 
     def criterion(self):
         config = deepcopy(self.config['loss'])
         config.update(ssim_window=3, ms_ssim_weights=[0.3, 0.3, 0.4])
-        return DistillationLoss(config, channels=dict.fromkeys(('e1', 'e2', 'e3', 'vit'), 4))
+        return DistillationLoss(config, channels=dict.fromkeys(('E2', 'VIT', 'D1', 'D3'), 4))
 
     def test_ssm_checkpoint_matches_outputs_and_gradients(self):
         from model.card.mamba import MambaStage
@@ -183,7 +209,7 @@ class TrainingTests(unittest.TestCase):
         import yaml
         c = yaml.safe_load(Path(self.config['model']['student_config']).read_text(encoding='utf-8-sig'))
         self.assertEqual([c['backbone'][i][2] for i in (3, 5, 7)], ['SSMStage'] * 3)
-        self.assertEqual(c['input_channels'], 8)
+        self.assertEqual(c['input_channels'], 16)
         self.assertEqual(c['ssm'], {'rotation': 'clockwise', 'directions': 2})
         self.assertEqual([c['backbone'][i][3][1] for i in (1, 3, 5, 7, 9, 11)], [2, 2, 4, 6, 8, 8])
         controls = TrainingSchedule(self.config, total_steps=1001)
@@ -290,15 +316,20 @@ class TrainingTests(unittest.TestCase):
 
     def test_total_loss_formula_and_projection_gradients(self):
         criterion = self.criterion()
-        s = {name: torch.rand(1, 4, 4, 4, requires_grad=True) for name in ('e1', 'e2', 'e3', 'vit')}
+        s = {name: torch.rand(1, 4, 4, 4, requires_grad=True) for name in ('E2', 'VIT', 'D1', 'D3')}
         t = {name: torch.rand(1, 4, max(1, 128 // stride), max(1, 128 // stride), requires_grad=True)
-             for name, stride in {'e1': 4, 'e2': 8, 'e3': 16, 'vit': 64}.items()}
+             for name, stride in {'E2': 8, 'VIT': 64, 'D1': 32, 'D3': 8}.items()}
         sh, th = torch.rand(1, 128, 128, 4, requires_grad=True), torch.rand(1, 128, 128, 4, requires_grad=True)
         sr, tr = torch.rand(1, 3, 128, 128, requires_grad=True), torch.rand(1, 3, 128, 128, requires_grad=True)
-        loss, parts = criterion(sh, th, s, t, sr, tr, image_hw=(128, 128), network_hw=(128, 128))
-        mid = (parts['e1'] + parts['e2'] + parts['e3'] + 0.5 * parts['vit_feature'] + parts['vit_affinity']) / 4
-        rgb = 0.5 * parts['rgb_mse'] + 0.2 * parts['rgb_ssim'] + 0.3 * parts['rgb_ms_ssim']
-        self.assertAlmostEqual(loss.item(), 3 * (0.5 * mid + 0.5 * parts['output']) + rgb, places=5)
+        loss, parts = criterion(sh, th, s, t, sr, tr, image_hw=(128, 128), network_hw=(128, 128), clean_source=tr.detach().clone())
+        mid = sum(criterion.config['feature_weights'][name] * parts[name]
+                  for name in criterion.stages) / len(criterion.stages)
+        rgb = parts['rgb_mse'] + 0.5 * parts['rgb_ssim'] + 0.8 * parts['rgb_ms_ssim']
+        self.assertAlmostEqual(loss.item(), criterion.config['distillation'] * (
+            criterion.config['mid'] * mid + criterion.config['output'] * parts['output'])
+            + criterion.config['reconstruction'] * rgb, places=5)
+        self.assertAlmostEqual(parts['output'], criterion.config['output_rgb'] * parts['output_rgb']
+                               + criterion.config['output_gate'] * parts['output_gate'], places=6)
         weighted = sum(value for key, value in parts.items() if key.startswith('weighted_'))
         self.assertAlmostEqual(loss.item(), weighted, places=5)
         loss.backward()
@@ -309,8 +340,8 @@ class TrainingTests(unittest.TestCase):
         self.assertGreater(sr.grad.abs().sum().item(), 0)
 
     def test_narrow_student_projects_features_to_teacher_widths(self):
-        source = dict(e1=2, e2=3, e3=4, vit=4)
-        target = dict(e1=4, e2=5, e3=6, vit=4)
+        source = dict(E2=2, D1=3, D3=4, VIT=4)
+        target = dict(E2=4, D1=5, D3=6, VIT=4)
         config = dict(self.criterion().config)
         criterion = DistillationLoss(config, channels=target, student_channels=source)
         for name in source:
@@ -319,11 +350,11 @@ class TrainingTests(unittest.TestCase):
         features = {name: torch.randn(1, source[name], 4, 4, requires_grad=True) for name in source}
         teacher = {name: torch.randn(1, target[name], max(1, 32 // stride), max(1, 32 // stride),
                                     requires_grad=True)
-                   for name, stride in {'e1': 4, 'e2': 8, 'e3': 16, 'vit': 64}.items()}
+                   for name, stride in {'E2': 8, 'VIT': 64, 'D1': 32, 'D3': 8}.items()}
         head = torch.rand(1, 32, 32, 4, requires_grad=True)
         rgb = torch.rand(1, 3, 32, 32, requires_grad=True)
         loss, _ = criterion(head, torch.rand_like(head), features, teacher, rgb, torch.rand_like(rgb),
-                            image_hw=(32, 32), network_hw=(32, 32))
+                            image_hw=(32, 32), network_hw=(32, 32), clean_source=rgb.detach().clone())
         loss.backward()
         self.assertTrue(all(p.grad is not None and torch.isfinite(p.grad).all() for p in criterion.parameters()))
         self.assertTrue(all(v.grad is not None and torch.isfinite(v.grad).all() for v in features.values()))
@@ -333,7 +364,7 @@ class TrainingTests(unittest.TestCase):
 
     def test_current_student_merge_widths_and_feature_projections(self):
         student = EchoRenderStudent(self.config['model']['student_config'])
-        source = {name: student.channels[index] for name, index in student.FEATURE_LAYERS.items()}
+        source = {name: student.channels[index] for name, index in student.feature_layers.items()}
         criterion = DistillationLoss(self.config['loss'], student_channels=source)
         for name, width in source.items():
             self.assertEqual(criterion.projections[name].in_channels, width)
@@ -344,10 +375,10 @@ class TrainingTests(unittest.TestCase):
     def test_ms_ssim_identical_and_small_image_error(self):
         c = DistillationLoss(self.config['loss'])
         rgb = torch.rand(1, 3, 192, 192)
-        terms = c.image_terms(rgb, rgb)
+        terms = c.image_terms(rgb, rgb, rgb)
         self.assertTrue(all(abs(value.item()) < 1e-6 for value in terms.values()))
         with self.assertRaisesRegex(ValueError, 'MS-SSIM'):
-            c.image_terms(rgb[..., :64, :64], rgb[..., :64, :64])
+            c.image_terms(rgb[..., :64, :64], rgb[..., :64, :64], rgb[..., :64, :64])
 
     def test_gpu_uuid_mapping_and_poll_interval(self):
         import pynvml
@@ -370,7 +401,8 @@ class TrainingTests(unittest.TestCase):
         nn.Module.__init__(backend)
         backend.topology = HT
         backend._captures = None
-        backend._window_names = {8: 'e1', 14: 'e2', 22: 'e3'}
+        backend.stages = ('E1', 'E2', 'E3', 'VIT', 'D1', 'D2', 'D3')
+        backend._window_names = {8: 'E1', 14: 'E2', 22: 'E3', 55: 'D2', 61: 'D3'}
         def weight(name):
             if 'input_adapter_weight' in name:
                 return torch.zeros(16, 32)
@@ -391,12 +423,13 @@ class TrainingTests(unittest.TestCase):
         backend.weight = weight
         with patch('mlxdlss.model.NeuralRenderingModel._window', lambda self, value, index, **kw: value), \
              patch('mlxdlss.model.NeuralRenderingModel._global', lambda self, value, index: value), \
-             patch.object(backend, '_split_window', side_effect=lambda value, index: value):
+             patch('mlxdlss.model.NeuralRenderingModel._split_window', lambda self, value, index: value):
             head, captures = backend.forward_with_features(torch.zeros(1, 320, 320, 16))
         self.assertEqual(head.shape, (1, 320, 320, 4))
         self.assertEqual({k: tuple(v.shape) for k, v in captures.items()},
-                         {'e1': (1, 64, 80, 80), 'e2': (1, 128, 40, 40),
-                          'e3': (1, 256, 20, 20), 'vit': (1, 1024, 8, 8)})
+                         {'E1': (1, 64, 80, 80), 'E2': (1, 128, 40, 40),
+                          'E3': (1, 256, 20, 20), 'VIT': (1, 1024, 8, 8),
+                          'D1': (1, 512, 12, 12), 'D2': (1, 256, 20, 20), 'D3': (1, 128, 40, 40)})
 
     def test_teacher_capture_selection_and_cleanup(self):
         # Test the actual subclass interception against the pinned base methods.
@@ -405,23 +438,26 @@ class TrainingTests(unittest.TestCase):
         nn.Module.__init__(backend)
         backend.topology = HT
         backend._captures = None
-        backend._window_names = {8: 'e1', 14: 'e2', 22: 'e3'}
+        backend.stages = ('E1', 'E2', 'E3', 'VIT', 'D1', 'D2', 'D3')
+        backend._window_names = {8: 'E1', 14: 'E2', 22: 'E3', 55: 'D2', 61: 'D3'}
         def base_window(model, value, index, **kwargs):
             return value + index
         def base_global(model, value, index):
             return value + index
         def forward(model, x):
-            for index in (8, 14, 22):
+            for index in (8, 14, 22, 55, 61):
                 model._window(x, index, head_count=1, publish=False)
+            model._split_window(x, 47)
             model._global(x, 38)
             return x
         with patch('mlxdlss.model.NeuralRenderingModel._window', base_window), \
              patch('mlxdlss.model.NeuralRenderingModel._global', base_global), \
+             patch('mlxdlss.model.NeuralRenderingModel._split_window', lambda self, x, index: x), \
              patch('mlxdlss.model.NeuralRenderingModel.forward', forward):
             x = torch.zeros(1, 2, 3, 4, requires_grad=True)
             head, features = backend.forward_with_features(x)
-            self.assertEqual(set(features), {'e1', 'e2', 'e3', 'vit'})
-            self.assertEqual(features['e1'].shape, (1, 4, 2, 3))
+            self.assertEqual(set(features), {'E1', 'E2', 'E3', 'VIT', 'D1', 'D2', 'D3'})
+            self.assertEqual(features['E1'].shape, (1, 4, 2, 3))
             self.assertTrue(all(not value.requires_grad for value in features.values()))
             self.assertIsNone(backend._captures)
         with patch('mlxdlss.model.NeuralRenderingModel.forward', side_effect=RuntimeError('fixture failure')):

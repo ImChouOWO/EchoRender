@@ -37,32 +37,12 @@ def augment_image(rgb, mode, fraction, config, *, seed, sample_id):
     return image, parameters
 
 
-def resize_rgb(rgb, inference_size):
-    if type(inference_size) is not int or inference_size < 0:
-        raise ValueError('inference_size must be a nonnegative integer')
-    h, w = rgb.shape[:2]
-    scale = min(1.0, inference_size / max(h, w)) if inference_size else 1.0
-    scaled_hw = (max(1, round(h * scale)), max(1, round(w * scale)))
-    if scaled_hw == (h, w):
-        return rgb
-    tensor = torch.from_numpy(rgb.copy()).permute(2, 0, 1).unsqueeze(0)
-    return F.interpolate(tensor, size=scaled_hw, mode='bilinear', align_corners=False,
-        antialias=True)[0].clamp(0, 1).permute(1, 2, 0).contiguous().numpy()
-
-
-def prepare_variant(rgb, mode, fraction, config, *, seed, sample_id, inference_size):
-    """Apply corruption after resizing, then map the same input change to display size."""
-    resized = resize_rgb(rgb, inference_size)
-    network_rgb, parameters = augment_image(resized, mode, fraction, config, seed=seed, sample_id=sample_id)
-    delta = network_rgb - resized
+def prepare_variant(rgb, mode, fraction, config, *, seed, sample_id):
+    image, parameters = augment_image(rgb, mode, fraction, config, seed=seed, sample_id=sample_id)
+    delta = image - rgb
     parameters.update(inference_delta_mae=float(np.abs(delta).mean()),
                       inference_delta_std=float(delta.std()))
-    display_rgb = network_rgb
-    if resized.shape != rgb.shape:
-        mapped = F.interpolate(torch.from_numpy(delta).permute(2, 0, 1).unsqueeze(0),
-            size=rgb.shape[:2], mode='bilinear', align_corners=False)
-        display_rgb = np.clip(rgb + mapped[0].permute(1, 2, 0).numpy(), 0, 1)
-    return VariantInput(display_rgb, network_rgb, parameters)
+    return VariantInput(image, image, parameters)
 
 
 def bold_font(size):
@@ -162,20 +142,20 @@ def sample_modes(loader, maximum, seed):
 
 @torch.inference_mode()
 def predict_clip(model, sample, mode, fraction, profile, config, device, blend_scale, is_teacher):
-    from .temporal import (crop_rgb, prepare_frame, prepare_student_frame, student_inputs, compose_tensor, teacher_target,
+    from .temporal import (image_rgb, prepare_frame, prepare_student_frame, student_inputs, compose_tensor, teacher_target,
                            frame_guides, reset_history, resample, student_previous)
     history = previous = previous_student = None
     total = 0.
     last_prediction = last_variant = None
     geometry = {}
     for position, image in enumerate(sample['images']):
-        rgb = crop_rgb(image, config['reporting']['crop_size'])
+        rgb = image_rgb(image)
         variant = prepare_variant(rgb, mode, fraction, config['augmentation'], seed=config['loader']['seed'],
-            sample_id=sample['sample_ids'][position], inference_size=config['reporting']['inference_size'])
+            sample_id=sample['sample_ids'][position])
         if reset_history(previous, variant.network_rgb, config):
             history = previous_student = None
         if is_teacher:
-            motion, confidence = frame_guides(sample, position, config['reporting']['crop_size'])
+            motion, confidence = frame_guides(sample, position)
             if motion is not None:
                 h, w = variant.network_rgb.shape[:2]
                 motion, confidence = resample(motion, w, h), resample(confidence, w, h)
@@ -212,7 +192,7 @@ def predict_clip(model, sample, mode, fraction, profile, config, device, blend_s
             'inference_input_sha256': hashlib.sha256(variant.network_rgb.tobytes()).hexdigest(),
             'input_sha256': hashlib.sha256(variant.display_rgb.tobytes()).hexdigest(),
             'prediction_sha256': hashlib.sha256(last_prediction.tobytes()).hexdigest(),
-            'network_hw': list(frame.inputs.shape[1:3]), 'parameters': variant.parameters,
+            'network_hw': [frame.geometry.network_height, frame.geometry.network_width], 'parameters': variant.parameters,
             'motion_source': 'sintel' if is_teacher and sample['sample_ids'][0].startswith('training/') else
                              'raw' if is_teacher else model.motion_mode}
         history = next_history if config['rendering']['temporal'] else None
@@ -231,7 +211,9 @@ def export_predictions(checkpoint, teacher_factory, loaders, config, directory, 
     payload = torch.load(checkpoint, map_location='cpu', weights_only=True)
     if payload.get('format') != FORMAT:
         raise ValueError(f'Expected a {FORMAT} checkpoint; retraining is required')
-    config = dict(config, rendering=payload['train_config']['rendering'])
+    config = dict(config, rendering=payload['train_config']['rendering'],
+                  training={**config['training'], **{k: payload['train_config']['training'][k]
+                            for k in ('adapter_size', 'distillation_layers')}})
     blend_scale = payload['teacher_blend_scale']
     manifest = {'status': 'running', 'checkpoint': str(checkpoint), 'checkpoint_epoch': payload['epoch'],
         'rendering': config['rendering'], 'missing_splits': missing_splits or {},
