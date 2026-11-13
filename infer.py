@@ -1,78 +1,82 @@
-"""Run the recovered Teacher on one image, without a DataLoader or training loop."""
+"""RGB-only single-image or ordered-frame SR inference."""
+
 import argparse
-import json
 from pathlib import Path
-from time import perf_counter
-
-import numpy as np
 import torch
+from PIL import Image
+from train import resolve_device
+from model.student import EchoRenderSR
+from tool.resume import read_checkpoint
+from tool.training_config import project_path, reserve_output_dir, PROJECT_ROOT
+from tool.dataloader import read_rgb
+from tool.temporal import tiled_forward, autocast
+from tool.prediction_report import image_array
 
-from model.teacher import EchoRenderTeacher
-from tool.teacher_pipeline import TeacherPipeline, load_rgb, save_rgb
+
+@torch.inference_mode()
+def run_inference(
+    weights, input_image, *, device="cuda:1", project="sr_inference", max_frames=10
+):
+    if not 1 <= max_frames <= 10:
+        raise ValueError("max_frames must be between 1 and 10")
+    if Path(project).name != project or project in (".", ".."):
+        raise ValueError("Invalid project name")
+    payload = read_checkpoint(project_path(weights))
+    config = payload["train_config"]
+    device = resolve_device(device)
+    model = EchoRenderSR(payload["model_config"]).to(device).eval()
+    model.load_state_dict(payload["model"])
+    source = project_path(input_image)
+    paths = (
+        [source]
+        if source.is_file()
+        else sorted(
+            p
+            for p in source.iterdir()
+            if p.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")
+        )[:max_frames]
+    )
+    if not paths:
+        raise ValueError("No input images found")
+    output = reserve_output_dir(PROJECT_ROOT / "output/infer" / project)
+    previous = None
+    for path in paths:
+        rgb = read_rgb(path)[None].to(device)
+        if previous is not None and previous.shape != rgb.shape:
+            previous = None
+        with autocast(model, config["training"]["precision"]):
+            predictions = tiled_forward(
+                model,
+                rgb,
+                previous,
+                tile_size=config["validation"]["tile_size"],
+                overlap=config["validation"]["tile_overlap"],
+            )
+        Image.fromarray(image_array(predictions["output"])).save(
+            output / f"{path.stem}.png"
+        )
+        previous = rgb
+    return output
 
 
-def main(argv=None):
+def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", type=Path, required=True, help="Input image")
-    parser.add_argument("--weights", type=Path, required=True, help="Decoded logical safetensors")
-    parser.add_argument("--output", type=Path, required=True, help="Output RGB PNG")
-    parser.add_argument("--device", default="auto", help="auto, cpu, or cuda[:index]")
-    parser.add_argument("--noise-index", type=int, default=0, help="Deterministic noise index; no history is retained")
-    parser.add_argument("--intensity", type=float, default=1.0, help="Effect blend, within [0,1]")
-    parser.add_argument("--cpu-threads", type=int, default=4)
-    parser.add_argument("--report", type=Path, help="Optional JSON timings and image statistics")
-    parser.add_argument("--overwrite", action="store_true", help="Allow replacing existing outputs")
-    args = parser.parse_args(argv)
-    try:
-        if args.cpu_threads < 1:
-            raise ValueError("cpu-threads must be positive")
-        if args.noise_index < 0 or not np.isfinite(args.intensity) or not 0 <= args.intensity <= 1:
-            raise ValueError("noise-index must be nonnegative and intensity must be within [0,1]")
-        if args.output.suffix.lower() != ".png":
-            raise ValueError("output must use .png")
-        outputs = [args.output] + ([args.report] if args.report else [])
-        protected = {args.input.resolve(), args.weights.resolve()}
-        if any(path.resolve() in protected for path in outputs):
-            raise ValueError("Output/report paths must differ from the input image and weights")
-        if len({path.resolve() for path in outputs}) != len(outputs):
-            raise ValueError("Output image and report must use different paths")
-        for path in outputs:
-            if path.exists() and not args.overwrite:
-                raise FileExistsError(f"Output already exists: {path}; choose a new path or use --overwrite")
-        torch.set_num_threads(args.cpu_threads)
-        image = load_rgb(args.input)
-        started = perf_counter()
-        print("Loading decoded Teacher weights...", flush=True)
-        teacher = EchoRenderTeacher(args.weights, device=args.device)
-        load_seconds = perf_counter() - started
-        print(f"Running Teacher on {teacher.device}: {image.shape[1]}x{image.shape[0]}...", flush=True)
-        result = TeacherPipeline(teacher).enhance(image, noise_index=args.noise_index, intensity=args.intensity)
-        save_rgb(result.image, args.output)
-        difference = np.abs(result.image - image)
-        report = {
-            "backend": "MLX-DLSS PyTorch recovered reference",
-            "backend_revision": "7870371e8bf6c03967213f1a5d40db6c5a3bee38",
-            "weights_format": teacher.metadata.get("format"),
-            "weight_tensors": teacher.tensor_count,
-            "device": str(teacher.device), "torch": torch.__version__,
-            "input": str(args.input), "output": str(args.output),
-            "image_size": [image.shape[1], image.shape[0]],
-            "network_extent_hw": list(result.network_extent),
-            "noise_index": args.noise_index, "intensity": args.intensity,
-            "finite": bool(np.isfinite(result.image).all()),
-            "output_min": float(result.image.min()), "output_max": float(result.image.max()),
-            "mean_absolute_change": float(difference.mean()),
-            "max_absolute_change": float(difference.max()),
-            "seconds": {"load_weights": load_seconds, **result.timings},
-        }
-        if args.report:
-            args.report.parent.mkdir(parents=True, exist_ok=True)
-            args.report.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-        print(json.dumps(report, indent=2), flush=True)
-    except (OSError, ValueError, RuntimeError, ImportError) as exc:
-        parser.exit(2, f"Teacher inference failed: {exc}\n")
-    return 0
+    parser.add_argument("--weights", required=True)
+    parser.add_argument("--input", required=True)
+    parser.add_argument("--device", default="cuda:1")
+    parser.add_argument("--project", default="sr_inference")
+    parser.add_argument("--max-frames", type=int, default=10)
+    args = parser.parse_args()
+    print(
+        run_inference(
+            args.weights,
+            args.input,
+            device=args.device,
+            project=args.project,
+            max_frames=args.max_frames,
+        )
+    )
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

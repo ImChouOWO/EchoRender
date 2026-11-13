@@ -1,344 +1,357 @@
-"""Epoch loop, checkpoints and metric persistence for train.py."""
-import json
-import gc
+"""SR training with clip microbatches, exact per-update cosine and resume."""
+
+import math
 from pathlib import Path
-from time import perf_counter
-from collections import defaultdict
-
+import time
 import torch
-from tqdm.auto import tqdm
-from model.card.mamba import MambaStage
-
-from .distillation import train_batch, evaluate, module_digest, StudentAugmentation
-from .training_config import TrainingSchedule, PROJECT_ROOT
-from .teacher_features import TeacherFeatureCache
-from .temporal import FORMAT
-from .progress import progress_bar, progress_row, network_size, profile_row, highlight_best
-from .reporting import (validation_values, is_better, best_message, metric_statistics,
-                        print_statistics, write_training_report, EarlyStopping)
-
-FEATURE_CACHE_DIR = PROJECT_ROOT / "output/feats"
+from .temporal import FORMAT, augmentation_ratio, synthesize, autocast, tiled_forward
 from .monitoring import GPUMonitor
-from .resume import (capture_rng, restore_rng, restore_progress, validate_resume, training_lock, checkpoint_values)
+from .progress import progress_bar, progress_row, highlight_best
+from .reporting import DIRECTIONS, is_better, write_training_report, atomic_json
+from .resume import capture_rng, restore_rng, save_checkpoint, training_lock
 
 
-def feature_cache_dir(config):
-    return FEATURE_CACHE_DIR.with_name(FEATURE_CACHE_DIR.name + '_reds') if config['dataset'].get('type') == 'reds' else FEATURE_CACHE_DIR
+def learning_rate(step, total, initial, minimum):
+    if total == 1:
+        return initial
+    return (
+        minimum + (initial - minimum) * (1 + math.cos(math.pi * step / (total - 1))) / 2
+    )
 
 
-def json_safe(value):
-    """Represent infinite perfect-match PSNR as a JSON string, not invalid JSON."""
-    import math
-    if isinstance(value, float) and not math.isfinite(value):
-        return 'Infinity' if value > 0 else '-Infinity' if value < 0 else None
-    if isinstance(value, dict):
-        return {k: json_safe(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [json_safe(v) for v in value]
-    return value
-
-
-def load_student_state(student, path):
-    payload = torch.load(path, map_location='cpu', weights_only=True)
-    if not isinstance(payload, dict) or payload.get('format') != FORMAT:
-        raise ValueError(f'Expected a {FORMAT} checkpoint; retraining is required')
-    if payload['student_config']['input_channels'] != 16:
-        raise ValueError('Student checkpoint requires the prepared 16-channel layout')
-    student.load_state_dict(payload['student'], strict=True)
-
-
-def save_checkpoint(path, student, criterion, optimizer, *, epoch, step, config, controls, blend_scale, resume_state=None):
-    from copy import deepcopy
-    checkpoint_config = deepcopy(config)
-    checkpoint_config['rendering']['profiles'] = {name: config['rendering']['profiles'][name]
-        for name in config['training']['profiles']}
-    payload = {
-        'format': FORMAT, 'student': student.state_dict(),
-        'distillation': criterion.state_dict(), 'optimizer': optimizer.state_dict(),
-        'student_config': student.config, 'train_config': checkpoint_config,
-        'epoch': epoch, 'global_step': step, 'schedule_controls': controls,
-        'teacher_blend_scale': blend_scale, 'resume_state': checkpoint_values(resume_state),
+@torch.inference_mode()
+def evaluate(model, loader, criterion, metrics, config, device, epoch=0):
+    model.eval()
+    totals = {}
+    count = 0
+    monitor = GPUMonitor(device, config["logging"]["gpu_poll_seconds"])
+    available = (
+        sum(len(pairs) for _, pairs in loader.dataset.clips)
+        if hasattr(loader.dataset, "clips")
+        else None
+    )
+    maximum = config["validation"]["max_images"]
+    expected = (
+        min(available, maximum) if available is not None and maximum else available
+    )
+    bar = progress_bar(
+        enabled=config["logging"]["progress"], validation=True, total=expected
+    )
+    started = time.perf_counter()
+    try:
+        for batch in loader:
+            for clip in batch:
+                previous = None
+                for lr, hr in zip(clip["lr"], clip["hr"]):
+                    if (
+                        config["validation"]["max_images"]
+                        and count >= config["validation"]["max_images"]
+                    ):
+                        break
+                    lr, hr = lr[None].to(device), hr[None].to(device)
+                    with autocast(model, config["training"]["precision"]):
+                        prediction = tiled_forward(
+                            model,
+                            lr,
+                            previous,
+                            tile_size=config["validation"]["tile_size"],
+                            overlap=config["validation"]["tile_overlap"],
+                        )
+                    loss, _ = criterion(
+                        prediction, {k: hr for k in ("sr", "deblur", "output")}
+                    )
+                    scores = metrics(prediction["output"], hr)[0]
+                    scores["loss"] = float(loss)
+                    for key, value in scores.items():
+                        totals[key] = totals.get(key, 0) + value
+                    count += 1
+                    previous = lr.detach()
+                    bar.update(1)
+                    avg = {k: v / count for k, v in totals.items()}
+                    bar.set_description_str(
+                        progress_row(
+                            epoch,
+                            config["training"]["epochs"],
+                            device,
+                            monitor,
+                            [
+                                f"{avg['loss']:.5f}",
+                                f"{avg['psnr']:.2f}",
+                                f"{avg['ssim']:.4f}",
+                                f"{avg['lpips']:.4f}",
+                                count,
+                            ],
+                        )
+                    )
+                if (
+                    config["validation"]["max_images"]
+                    and count >= config["validation"]["max_images"]
+                ):
+                    break
+            if (
+                config["validation"]["max_images"]
+                and count >= config["validation"]["max_images"]
+            ):
+                break
+    finally:
+        bar.close()
+        monitor.close()
+    if not count:
+        raise ValueError("Validation produced no images")
+    return {
+        **{k: v / count for k, v in totals.items()},
+        "images": count,
+        "seconds": time.perf_counter() - started,
     }
-    temporary = path.with_suffix('.pt.tmp')
-    try:
-        torch.save(payload, temporary)
-        temporary.replace(path)
-    finally:
-        temporary.unlink(missing_ok=True)
 
 
-def move_student(student, criterion, optimizer, device):
-    optimizer.zero_grad(set_to_none=True)
-    student.to(device)
+def fit(
+    model,
+    train_loader,
+    val_loader,
+    criterion,
+    optimizer,
+    metrics,
+    config,
+    device,
+    generator,
+    resume=None,
+):
+    output = Path(config["runtime"]["output_dir"])
+    model.to(device)
     criterion.to(device)
-    for state in optimizer.state.values():
-        for key, value in state.items():
-            if isinstance(value, torch.Tensor):
-                state[key] = value.to(device)
+    metrics.to(device)
+    epochs = config["training"]["epochs"]
+    initial = config["training"]["optimizer"]["lr"]
+    total = min(epochs * len(train_loader), config["training"]["max_steps"] or math.inf)
+    step = 0
+    history = []
+    best = None
+    best_epoch = None
+    early = {"value": None, "bad_epochs": 0}
+    start = 1
+    if resume:
+        model.load_state_dict(resume["model"])
+        optimizer.load_state_dict(resume["optimizer"])
+        step = resume["step"]
+        history = resume["history"]
+        best = resume["best"]
+        best_epoch = resume["best_epoch"]
+        early = resume["early"]
+        start = resume["epoch"] + 1
+        if total != resume["total_steps"]:
+            raise ValueError("Resume schedule length changed")
+        restore_rng(resume["rng"])
+        generator.set_state(resume["loader_rng"])
+        if not (output / "best.pt").is_file():
+            raise ValueError("Resume requires the original best.pt alongside last.pt")
+    metric = config["reporting"]["best_metric"]
+    early_cfg = config["training"]["early_stopping"]
+    report = output.parent / "val" / output.name
+    writer = None
+    if config["logging"]["tensorboard"]:
+        from torch.utils.tensorboard import SummaryWriter
 
-
-def release_cuda(device):
-    if device.type == 'cuda':
-        with torch.cuda.device(device):
-            torch.cuda.empty_cache()
-
-
-def fit(teacher, student, criterion, train_loader, val_loader, optimizer, metrics, config, *, schedule=None, device=None, cache_cleanup=None, report_dir=None, on_complete=None, resume=None):
-    with training_lock(Path(config['runtime']['output_dir'])):
-        return _fit(teacher, student, criterion, train_loader, val_loader, optimizer, metrics, config,
-                    schedule=schedule, device=device, cache_cleanup=cache_cleanup, report_dir=report_dir,
-                    on_complete=on_complete, resume=resume)
-
-
-def _fit(teacher, student, criterion, train_loader, val_loader, optimizer, metrics, config, *, schedule=None, device=None, cache_cleanup=None, report_dir=None, on_complete=None, resume=None):
-    if resume is not None:
-        validate_resume(resume, config, student)
-        student.load_state_dict(resume['student'], strict=True)
-        criterion.load_state_dict(resume['distillation'], strict=True)
-        optimizer.load_state_dict(resume['optimizer'])
-    for module in student.modules():
-        if isinstance(module, MambaStage):
-            module.gradient_checkpointing = config['training']['gradient_checkpointing']
-    if not isinstance(teacher, torch.nn.Module):
-        teacher = teacher()
-    blend_scale = float(torch.as_tensor(teacher.blend_scale).detach().cpu().item())
-    if any(value.requires_grad for value in list(teacher.parameters()) + list(teacher.buffers())):
-        raise ValueError('Teacher must be frozen')
-    expected = {id(p) for module in (student, criterion) for p in module.parameters() if p.requires_grad}
-    actual = {id(p) for group in optimizer.param_groups for p in group['params']}
-    if expected != actual:
-        raise ValueError('Optimizer must own student AND feature adapter parameters only')
-    if len(train_loader) == 0 or len(val_loader) == 0:
-        raise ValueError('Train and validation loaders must be nonempty')
-    output = Path(config['runtime']['output_dir'])
-    output.mkdir(parents=True, exist_ok=True)
-    for name in (() if resume is not None else ('metrics.jsonl', 'best.pt', 'last.pt', 'summary.json', 'resolved_train.yaml')):
-        if (output / name).exists():
-            raise FileExistsError(f'{output / name} exists; choose a fresh output_dir')
-    import yaml
-    if resume is None:
-        (output / 'resolved_train.yaml').write_text(yaml.safe_dump(config, sort_keys=False), encoding='utf-8')
-    teacher_before = module_digest(teacher)
-    if resume is not None:
-        expected_teacher = resume['resume_state']['teacher_digest']
-        if expected_teacher is not None and teacher_before != expected_teacher:
-            raise ValueError('Teacher weights differ from the resumed checkpoint')
-    student_before = module_digest(student, parameters_only=True)
-    device = torch.device(device) if device is not None else next(student.parameters()).device
-    monitor = GPUMonitor(device, config['logging']['gpu_poll_seconds'])
-    total_steps = len(train_loader) * config['training']['epochs']
-    if config['training']['max_steps'] is not None:
-        total_steps = min(total_steps, config['training']['max_steps'])
-    if resume is not None:
-        total_steps = resume['resume_state']['total_steps']
-    schedule = schedule or TrainingSchedule(config, total_steps=total_steps)
-    augmentation = StudentAugmentation(config)
-    global_step, images_seen, history = 0, 0, []
-    started = perf_counter()
-    previous_seconds = (resume['resume_state']['seconds'] if resume else 0.)
-    completed = False
-    best, best_epoch = None, None
-    best_metric = config['reporting']['best_metric']
-    early = EarlyStopping(best_metric, **config['training']['early_stopping'])
-    first_epoch, previous_rows = 1, []
-    if resume is not None:
-        previous_rows, history, best, best_epoch, images_seen = restore_progress(resume, output, early, best_metric)
-        global_step, first_epoch = resume['global_step'], resume['epoch'] + 1
-    stopped_early = False
-    cache = TeacherFeatureCache(feature_cache_dir(config)) if config['training']['releas'] else None
-    if device.type == 'cuda':
-        torch.cuda.reset_peak_memory_stats(device)
+        writer = SummaryWriter(
+            str(output / "tensorboard"), purge_step=start if resume else None
+        )
+    monitor = GPUMonitor(device, config["logging"]["gpu_poll_seconds"])
     try:
-        if cache is not None:
-            cache.open()
-        else:
-            teacher.to(device)
-            move_student(student, criterion, optimizer, device)
-        if resume is not None:
-            temporary = output / 'metrics.jsonl.tmp'
-            temporary.write_text(''.join(json.dumps(json_safe(row), allow_nan=False) + '\n' for row in previous_rows), encoding='utf-8')
-            temporary.replace(output / 'metrics.jsonl')
-        with (output / 'metrics.jsonl').open('a' if resume is not None else 'x', encoding='utf-8') as stream:
-            def record(row):
-                stream.write(json.dumps(json_safe(row), allow_nan=False) + '\n')
-                stream.flush()
-            if cache is not None:
-                move_student(student, criterion, optimizer, 'cpu')
-                metrics.cpu()
-                release_cuda(device)
-                fingerprint = cache.fingerprint(teacher_before, train_loader, val_loader, config, device)
-                reused = cache.reuse(fingerprint)
-                if reused:
-                    tqdm.write(f'Reusing Teacher feature cache: {cache.directory}')
-                else:
-                    tqdm.write(f'[Cache]: {cache.reason}; resuming extraction.')
-                    cache.prepare(fingerprint, blend_scale)
-                    try:
-                        teacher.to(device)
-                        cache.build(teacher, train_loader, val_loader, config, monitor=monitor)
-                        cache.seal(fingerprint, blend_scale=blend_scale)
-                    finally:
-                        teacher.cpu()
-                        release_cuda(device)
-                if teacher is not None and module_digest(teacher) != teacher_before:
-                    raise RuntimeError('Teacher parameters/buffers changed during cache generation')
-                teacher.cpu()
-                teacher = None
-                gc.collect()
-                release_cuda(device)
-                record({'event': 'teacher_cache', 'reused': reused, 'teacher_device': 'released',
-                        'teacher_blend_scale': blend_scale,
-                        'cache_dir': str(cache.directory),
-                        'gpu_allocated_mib': torch.cuda.memory_allocated(device) / 2**20 if device.type == 'cuda' else None})
-                move_student(student, criterion, optimizer, device)
-            if resume is not None:
-                state = resume['resume_state']
-                restore_rng(state['rng'], augmentation, (train_loader, val_loader), device)
-                augmentation.applied_count = state['augmentation_applied']
-                record({'event': 'resume', 'epoch': resume['epoch'], 'step': global_step, 'rng_restored': True})
-                tqdm.write(f'[Resume]: epoch={first_epoch} | step={global_step} | RNG=restored')
-            for epoch in range(first_epoch, config['training']['epochs'] + 1):
-                epoch_loss, epoch_images, epoch_clips, batches = 0.0, 0, 0, 0
-                epoch_components = defaultdict(float)
-                augmentation_ratio = augmentation.ratio(epoch)
-                gpu_values = []
-                bar = progress_bar(train_loader, enabled=config['logging']['progress'])
-                try:
-                    for batch in bar:
-                        # Apply current LR and reserved future training controls.
-                        controls = schedule.values(epoch=epoch, step=global_step)
-                        for group in optimizer.param_groups:
-                            group['lr'] = controls['lr']
-                        result = train_batch(teacher, student, criterion, batch, optimizer,
-                                             config=config, controls=controls,
-                                             augmentation=augmentation,
-                                             augmentation_ratio=augmentation_ratio, target_cache=cache,
-                                             blend_scale=blend_scale, micro_batch_size=config['training']['micro_batch_size'])
-                        global_step += 1
-                        batches += 1
-                        epoch_clips += result['batch_size']
-                        epoch_images += result['frames']
-                        images_seen += result['frames']
-                        epoch_loss += result['loss'] * result['batch_size']
-                        for name, value in result['components'].items():
-                            epoch_components[name] += value * result['batch_size']
-                        gpu = monitor.sample()
-                        if gpu is not None:
-                            gpu_values.append(gpu)
-                        record({'event': 'train', 'epoch': epoch, 'step': global_step, **result,
-                                'lr': controls['lr'], 'grad_clip': controls['grad_clip'],
-                                'loss_weights': controls['loss_weights'],
-                                'augmentation_ratio': augmentation_ratio,
-                                'gpu_utilization_percent': gpu})
-                        bar.set_description_str(progress_row(epoch, config['training']['epochs'], device, monitor, [
-                            f'{result["loss"]:.5f}', f'{epoch_loss / epoch_clips:.5f}', f'{controls["lr"]:.2e}',
-                            epoch_images, network_size(config['training']['adapter_size'])]), refresh=False)
-                        maximum = config['training']['max_steps']
-                        if maximum is not None and global_step >= maximum:
-                            break
-                finally:
-                    bar.close()
-                optimizer.zero_grad(set_to_none=True)
-                metrics.to(device)
-                validation = evaluate(teacher, student, criterion, val_loader, metrics, monitor,
-                                      config=config, epoch=epoch, controls=controls, target_cache=cache,
-                                      blend_scale=blend_scale)
-                metrics.cpu()
-                if teacher is not None and module_digest(teacher) != teacher_before:
-                    raise RuntimeError('Teacher parameters/buffers changed')
-                row = {'event': 'epoch', 'epoch': epoch, 'step': global_step,
-                       'train_loss': epoch_loss / epoch_clips, 'train_images': epoch_images, 'train_clips': epoch_clips,
-                       'train_components': {name: value / epoch_clips for name, value in epoch_components.items()},
-                       'train_partial': batches < len(train_loader), 'validation': validation,
-                       'gpu_utilization_percent': sum(gpu_values) / len(gpu_values) if gpu_values else None}
+        with training_lock(output):
+            for epoch in range(start, epochs + 1):
+                if step >= total:
+                    break
+                train_loader.dataset.epoch = epoch
+                model.train()
+                sums = {}
+                clips = 0
+                started = time.perf_counter()
+                ratio = augmentation_ratio(epoch, epochs, config["augmentation"])
+                bar = progress_bar(
+                    enabled=config["logging"]["progress"],
+                    total=min(len(train_loader), total - step),
+                )
+                for batch in train_loader:
+                    if step >= total:
+                        break
+                    lr = learning_rate(
+                        step, total, initial, config["schedule"]["eta_min"]
+                    )
+                    for group in optimizer.param_groups:
+                        group["lr"] = lr
+                    optimizer.zero_grad(set_to_none=True)
+                    # Select at most floor(batch * ratio); never augment an entire small batch.
+                    selected = set(
+                        torch.randperm(len(batch))[: int(len(batch) * ratio)].tolist()
+                    )
+                    micro = config["training"]["micro_batch_size"]
+                    batch_values = {}
+                    for offset in range(0, len(batch), micro):
+                        subset = batch[offset : offset + micro]
+                        prepared = []
+                        for j, clip in enumerate(subset):
+                            inputs, targets = synthesize(
+                                clip["lr"].to(device),
+                                clip["hr"].to(device),
+                                ratio if offset + j in selected else 0.0,
+                                config["augmentation"],
+                            )
+                            prepared.append((inputs, targets))
+                        for t in range(max(len(item[0]) for item in prepared)):
+                            valid = [
+                                i for i, item in enumerate(prepared) if t < len(item[0])
+                            ]
+                            rgb = torch.stack([prepared[i][0][t] for i in valid])
+                            previous = (
+                                None
+                                if t == 0
+                                else torch.stack(
+                                    [prepared[i][0][t - 1] for i in valid]
+                                ).detach()
+                            )
+                            with autocast(model, config["training"]["precision"]):
+                                predictions = model(rgb, previous)
+                            # Each clip contributes equally, irrespective of its sampled frame count.
+                            frame_loss = rgb.new_zeros(())
+                            for k, i in enumerate(valid):
+                                targets = {
+                                    name: value[t : t + 1]
+                                    for name, value in prepared[i][1].items()
+                                }
+                                loss, parts = criterion(
+                                    {
+                                        name: value[k : k + 1]
+                                        for name, value in predictions.items()
+                                    },
+                                    targets,
+                                )
+                                factor = 1 / (len(batch) * len(prepared[i][0]))
+                                frame_loss = frame_loss + loss * factor
+                                for name, value in {"loss": loss, **parts}.items():
+                                    batch_values[name] = (
+                                        batch_values.get(name, 0)
+                                        + float(value.detach()) * factor
+                                    )
+                            frame_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), config["training"]["grad_clip"]
+                    ) if config["training"]["grad_clip"] else None
+                    optimizer.step()
+                    step += 1
+                    clips += len(batch)
+                    bar.update(1)
+                    for name, value in batch_values.items():
+                        sums[name] = sums.get(name, 0) + value * len(batch)
+                    bar.set_description_str(
+                        progress_row(
+                            epoch,
+                            epochs,
+                            device,
+                            monitor,
+                            [
+                                f"{batch_values['sr']:.4f}",
+                                f"{batch_values['deblur']:.4f}",
+                                f"{batch_values['denoise']:.4f}",
+                                f"{lr:.2e}",
+                                clips,
+                            ],
+                        )
+                    )
+                    if step >= total:
+                        break
+                bar.close()
+                train_values = {k: v / clips for k, v in sums.items()}
+                validation = evaluate(
+                    model, val_loader, criterion, metrics, config, device, epoch
+                )
+                row = {
+                    "format": FORMAT,
+                    "epoch": epoch,
+                    "step": step,
+                    "train": train_values,
+                    "validation": validation,
+                    "lr": lr,
+                    "augmentation_ratio": ratio,
+                    "seconds": time.perf_counter() - started,
+                }
                 history.append(row)
-                record(row)
-                from .temporal import write_stage_report
-                write_stage_report(validation, report_dir or output, prefix='temporal_latest')
-                for profile, scores in validation['profiles'].items():
-                    tqdm.write(profile_row(profile, scores))
-                quality = validation['image_mean']
-                tqdm.write(f'Epoch {epoch}: loss={row["train_loss"]:.6f}, '
-                           f'PSNR={quality["psnr"]:.3f}, SSIM={quality["ssim"]:.4f}, LPIPS={quality["lpips"]:.4f}')
-                if validation['benchmark']:
-                    timing = validation['benchmark']
-                    tqdm.write(f'Forward latency: Teacher={timing["teacher_latency_ms"]:.2f} ms/image, '
-                               f'Student={timing["student_latency_ms"]:.2f} ms/image')
-                current = validation_values(validation)
-                improved = is_better(current, best, best_metric)
+                improved = is_better(validation, best, metric)
                 if improved:
-                    message = best_message(epoch, current, best)
-                    best, best_epoch = dict(current), epoch
-                stopped_early = early.update(current[best_metric], epoch)
-                resume_state = {'rng': capture_rng(augmentation, (train_loader, val_loader), device),
-                    'augmentation_applied': augmentation.applied_count, 'history': history,
-                    'early': {key: getattr(early, key) for key in ('best', 'best_epoch', 'bad_epochs')},
-                    'total_steps': schedule.total_steps, 'teacher_digest': teacher_before,
-                    'seconds': previous_seconds + perf_counter() - started, 'report_dir': str(report_dir) if report_dir else None}
-                for name in (('best.pt', 'last.pt') if improved else ('last.pt',)):
-                    save_checkpoint(output / name, student, criterion, optimizer, epoch=epoch,
-                        step=global_step, config=config, controls=controls, blend_scale=blend_scale,
-                        resume_state=resume_state)
-                    if name == 'best.pt':
-                        record({'event': 'best', 'epoch': epoch, 'metric': best_metric, 'values': best})
-                        tqdm.write(highlight_best(message))
-                if stopped_early:
-                    record({'event': 'early_stop', 'epoch': epoch, 'metric': best_metric,
-                            'patience': early.patience, 'min_delta': early.min_delta})
-                    tqdm.write(f'[Early stop]: {best_metric.upper()} | no sufficient improvement for '
-                               f'{early.patience} epochs | best checkpoint epoch={best_epoch}')
+                    changes = (
+                        "initial checkpoint"
+                        if best is None
+                        else " | ".join(
+                            f"{k.upper()} {DIRECTIONS[k] * (validation[k] - best[k]) / max(abs(best[k]), 1e-12) * 100:+.2f}%"
+                            for k in DIRECTIONS
+                        )
+                    )
+                    print(
+                        highlight_best(f"[Best]: save best weight | {changes}"),
+                        flush=True,
+                    )
+                    best = {k: validation[k] for k in DIRECTIONS}
+                    best_epoch = epoch
+                score = DIRECTIONS[metric] * validation[metric]
+                if (
+                    early["value"] is None
+                    or score > early["value"] + early_cfg["min_delta"]
+                ):
+                    early = {"value": score, "bad_epochs": 0}
+                else:
+                    early["bad_epochs"] += 1
+                payload = {
+                    "format": FORMAT,
+                    "model": model.state_dict(),
+                    "model_config": model.config,
+                    "train_config": config,
+                    "optimizer": optimizer.state_dict(),
+                    "epoch": epoch,
+                    "step": step,
+                    "history": history,
+                    "best": best,
+                    "best_epoch": best_epoch,
+                    "early": early,
+                    "total_steps": total,
+                    "rng": capture_rng(),
+                    "loader_rng": generator.get_state(),
+                }
+                save_checkpoint(output / "last.pt", payload)
+                if improved:
+                    save_checkpoint(output / "best.pt", payload)
+                atomic_json(output / "history.json", history)
+                if config["reporting"]["enabled"]:
+                    write_training_report(history, report, best_epoch)
+                if writer:
+                    for group, values in [
+                        ("train", train_values),
+                        ("validation", validation),
+                    ]:
+                        for key, value in values.items():
+                            writer.add_scalar(f"{group}/{key}", value, epoch)
+                    writer.add_scalar("schedule/lr", lr, epoch)
+                    writer.add_scalar("schedule/augmentation", ratio, epoch)
+                    writer.flush()
+                print(
+                    f"Epoch {epoch}: loss={validation['loss']:.5f}, PSNR={validation['psnr']:.3f}, SSIM={validation['ssim']:.4f}, LPIPS={validation['lpips']:.4f}",
+                    flush=True,
+                )
+                if (
+                    early_cfg["patience"]
+                    and early["bad_epochs"] >= early_cfg["patience"]
+                ):
+                    print(
+                        f"[Early stop]: no sufficient {metric.upper()} improvement for {early['bad_epochs']} epochs",
+                        flush=True,
+                    )
                     break
-                maximum = config['training']['max_steps']
-                if maximum is not None and global_step >= maximum:
-                    break
-            summary = {
-                'status': 'early_stopped' if stopped_early else 'completed',
-                'early_stopping': {**config['training']['early_stopping'], 'metric': best_metric,
-                                   'triggered': stopped_early, 'bad_epochs': early.bad_epochs},
-                'profiles': config['training']['profiles'], 'reference': 'matching_profile_temporal_teacher_rgb', 'global_step': global_step,
-                'epochs_run': len(history), 'train_images_seen': images_seen,
-                'student_parameters_updated': module_digest(student, parameters_only=True) != student_before,
-                'teacher_unchanged': True, 'teacher_released': cache is not None,
-                'teacher_blend_scale': blend_scale, 'student_parameter_count': sum(p.numel() for p in student.parameters()),
-                'adapter_parameter_count': sum(p.numel() for p in criterion.parameters()),
-                'seconds': previous_seconds + perf_counter() - started, 'history': history,
-                'best_epoch': best_epoch, 'best_metric': best_metric, 'best_values': best,
-                'best_checkpoint': str(output / 'best.pt'), 'last_checkpoint': str(output / 'last.pt'),
-                'statistics': metric_statistics(history, best_epoch),
-                'report_dir': str(report_dir) if report_dir is not None else None,
-                'peak_cuda_allocated_mib': (torch.cuda.max_memory_allocated(device) / 2**20
-                                            if device.type == 'cuda' else None),
-            }
-            # The validation metric can be infinite only for identical RGB pairs.
-            (output / 'summary.json').write_text(json.dumps(json_safe(summary), indent=2, allow_nan=False) + '\n', encoding='utf-8')
-            print_statistics(summary['statistics'])
-            if report_dir is not None:
-                write_training_report(summary, report_dir)
-            if on_complete is not None:
-                # Export models sequentially after all training CUDA resources are released.
-                if teacher is not None:
-                    teacher.cpu()
-                    teacher = None
-                metrics.cpu()
-                move_student(student, criterion, optimizer, 'cpu')
-                gc.collect()
-                release_cuda(device)
-                on_complete(summary)
-            completed = True
-            return summary
     finally:
-        try:
-            if teacher is not None:
-                teacher.cpu()
-            metrics.cpu()
-            move_student(student, criterion, optimizer, 'cpu')
-            release_cuda(device)
-            monitor.close()
-        finally:
-            if cache is not None and cache.lock is not None:
-                delete = cache_cleanup is None
-                try:
-                    if completed and cache_cleanup is not None:
-                        delete = cache_cleanup(cache.directory)
-                finally:
-                    cache.close(delete=delete)
+        monitor.close()
+        if writer:
+            writer.close()
+    if history:
+        write_training_report(history, report, best_epoch, print_table=True)
+    return {
+        "best_checkpoint": str(output / "best.pt"),
+        "report_dir": str(report),
+        "history": history,
+    }

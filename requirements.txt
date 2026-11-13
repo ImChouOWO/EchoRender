@@ -1,13 +1,15 @@
-# Prefer `uv sync --locked` for the reproducible CUDA environment.
-mlxdlss @ git+https://github.com/iamwavecut/MLX-DLSS.git@7870371e8bf6c03967213f1a5d40db6c5a3bee38#subdirectory=python
+# Prefer uv sync --locked on the CUDA server.
 torch>=2.7
+torchvision>=0.22
+mamba-ssm==2.2.6.post3; sys_platform == 'linux'
+einops>=0.8
 PyYAML>=6.0
-safetensors>=0.4
 numpy>=1.26
 Pillow>=10.0
-torchvision>=0.22
+opencv-python-headless>=4.10,<4.12
 pytorch-msssim>=1.0
 lpips>=0.1.4
 tqdm>=4.67
 nvidia-ml-py>=12
 matplotlib>=3.10
+tensorboard>=2.20

@@ -1,47 +1,53 @@
-# RGB sequence distillation Student; not numerically equivalent to the NVIDIA Teacher.
-# Each row: [from, repeats, module, args]. -1 means the previous layer.
-# Comment indices identify DAG layers, not individual blocks.
-# Swin: [channels, depth, heads, window, ffn_ratio].
-# VIT: [channels, depth, heads, ffn_ratio].
-# SSM: [channels, depth, state_dim, d_conv, expand].
-# Upsample output channels must match the skip connection used by Add.
-# Named DAG taps; training.distillation_layers selects supervision only.
-stages: {InputAdapter: 0, OutputHead: 28, E0: 1, E1: 3, E2: 5, E3: 7, E4: 9, VIT: 11, D1: 14, D2: 17, D3: 20}
-input_channels: 16  # RGB 0:3, history 3:6, style 6, tone 7, low RGB 8:11, high RGB 11:14, gray XY 14:16
-motion: raft_small  # pretrained RAFT-Small; fine-tuned with Sintel flow and validity
-output_channels: 4
-input_layout: BHWC
+# Internal backbone features: current RGB (3) + aligned historical RGB (3).
+# Public model input/output are RGB. No fixed-size global image resize.
+# DAG rows: [from, repeats, module, args]; -1 means the previous layer.
+# Swin: [channels, depth, heads, window, FFN ratio]; ViT omits window.
+# SSM: [channels, depth, state_dim, expand]. Global skip connections are retained.
+input_channels: 6
+output_channels: 32  # final backbone feature width, before RGB reconstruction
+input_layout: BCHW
+motion: raft_small  # frozen pretrained RGB alignment; raw / feat are optional
+gradient_checkpointing: false
 ssm:
-  rotation: clockwise  # clockwise or counterclockwise
-  directions: 2       # 1-4 directions per block; each stage starts scanning right
+  rotation: clockwise
+  directions: 2
+  window: 8
+  stride: 4
+  tokens: 128
+  prompt_rank: 64
+reconstruction:
+  scale: 4
+  width: 16
+  naf_depths: [1, 2]
+  restormer_depths: [1, 2]
+  middle: 2
 backbone:
-  - [-1, 1, InputAdapter, [32, 1, 16, 4]]  # 0: full-field resize, 16 -> 32, one Swin block (heads=1, window=16, FFN=4)
-  - [-1, 1, SwinStage, [32, 2, 1, 8, 4]]   # 1: E0, 2 blocks, skip -> 25
-  - [-1, 1, Downsample, [32]]               # 2: downsample to E1
-  - [-1, 1, SSMStage, [32, 2, 16, 4, 2]]   # 3: E1, 2 blocks, skip -> 22
-  - [-1, 1, Downsample, [64]]               # 4: downsample to E2
-  - [-1, 1, SSMStage, [64, 4, 16, 4, 2]]   # 5: E2, 4 blocks, distillation features, skip -> 19
-  - [-1, 1, Downsample, [128]]              # 6: downsample to E3
-  - [-1, 1, SSMStage, [128, 6, 16, 4, 2]]  # 7: E3, 6 blocks, skip -> 16
-  - [-1, 1, Downsample, [256]]              # 8: downsample, output 256 channels
-  - [-1, 1, SwinStage, [512, 8, 16, 8, 4]] # 9: E4, projection 256 -> 512, 8 blocks, skip -> 13
-  - [-1, 1, Downsample, [1024]]             # 10: downsample to bottleneck
-  - [-1, 1, ViTStage, [1024, 8, 32, 4]]    # 11: bottleneck, 8 blocks, distillation features
+  - [-1, 1, InputAdapter, [32, 1, 16, 4]]             # 0: RGB/history bottleneck + Swin adapter; full-resolution grid
+  - [-1, 1, SwinStage, [32, 2, 1, 8, 4]]              # 1: E0, skip to 25
+  - [-1, 1, Downsample, [32]]                         # 2: downsample to E1
+  - [-1, 1, SSMStage, [32, 2, 16, 2]]                 # 3: E1, skip to 22
+  - [-1, 1, Downsample, [64]]                         # 4: downsample to E2
+  - [-1, 1, SSMStage, [64, 4, 16, 2]]                 # 5: E2, skip to 19
+  - [-1, 1, Downsample, [128]]                        # 6: downsample to E3
+  - [-1, 1, SSMStage, [128, 6, 16, 2]]                # 7: E3, skip to 16
+  - [-1, 1, Downsample, [256]]                        # 8: downsample to E4
+  - [-1, 1, SwinStage, [512, 8, 16, 8, 4]]            # 9: E4, skip to 13
+  - [-1, 1, Downsample, [1024]]                       # 10: downsample to bottleneck
+  - [-1, 1, ViTStage, [1024, 8, 32, 4]]               # 11: global ViT bottleneck
 head:
-  - [[-1, 9], 1, Upsample, [512]]           # 12: resize to E4, output 512 channels to match skip
-  - [[-1, 9], 1, Add, []]                  # 13: fuse E4, 512 + 512
-  - [-1, 1, SwinStage, [256, 8, 16, 8, 4]] # 14: D1 / decoder E4, projection 512 -> 256, 8 blocks
-  - [[-1, 7], 1, Upsample, [128]]           # 15: resize to E3
-  - [[-1, 7], 1, Add, []]                  # 16: fuse E3, 128 + 128
-  - [-1, 1, SwinStage, [128, 8, 8, 8, 4]]  # 17: D2 / decoder E3, 8 blocks
-  - [[-1, 5], 1, Upsample, [64]]            # 18: resize to E2
-  - [[-1, 5], 1, Add, []]                  # 19: fuse E2, 64 + 64
-  - [-1, 1, SwinStage, [64, 6, 4, 8, 4]]   # 20: D3 / decoder E2, 6 blocks
-  - [[-1, 3], 1, Upsample, [32]]            # 21: resize to E1
-  - [[-1, 3], 1, Add, []]                  # 22: fuse E1, 32 + 32
-  - [-1, 1, SwinStage, [32, 4, 2, 8, 4]]   # 23: decoder E1, 4 blocks
-  - [[-1, 1], 1, Upsample, [32]]            # 24: resize to E0
-  - [[-1, 1], 1, Add, []]                  # 25: fuse E0, 32 + 32
-  - [-1, 1, SwinStage, [32, 5, 1, 8, 4]]   # 26: decoder E0, 5 blocks
-  - [[-1, 0], 1, Add, []]                   # 27: direct InputAdapter residual before the output head
-  - [-1, 1, OutputHead, [4]]                # 28: raw RGB residual (3 channels) + gate logit (1 channel)
+  - [[-1, 9], 1, Upsample, [512]]                     # 12: resize to E4; match 512-channel skip
+  - [[-1, 9], 1, Add, []]                             # 13: E4 residual merge
+  - [-1, 1, SwinStage, [256, 8, 16, 8, 4]]            # 14: decoder E4, 512 -> 256
+  - [[-1, 7], 1, Upsample, [128]]                     # 15: resize to E3
+  - [[-1, 7], 1, Add, []]                             # 16: E3 residual merge
+  - [-1, 1, SwinStage, [128, 8, 8, 8, 4]]             # 17: decoder E3
+  - [[-1, 5], 1, Upsample, [64]]                      # 18: resize to E2
+  - [[-1, 5], 1, Add, []]                             # 19: E2 residual merge
+  - [-1, 1, SwinStage, [64, 6, 4, 8, 4]]              # 20: decoder E2
+  - [[-1, 3], 1, Upsample, [32]]                      # 21: resize to E1
+  - [[-1, 3], 1, Add, []]                             # 22: E1 residual merge
+  - [-1, 1, SwinStage, [32, 4, 2, 8, 4]]              # 23: decoder E1
+  - [[-1, 1], 1, Upsample, [32]]                      # 24: resize to E0
+  - [[-1, 1], 1, Add, []]                             # 25: E0 residual merge
+  - [-1, 1, SwinStage, [32, 5, 1, 8, 4]]              # 26: decoder E0
+  - [[-1, 0], 1, Add, []]                             # 27: preserve direct InputAdapter-to-output feature skip

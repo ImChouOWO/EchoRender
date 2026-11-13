@@ -1,79 +1,117 @@
-"""Independent RGB-pair motion branch; backward flow uses normalized image units."""
+"""RGB-only backward motion and historical RGB alignment; no dataset flow input."""
+
+import cv2
 import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
 
 
-def raw_motion(previous, current):
-    """Estimate current-to-previous flow outside the network, without dataset guides."""
-    import cv2
-    if previous.shape != current.shape or current.ndim != 3 or current.shape[-1] != 3:
-        raise ValueError('Motion requires matching HWC RGB frames')
-    cv2.setNumThreads(1)
-    height, width = current.shape[:2]
-    scale = min(1., 512 / max(height, width))
-    size = max(8, round(width * scale)), max(8, round(height * scale))
-    def gray(rgb):
-        image = np.clip(np.rint(rgb * 255), 0, 255).astype(np.uint8)
-        return cv2.resize(cv2.cvtColor(image, cv2.COLOR_RGB2GRAY), size)
-    before, now = gray(previous), gray(current)
-    def estimate(a, b):
-        return cv2.calcOpticalFlowFarneback(a, b, None, .5, 4, 21, 5, 7, 1.5, 0)
-    backward, forward = estimate(now, before), estimate(before, now)
-    yy, xx = np.indices(now.shape, dtype=np.float32)
-    x, y = xx + backward[..., 0], yy + backward[..., 1]
-    reverse = cv2.remap(forward, x, y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
-    error = np.square(backward + reverse).sum(-1)
-    threshold = .01 * (np.square(backward).sum(-1) + np.square(reverse).sum(-1)) + .5
-    confidence = ((error <= threshold) & (x >= 0) & (x <= size[0] - 1)
-                  & (y >= 0) & (y <= size[1] - 1)).astype(np.float32)
-    backward /= np.array(size, np.float32)
-    motion = cv2.resize(backward, (width, height), interpolation=cv2.INTER_LINEAR)
-    confidence = cv2.resize(confidence, (width, height), interpolation=cv2.INTER_LINEAR)
-    return motion, confidence[..., None]
+def warp(history, flow):
+    b, _, h, w = history.shape
+    yy, xx = torch.meshgrid(
+        torch.arange(h, device=history.device),
+        torch.arange(w, device=history.device),
+        indexing="ij",
+    )
+    grid = torch.stack((xx, yy), 0).to(flow)[None] + flow
+    valid = (
+        (grid[:, 0] >= 0)
+        & (grid[:, 0] <= w - 1)
+        & (grid[:, 1] >= 0)
+        & (grid[:, 1] <= h - 1)
+    )[:, None]
+    grid = torch.stack(
+        (2 * (grid[:, 0] + 0.5) / w - 1, 2 * (grid[:, 1] + 0.5) / h - 1), -1
+    )
+    return (
+        F.grid_sample(history, grid, align_corners=False, padding_mode="border") * valid
+    )
 
 
-class RaftSmallMotion(nn.Module):
-    """Pretrained backward RAFT-Small flow plus a trainable Sintel-validity head."""
-    def __init__(self, size=320):
+class MotionAlignment(nn.Module):
+    def __init__(self, mode):
         super().__init__()
-        import os
-        from pathlib import Path
-        from torchvision.models.optical_flow import raft_small, Raft_Small_Weights
-        os.environ.setdefault('TORCH_HOME', str(Path(__file__).resolve().parents[1] / '.cache/torch'))
-        self.raft = raft_small(weights=Raft_Small_Weights.C_T_V2, progress=False)
-        self.size = max(128, ((size + 7) // 8) * 8)
-        self.confidence = nn.Sequential(nn.Conv2d(8, 32, 3, padding=1), nn.GELU(),
-                                        nn.Conv2d(32, 1, 1))
+        if mode not in ("raw", "feat", "raft_small"):
+            raise ValueError("motion must be raw, feat or raft_small")
+        self.mode = mode
+        if mode == "raft_small":
+            import os
+            from pathlib import Path
+            from torchvision.models.optical_flow import raft_small, Raft_Small_Weights
 
-    def forward(self, previous, current):
-        if previous.shape != current.shape or current.ndim != 4 or current.shape[1] != 3:
-            raise ValueError('RAFT-Small requires matching BCHW RGB frames')
-        extent = current.shape[-2:]
-        previous = F.interpolate(previous.float(), (self.size, self.size), mode='bilinear',
-                                 align_corners=False, antialias=True)
-        current = F.interpolate(current.float(), (self.size, self.size), mode='bilinear',
-                                align_corners=False, antialias=True)
-        # Current -> previous is the backward field required to sample history.
-        predictions = self.raft(current * 2 - 1, previous * 2 - 1, num_flow_updates=12)
-        field = predictions[-1].float() / self.size
-        logits = self.confidence(torch.cat((current, previous, field), dim=1)).float()
-        # Torchvision retains its latest correlation pyramid as module state.
-        self.raft.corr_block.corr_pyramid = []
-        return (F.interpolate(field, extent, mode='bilinear', align_corners=False),
-                F.interpolate(logits, extent, mode='bilinear', align_corners=False))
+            os.environ.setdefault(
+                "TORCH_HOME", str(Path(__file__).resolve().parents[1] / ".cache/torch")
+            )
+            self.estimator = (
+                raft_small(weights=Raft_Small_Weights.C_T_V2, progress=False)
+                .eval()
+                .requires_grad_(False)
+            )
+        if mode == "feat":
+            self.predictor = nn.Sequential(
+                nn.Conv2d(6, 32, 3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(32, 64, 3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(64, 32, 3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(32, 2, 3, padding=1),
+            )
+            nn.init.zeros_(self.predictor[-1].weight)
+            nn.init.zeros_(self.predictor[-1].bias)
 
+    def forward(self, current, previous):
+        if previous is None:
+            return torch.zeros_like(current)
+        if previous.shape != current.shape:
+            raise ValueError("History must have the current LR RGB dimensions")
+        if self.mode == "feat":
+            flow = self.predictor(torch.cat((current, previous), 1))
+        elif self.mode == "raft_small":
+            h, w = current.shape[-2:]
+            extent = (max(128, (h + 7) // 8 * 8), max(128, (w + 7) // 8 * 8))
+            self.estimator.eval()
+            with (
+                torch.no_grad(),
+                torch.autocast(device_type=current.device.type, enabled=False),
+            ):
+                now = F.interpolate(
+                    current.float(), extent, mode="bilinear", align_corners=False
+                )
+                before = F.interpolate(
+                    previous.float(), extent, mode="bilinear", align_corners=False
+                )
+                field = self.estimator(
+                    now * 2 - 1, before * 2 - 1, num_flow_updates=12
+                )[-1]
+                self.estimator.corr_block.corr_pyramid = []
+                flow = F.interpolate(
+                    field, (h, w), mode="bilinear", align_corners=False
+                )
+                flow = (
+                    flow
+                    * flow.new_tensor([w / extent[1], h / extent[0]])[
+                        None, :, None, None
+                    ]
+                )
+        else:
+            cv2.setNumThreads(1)
+            arrays = []
+            for now, before in zip(
+                current.detach().float().cpu(), previous.detach().float().cpu()
+            ):
 
-def warp_history(history, motion, confidence):
-    """Differentiable backward sampling, with invalid and out-of-frame pixels rejected."""
-    height, width = history.shape[-2:]
-    yy, xx = torch.meshgrid(torch.arange(height, device=history.device),
-                           torch.arange(width, device=history.device), indexing='ij')
-    base = torch.stack(((xx + .5) / width, (yy + .5) / height), dim=-1).to(history)
-    coordinates = base[None] + motion.permute(0, 2, 3, 1)
-    valid = ((coordinates[..., 0] >= .5 / width) & (coordinates[..., 0] <= 1 - .5 / width)
-             & (coordinates[..., 1] >= .5 / height) & (coordinates[..., 1] <= 1 - .5 / height))
-    aligned = F.grid_sample(history, 2 * coordinates - 1, mode='bilinear',
-                            padding_mode='border', align_corners=False)
-    return aligned, confidence * valid[:, None]
+                def gray(t):
+                    return cv2.cvtColor(
+                        np.uint8(t.permute(1, 2, 0).numpy().clip(0, 1) * 255),
+                        cv2.COLOR_RGB2GRAY,
+                    )
+
+                arrays.append(
+                    cv2.calcOpticalFlowFarneback(
+                        gray(now), gray(before), None, 0.5, 3, 15, 3, 5, 1.2, 0
+                    )
+                )
+            flow = torch.from_numpy(np.stack(arrays)).permute(0, 3, 1, 2).to(current)
+        return warp(previous, flow)

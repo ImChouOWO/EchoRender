@@ -13,7 +13,7 @@ __pycache__/
 *.pth
 *.ckpt
 
-# Training/inference outputs, including Teacher feature caches and locks
+# Training and inference outputs
 /output/
 /outputs/
 /config/output/

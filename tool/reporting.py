@@ -1,163 +1,86 @@
-"""Best-checkpoint selection and end-of-training statistics and plots."""
+"""Persist standard metrics, task losses and training curves."""
+
 import csv
 import json
-import math
 from pathlib import Path
-from statistics import fmean
+import numpy as np
 
-from tqdm.auto import tqdm
-
-
-DIRECTIONS = {'loss': -1, 'psnr': 1, 'ssim': 1, 'lpips': -1}
+DIRECTIONS = {"loss": -1, "psnr": 1, "ssim": 1, "lpips": -1}
 
 
-class EarlyStopping:
-    """Stop after patience epochs without an absolute improvement above min_delta."""
-    def __init__(self, metric, patience, min_delta):
-        self.metric, self.patience, self.min_delta = metric, patience, min_delta
-        self.best, self.best_epoch, self.bad_epochs = None, None, 0
-
-    def update(self, value, epoch):
-        if math.isnan(value):
-            raise ValueError('Early stopping metric must not be NaN')
-        improvement = self.best is None or DIRECTIONS[self.metric] * (value - self.best) > self.min_delta
-        if improvement:
-            self.best, self.best_epoch, self.bad_epochs = value, epoch, 0
-        else:
-            self.bad_epochs += 1
-        return self.patience > 0 and self.bad_epochs >= self.patience
+def json_safe(value):
+    if isinstance(value, dict):
+        return {k: json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(v) for v in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
 
 
-def validation_values(validation):
-    return {'loss': validation['components']['total'], **validation['image_mean']}
+def atomic_json(path, value):
+    path = Path(path)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(json_safe(value), indent=2, allow_nan=False))
+    temporary.replace(path)
 
 
-def is_better(candidate, previous, metric):
-    return previous is None or DIRECTIONS[metric] * candidate[metric] > DIRECTIONS[metric] * previous[metric]
+def is_better(values, best, metric):
+    return best is None or DIRECTIONS[metric] * (values[metric] - best[metric]) > 0
 
 
-def best_message(epoch, current, previous):
-    changes = []
-    for name, direction in DIRECTIONS.items():
-        if previous is None:
-            change = 'initial'
-        elif not all(math.isfinite(value) for value in (current[name], previous[name])):
-            change = 'N/A'
-        elif previous[name] == 0:
-            change = '0.00%' if current[name] == 0 else 'N/A'
-        else:
-            change = f'{direction * (current[name] - previous[name]) / abs(previous[name]) * 100:+.2f}%'
-        changes.append(f'{name.upper() if name != "loss" else name}={change}')
-    return f'[Best]: save best weight | epoch={epoch} | ' + ' | '.join(changes)
-
-
-def metric_statistics(history, best_epoch):
-    series = {'train_loss': [row['train_loss'] for row in history]}
-    for name in DIRECTIONS:
-        series[name] = [validation_values(row['validation'])[name] for row in history]
-    best_index = next(i for i, row in enumerate(history) if row['epoch'] == best_epoch)
-    result = {}
-    for name, values in series.items():
-        direction = DIRECTIONS.get(name, -1)
-        index = max(range(len(values)), key=lambda i: direction * values[i])
-        result[name] = {'max': max(values), 'min': min(values), 'mean': fmean(values),
-                        'best': values[index], 'best_epoch': history[index]['epoch'],
-                        'at_best_checkpoint': values[best_index]}
-    return result
-
-
-def print_statistics(statistics):
-    tqdm.write('\n[Done]: Training performance (epoch means; loss = validation loss)')
-    tqdm.write(f'{"Metric":<14}{"Max":>13}{"Min":>13}{"Mean":>13}{"Best":>13}{"Epoch":>8}')
-    for name, values in statistics.items():
-        tqdm.write(f'{name:<14}' + ''.join(f'{values[key]:>13.5f}' for key in ('max', 'min', 'mean', 'best'))
-                   + f'{values["best_epoch"]:>8}')
-
-
-def write_training_report(summary, directory):
+def write_training_report(history, directory, best_epoch, *, print_table=False):
     import matplotlib
-    matplotlib.use('Agg')
+
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from matplotlib.ticker import MaxNLocator
-    from .trainer import json_safe
 
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    statistics = summary['statistics']
-    (directory / 'statistics.json').write_text(json.dumps(json_safe({
-        'reference': 'teacher_rgb', 'aggregation': 'validation image means per epoch',
-        'best_epoch': summary['best_epoch'], 'best_metric': summary['best_metric'],
-        'metrics': statistics}), indent=2, allow_nan=False) + '\n')
-    with (directory / 'statistics.csv').open('w', newline='') as stream:
-        writer = csv.writer(stream)
-        writer.writerow(['metric', 'max', 'min', 'mean', 'best', 'best_epoch', 'at_best_checkpoint'])
-        for name, values in statistics.items():
-            writer.writerow([name, *values.values()])
-    history = summary['history']
-    epochs = [row['epoch'] for row in history]
-    with (directory / 'epochs.csv').open('w', newline='') as stream:
-        writer = csv.writer(stream)
-        writer.writerow(['epoch', 'train_loss', 'val_loss', 'psnr', 'ssim', 'lpips'])
-        for row in history:
-            values = validation_values(row['validation'])
-            writer.writerow([row['epoch'], row['train_loss'], *[values[name] for name in DIRECTIONS]])
-    figure, axes = plt.subplots(2, 2, figsize=(12, 8), constrained_layout=True)
-    for axis, name in zip(axes.flat, DIRECTIONS):
-        values = [validation_values(row['validation'])[name] for row in history]
-        finite = [value if math.isfinite(value) else float('nan') for value in values]
-        axis.plot(epochs, finite, marker='o', label='Validation')
-        if name == 'loss':
-            axis.plot(epochs, [row['train_loss'] for row in history], marker='o', label='Train')
-        if any(not math.isfinite(value) for value in values):
-            axis.text(.02, .97, 'Infinite values omitted from plot; see statistics.json',
-                      transform=axis.transAxes, va='top', fontsize=8)
-        axis.axvline(summary['best_epoch'], color='gray', linestyle='--', label='Best checkpoint')
-        axis.set(title={'loss': 'Loss', 'psnr': 'PSNR (dB)', 'ssim': 'SSIM', 'lpips': 'LPIPS'}[name],
-                 xlabel='Epoch')
-        axis.grid(alpha=.25)
-        axis.legend(fontsize=8)
-        axis.xaxis.set_major_locator(MaxNLocator(integer=True, nbins=10))
-    figure.suptitle('Training performance - Teacher RGB reference', fontweight='bold')
-    figure.savefig(directory / 'training_metrics.png', dpi=160)
-    plt.close(figure)
-
-    appearance_names = list(dict.fromkeys(name for row in history for name in row['validation']['components']
-                                         if name == 'appearance' or name.startswith(('appearance_', 'weighted_appearance_'))))
-    if appearance_names:
-        with (directory / 'appearance.csv').open('w', newline='') as stream:
-            writer = csv.writer(stream)
-            writer.writerow(['epoch', 'split', *appearance_names])
-            for row in history:
-                for split, parts in (('train', row.get('train_components', {})), ('val', row['validation']['components'])):
-                    writer.writerow([row['epoch'], split, *[parts.get(name) for name in appearance_names]])
-        from model.card.appearance import APPEARANCE_TERMS
-        names = ['appearance', *[f'appearance_{name}' for name in APPEARANCE_TERMS],
-                 'appearance_roi_l_score', 'appearance_roi_c_score', 'appearance_roi_s_score',
-                 'appearance_lab_l_dark_mae', 'appearance_lab_l_bright_mae', 'appearance_lab_l_dark_fraction']
-        figure, axes = plt.subplots(5, 3, figsize=(15, 16), constrained_layout=True)
-        for axis, name in zip(axes.flat, names):
-            for split in ('train', 'val'):
-                values = [(row.get('train_components', {}) if split == 'train' else row['validation']['components']).get(name, float('nan'))
-                          for row in history]
-                axis.plot(epochs, values, label=split.capitalize())
-            axis.axvline(summary['best_epoch'], color='gray', linestyle='--')
-            axis.set(title=name.removeprefix('appearance_').replace('_', ' ').title(), xlabel='Epoch')
-            axis.grid(alpha=.25)
-            axis.legend(fontsize=8)
-        figure.suptitle('Local appearance supervision - Teacher RGB reference', fontweight='bold')
-        figure.savefig(directory / 'appearance_metrics.png', dpi=140)
-        plt.close(figure)
-
-    profiles = list(dict.fromkeys(name for row in history for name in row['validation'].get('profiles', {})))
-    if profiles:
-        figure, axes = plt.subplots(2, 2, figsize=(12, 8), constrained_layout=True)
-        for axis, name in zip(axes.flat, DIRECTIONS):
-            for profile in profiles:
-                values = [row['validation'].get('profiles', {}).get(profile, {}).get(name, float('nan')) for row in history]
-                axis.plot(epochs, [value if math.isfinite(value) else float('nan') for value in values], label=profile)
-            axis.set(title={'loss': 'Loss', 'psnr': 'PSNR (dB)', 'ssim': 'SSIM', 'lpips': 'LPIPS'}[name], xlabel='Epoch')
-            axis.grid(alpha=.25)
-            axis.legend(fontsize=8)
-        figure.suptitle('Validation by profile - Teacher RGB reference', fontweight='bold')
-        figure.savefig(directory / 'profile_metrics.png', dpi=160)
-        plt.close(figure)
+    statistics = {}
+    selected = next((row for row in history if row["epoch"] == best_epoch), history[-1])
+    for key in DIRECTIONS:
+        values = [row["validation"][key] for row in history]
+        statistics[key] = {
+            "min": min(values),
+            "max": max(values),
+            "mean": sum(values) / len(values),
+            "best": min(values) if DIRECTIONS[key] < 0 else max(values),
+            "at_best_checkpoint": selected["validation"][key],
+        }
+    summary = {"best_epoch": best_epoch, "statistics": statistics, "history": history}
+    atomic_json(directory / "summary.json", summary)
+    with (directory / "metrics.csv").open("w", newline="") as f:
+        rows = [
+            {
+                "epoch": r["epoch"],
+                "train_loss": r["train"]["loss"],
+                **r["validation"],
+                "lr": r["lr"],
+            }
+            for r in history
+        ]
+        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    fig, axes = plt.subplots(2, 2, figsize=(12, 7), layout="constrained")
+    epochs = [row["epoch"] for row in history]
+    for ax, key in zip(axes.flat, DIRECTIONS):
+        ax.plot(epochs, [row["validation"][key] for row in history], label="Validation")
+        if key == "loss":
+            ax.plot(epochs, [row["train"]["loss"] for row in history], label="Training")
+        ax.set(xlabel="Epoch", title=key.upper())
+        ax.grid(alpha=0.2)
+        ax.legend()
+    fig.savefig(directory / "curves.png", dpi=160)
+    plt.close(fig)
+    if print_table:
+        print(f"{'Metric':<10}{'Min':>12}{'Max':>12}{'Mean':>12}{'Best':>12}")
+        for key, stats in statistics.items():
+            print(
+                f"{key.upper():<10}"
+                + "".join(
+                    f"{stats[name]:>12.5f}" for name in ("min", "max", "mean", "best")
+                )
+            )
+    return summary
